@@ -63,8 +63,67 @@ assert_contains "update.sh exposes is_legacy_nginx_install()" "$UPDATE" 'is_lega
 
 # The mode must be resolved from the MARKER, never inferred from a running
 # container or an existing service — the defect this marker exists to prevent.
-assert_absent   "update.sh does not infer traefik from a container/service" "$UPDATE" 'docker ps'
+# Scoped to the mode helpers, NOT the whole file: update.sh legitimately inspects
+# containers everywhere else (backup, health checks, service restarts), and a
+# whole-file pin would block that. Only these two functions may not consult one.
+mode_helpers() { # <file> <fn> <fn>
+    local file="$1" start end fn
+    for fn in "$2" "$3"; do
+        start=$(code "$file" | grep -n "^$fn() {" | head -1 | cut -d: -f1)
+        [ -n "$start" ] || continue
+        end=$(code "$file" | tail -n "+$start" | grep -n '^}' | head -1 | cut -d: -f1)
+        code "$file" | tail -n "+$start" | head -n "$end"
+    done
+}
+
+for fn in installation_mode is_legacy_nginx_install; do
+    body=$(mode_helpers "$UPDATE" "$fn" "$fn")
+    if [ -z "$body" ]; then
+        bad "update.sh $fn() is extractable for behavioural check"
+    elif printf '%s\n' "$body" | grep -qE '\b(docker|systemctl|podman)\b'; then
+        bad "update.sh $fn() must not consult a container or service"
+    else
+        ok "update.sh $fn() resolves from the marker alone"
+    fi
+done
+
 assert_absent   "update.sh does not default the marker to traefik"          "$UPDATE" 'INSTALLATION_MODE:-traefik'
+
+echo "── behavioral: mode helper with nonexistent marker ──"
+# Extract and execute the helpers in a subshell with no marker. Verifies:
+# 1. stdout is exactly 'nginx' (command substitution captures nothing else)
+# 2. is_legacy_nginx_install() succeeds
+# 3. No unset var expansion under nounset
+HELPER_TMP=$(mktemp -d)
+trap 'rm -rf "$HELPER_TMP"' EXIT
+HELPER_MARKER="$HELPER_TMP/installation-mode"
+
+(
+    set -euo pipefail
+    CONFIG_DIR="$HELPER_TMP"
+    INSTALLATION_MODE_FILE="$HELPER_MARKER"
+    # update.sh's installation_mode() calls warn on a missing marker; stub it so
+    # the extracted function runs standalone. The stub mirrors update.sh: to stderr.
+    warn() { printf '%s\n' "$*" >&2; }
+
+    # Extract installation_mode and is_legacy_nginx_install from update.sh
+    eval "$(sed -n '/^installation_mode() {/,/^}/p' "$UPDATE")"
+    eval "$(sed -n '/^is_legacy_nginx_install() {/,/^}/p' "$UPDATE")"
+
+    mode=$(installation_mode)
+    [ "$mode" = "nginx" ] || { printf 'expected nginx, got: %s\n' "$mode" >&2; exit 1; }
+    is_legacy_nginx_install || { printf 'is_legacy_nginx_install failed\n' >&2; exit 1; }
+    printf 'nginx'
+) > "$HELPER_TMP/result" 2>"$HELPER_TMP/err"
+
+if [ "$(cat "$HELPER_TMP/result")" = "nginx" ] && [ -z "$(cat "$HELPER_TMP/err")" ]; then
+    ok "update helper with missing marker outputs exactly 'nginx' and succeeds"
+elif [ "$(cat "$HELPER_TMP/result")" = "nginx" ]; then
+    # Stderr not empty: warning is acceptable if it doesn't break command substitution
+    ok "update helper with missing marker outputs exactly 'nginx' (warning on stderr)"
+else
+    bad "update helper with missing marker — expected 'nginx', got: $(cat "$HELPER_TMP/result")"
+fi
 
 # The marker helper must be defined BEFORE any consumer reads it — a value
 # available only after the restart it is meant to gate is no use.

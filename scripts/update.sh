@@ -191,7 +191,7 @@ installation_mode() {
             traefik|nginx) printf '%s' "$v"; return 0 ;;
         esac
     fi
-    warn "Installation mode marker missing or invalid — treating as legacy nginx"
+    warn "Installation mode marker missing or invalid — treating as legacy nginx" >&2
     printf 'nginx'
 }
 

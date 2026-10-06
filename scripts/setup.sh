@@ -77,6 +77,7 @@ agent_rwp_dirs() {
 # On a fresh install the marker does not exist yet — that is what
 # INSTALLATION_MODE (default traefik, above) is for.
 installation_mode() {
+    local mode="${INSTALLATION_MODE:-traefik}"
     if [ -r "$INSTALLATION_MODE_FILE" ]; then
         local v
         v=$(cat "$INSTALLATION_MODE_FILE" 2>/dev/null || true)
@@ -85,8 +86,8 @@ installation_mode() {
             traefik|nginx) printf '%s' "$v"; return 0 ;;
         esac
     fi
-    case "${INSTALLATION_MODE:-nginx}" in
-        traefik|nginx) printf '%s' "$INSTALLATION_MODE" ;;
+    case "$mode" in
+        traefik|nginx) printf '%s' "$mode" ;;
         *)             printf '%s' 'traefik' ;;
     esac
 }
