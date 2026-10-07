@@ -104,6 +104,9 @@ export const navGroups: NavGroup[] = [
     items: [
       { to: "/dns", label: "DNS", iconName: "dns", adminOnly: true },
       { to: "/cdn", label: "CDN", iconName: "dns", adminOnly: true },
+      // Generic TCP forwards are host infrastructure: a public listener is a
+      // firewall rule and a port, so the page is admin-only like the endpoint.
+      { to: "/tcp-proxies", label: "TCP Proxies", iconName: "dns", adminOnly: true },
       // Unrestricted since v2.103.0, and the flag's absence is the whole point.
       // The backend admits a mail domain to whoever owns the site of the same
       // name on the same server (`MAIL_DOMAIN_CALLER_PREDICATE`, backend

@@ -115,6 +115,7 @@ const Notifications = lazyRetry(() => import("./pages/Notifications"));
 const Integrations = lazyRetry(() => import("./pages/Integrations"));
 const Users = lazyRetry(() => import("./pages/Users"));
 const ContainerPolicies = lazyRetry(() => import("./pages/ContainerPolicies"));
+const TcpProxies = lazyRetry(() => import("./pages/TcpProxies"));
 const System = lazyRetry(() => import("./pages/System"));
 const Telemetry = lazyRetry(() => import("./pages/Telemetry"));
 
@@ -166,6 +167,7 @@ createRoot(document.getElementById("root")!).render(
               <Route path="/resellers" element={<Resellers />} />
               <Route path="/users" element={<Users />} />
               <Route path="/container-policies" element={<ContainerPolicies />} />
+              <Route path="/tcp-proxies" element={<TcpProxies />} />
               <Route path="/backup-orchestrator" element={<BackupOrchestrator />} />
               {/* Incidents live in Monitoring's Status Page tab, so land there
                   rather than on the default Monitors tab. `resolveTab` clamps a

@@ -85,6 +85,12 @@ pub struct Database {
     /// RETURNING) still hydrate the struct.
     #[sqlx(default)]
     pub remote_port: Option<i32>,
+    /// The server's public address and whether the listener terminates TLS —
+    /// what a remote client actually needs to connect.
+    #[sqlx(default)]
+    pub remote_host: Option<String>,
+    #[sqlx(default)]
+    pub remote_tls: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -108,6 +114,9 @@ pub async fn list(
     let dbs: Vec<Database> = sqlx::query_as(
         "SELECT d.id, d.site_id, d.stack_id, d.name, d.engine, d.db_user, d.container_id, d.port, \
          (SELECT p.listen_port FROM tcp_proxies p WHERE p.database_id = d.id) AS remote_port, \
+         (SELECT sv.ip_address FROM tcp_proxies p JOIN servers sv ON sv.id = p.server_id \
+          WHERE p.database_id = d.id) AS remote_host, \
+         COALESCE((SELECT p.tls FROM tcp_proxies p WHERE p.database_id = d.id), FALSE) AS remote_tls, \
          d.created_at \
          FROM databases d \
          LEFT JOIN sites s ON d.site_id = s.id \

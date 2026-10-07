@@ -25,7 +25,17 @@ interface Database {
   db_user: string;
   container_id: string | null;
   port: number | null;
+  // Present when remote access is on: the public nginx stream listener.
+  remote_port: number | null;
+  remote_host: string | null;
+  remote_tls: boolean;
   created_at: string;
+}
+
+interface TlsCertificateOption {
+  id: string;
+  alias: string;
+  dns_names: string[];
 }
 
 interface Credentials {
@@ -940,6 +950,13 @@ export default function Databases() {
   const [resettingPw, setResettingPw] = useState<string | null>(null);
   const [pwResetSuccess, setPwResetSuccess] = useState<string | null>(null);
 
+  // Remote access (nginx stream TCP proxy) state
+  const [remoteId, setRemoteId] = useState<string | null>(null);
+  const [remoteBusy, setRemoteBusy] = useState(false);
+  const [remoteTls, setRemoteTls] = useState(false);
+  const [remoteCert, setRemoteCert] = useState("");
+  const [remoteCerts, setRemoteCerts] = useState<TlsCertificateOption[] | null>(null);
+
   const fetchData = async () => {
     try {
       const [dbs, sitesData, stacksData] = await Promise.all([
@@ -1055,6 +1072,49 @@ export default function Databases() {
       setError(err instanceof Error ? err.message : "Password reset failed");
     } finally {
       setResettingPw(null);
+    }
+  };
+
+  const toggleRemotePanel = async (id: string) => {
+    if (remoteId === id) {
+      setRemoteId(null);
+      return;
+    }
+    setRemoteId(id);
+    setRemoteTls(false);
+    setRemoteCert("");
+    // Certificates are only needed if the operator asks for TLS — fetch lazily,
+    // once, the first time the checkbox is ticked (see loadRemoteCerts).
+    if (remoteCerts === null) {
+      try {
+        const certs = await api.get<TlsCertificateOption[]>("/tls-certificates");
+        setRemoteCerts(certs);
+      } catch {
+        setRemoteCerts([]);
+      }
+    }
+  };
+
+  const handleRemoteToggle = async (db: Database, enable: boolean) => {
+    setRemoteBusy(true);
+    setError("");
+    setSuccessMsg("");
+    try {
+      if (enable) {
+        await api.post(`/databases/${db.id}/remote-access`, {
+          tls: remoteTls,
+          ...(remoteTls && remoteCert ? { certificate_id: remoteCert } : {}),
+        });
+        setSuccessMsg(`Remote access enabled for "${db.name}"`);
+      } else {
+        await api.delete(`/databases/${db.id}/remote-access`);
+        setSuccessMsg(`Remote access disabled for "${db.name}"`);
+      }
+      fetchData();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Remote access change failed");
+    } finally {
+      setRemoteBusy(false);
     }
   };
 
@@ -1447,6 +1507,17 @@ export default function Databases() {
                         >
                           {credentialsId === db.id ? "Hide" : "Connect"}
                         </button>
+                        <button
+                          onClick={() => toggleRemotePanel(db.id)}
+                          className={`px-2 py-1 rounded text-xs font-medium transition-colors ${
+                            db.remote_port
+                              ? "bg-accent-500/10 text-accent-400"
+                              : "bg-dark-700 text-dark-300 hover:bg-dark-600"
+                          }`}
+                          title={db.remote_port ? `Public TCP port ${db.remote_port}` : "Expose this database on a public TCP port through nginx"}
+                        >
+                          {db.remote_port ? `Remote :${db.remote_port}` : "Remote"}
+                        </button>
                         {confirmDeleteId === db.id ? (
                           <>
                             <span className="text-xs text-danger-400">Sure?</span>
@@ -1609,6 +1680,117 @@ export default function Databases() {
               ) : null}
             </div>
           )}
+
+          {/* Remote access panel — the public nginx stream listener */}
+          {remoteId && (() => {
+            const db = databases.find((d) => d.id === remoteId);
+            if (!db) return null;
+            return (
+              <div className="mt-4 bg-dark-800 rounded-lg border border-dark-500 p-5">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">
+                    Remote access — {db.name}
+                  </h3>
+                  <button
+                    onClick={() => setRemoteId(null)}
+                    className="text-dark-400 hover:text-dark-200 text-sm"
+                    aria-label="Close remote access panel"
+                  >
+                    &times;
+                  </button>
+                </div>
+
+                {db.remote_port ? (
+                  <div>
+                    <p className="text-xs text-dark-300 mb-3">
+                      This database is reachable from off-box through the server's nginx
+                      stream listener. The container itself stays bound to loopback only.
+                    </p>
+                    <div className="flex items-center gap-2 mb-4">
+                      <code className="flex-1 bg-dark-900 border border-dark-500 rounded-lg px-3 py-2 text-sm font-mono text-dark-50">
+                        {db.remote_host ?? "this server's public IP"}:{db.remote_port}
+                        {db.remote_tls ? "  (TLS)" : ""}
+                      </code>
+                      <button
+                        onClick={() =>
+                          copyToClipboard(
+                            db.remote_host
+                              ? `${db.remote_host}:${db.remote_port}`
+                              : String(db.remote_port),
+                            "remote_addr"
+                          )
+                        }
+                        className="shrink-0 px-3 py-2 bg-dark-700 text-dark-200 rounded-lg text-xs hover:bg-dark-600 transition-colors"
+                      >
+                        {copied === "remote_addr" ? "Copied!" : "Copy"}
+                      </button>
+                    </div>
+                    <button
+                      onClick={() => handleRemoteToggle(db, false)}
+                      disabled={remoteBusy}
+                      className="px-4 py-2 text-sm rounded-lg border border-danger-500/30 text-danger-400 hover:bg-danger-500/10 disabled:opacity-50 transition-colors"
+                    >
+                      {remoteBusy ? "Working..." : "Disable remote access"}
+                    </button>
+                  </div>
+                ) : (
+                  <div>
+                    <p className="text-xs text-dark-300 mb-3">
+                      Publish this database on a public TCP port (40000–44999 range)
+                      so external tools can connect. Traffic is forwarded to the
+                      container's existing loopback binding — no Docker port is
+                      exposed publicly.
+                    </p>
+                    <div className="flex items-end gap-3 flex-wrap">
+                      <label className="flex items-center gap-2 text-sm text-dark-200">
+                        <input
+                          type="checkbox"
+                          checked={remoteTls}
+                          onChange={(e) => setRemoteTls(e.target.checked)}
+                          className="rounded border-dark-500"
+                        />
+                        Terminate TLS on the listener
+                      </label>
+                      {remoteTls && (
+                        <select
+                          value={remoteCert}
+                          onChange={(e) => setRemoteCert(e.target.value)}
+                          className="px-3 py-2 border border-dark-500 rounded-lg text-sm bg-dark-800"
+                          aria-label="TLS certificate"
+                        >
+                          <option value="">-- certificate --</option>
+                          {(remoteCerts ?? []).map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.alias}
+                              {c.dns_names?.length ? ` (${c.dns_names[0]})` : ""}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                      <button
+                        onClick={() => handleRemoteToggle(db, true)}
+                        disabled={remoteBusy || !db.container_id || (remoteTls && !remoteCert)}
+                        className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 disabled:opacity-50 transition-colors"
+                      >
+                        {remoteBusy ? "Working..." : "Enable remote access"}
+                      </button>
+                    </div>
+                    {!db.container_id && (
+                      <p className="text-xs text-dark-400 mt-2">
+                        The container is not up yet — wait for provisioning to finish.
+                      </p>
+                    )}
+                    {remoteTls && remoteCerts !== null && remoteCerts.length === 0 && (
+                      <p className="text-xs text-dark-400 mt-2">
+                        No registered certificates on this server — register one under
+                        Settings &rarr; Certificates first, or leave TLS off.
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </div>
       ) : null}
       </div>
