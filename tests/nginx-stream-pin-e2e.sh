@@ -199,5 +199,22 @@ check "backend never sends key material to the agent" \
       "$(grep -c '"private_key"' "$BACKEND_TCP")" "0"
 
 echo
+echo "── S6: documentation contract ──"
+assert_contains "$REPO/docs/guides/databases.md" 'stream' \
+    "databases guide documents the stream module"
+assert_contains "$REPO/docs/guides/databases.md" '40000' \
+    "databases guide documents the managed port range"
+assert_contains "$REPO/docs/guides/databases.md" 'loopback' \
+    "databases guide documents the loopback-upstream model"
+assert_contains "$REPO/docs/guides/databases.md" 'firewall' \
+    "databases guide documents the firewall open/close contract"
+assert_contains "$REPO/docs/api-reference.md" 'remote-access' \
+    "api reference lists the remote-access endpoints"
+assert_contains "$REPO/docs/api-reference.md" 'tcp-proxies' \
+    "api reference lists the tcp-proxies endpoints"
+assert_contains "$REPO/docs/troubleshooting.md" 'libnginx-mod-stream' \
+    "troubleshooting covers the missing-module failure mode"
+
+echo
 printf 'PASS: %d   FAIL: %d\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

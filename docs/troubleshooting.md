@@ -306,6 +306,37 @@ The Dashboard shows a health score (0-100) with active issues. Click any issue t
 
 Go to Security > Diagnostics for a full diagnostic report.
 
+### TCP proxy / database remote access refuses to enable
+
+**Cause**: nginx on this host lacks the stream module, or the managed include
+was never wired — either an old install that predates the feature, or a distro
+nginx build without `ngx_stream`.
+
+**Fix**: check for compiled-in support first, then install the module package
+and let the updater wire the include:
+
+```bash
+nginx -V 2>&1 | grep -- --with-stream        # compiled in: nothing to install
+
+# Debian/Ubuntu                       RHEL-family
+apt install libnginx-mod-stream       dnf install nginx-mod-stream
+
+sudo bash /opt/dockpanel/scripts/update.sh   # ensures the stream include
+nginx -t && systemctl reload nginx
+```
+
+The stream block is one top-level `stream { include
+/etc/nginx/dockpanel-streams/*.conf; }` in `nginx.conf` — if it is missing,
+update.sh adds it (before `http {}`, or inside an existing `stream` block).
+Sites keep working without the module; only TCP proxy creation fails, and it
+says so rather than writing a config nginx cannot load.
+
+**Port stays closed after enabling**: the listener was written but the host
+firewall may not have taken the rule — check `ufw status` / `firewall-cmd
+--list-all` for the port in the 40000–44999 range.
+
+---
+
 ## Restarting Services
 
 ```bash

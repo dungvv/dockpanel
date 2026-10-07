@@ -218,6 +218,44 @@ Execute SQL query.
 | POST | `/api/databases/{id}/reset-password` | Rotate the database password |
 | GET | `/api/databases/{id}/dumps` | **Admin only.** List dumps the operator placed in this database's backup directory, including files that cannot be imported and why |
 | POST | `/api/databases/{id}/import` | **Admin only.** Import one of those dumps. Body: `{"filename": "mydb-20260821-120000.sql.gz"}`. Answers `504` with an explanation if the import outlasts the panel's 270s wait — that is not a failure |
+| POST | `/api/databases/{id}/remote-access` | Publish the database on a public TCP port through nginx's stream module. Body (all optional): `{"tls": true, "certificate_id": "uuid"}`. The upstream is read off the container's own loopback binding by the agent — never trusted from the request. Answers with `{"host", "listen_port", "upstream", "tls"}` |
+| DELETE | `/api/databases/{id}/remote-access` | Remove the listener, its firewall rule and the `tcp_proxies` row |
+
+## TCP Proxies (3 endpoints)
+
+Generic operator-defined TCP forwards through nginx's `stream` module. Each
+proxy is one public listen port in the managed range **40000–44999** forwarding
+to a `host:port` upstream, one config file under
+`/etc/nginx/dockpanel-streams/`, written atomically and gated by `nginx -t`
+before every reload. **All endpoints are admin-only and server-scoped.**
+
+### `GET /api/tcp-proxies`
+List this server's TCP proxies (both `generic` and `database` kinds — database
+rows are the ones remote access created).
+
+### `POST /api/tcp-proxies`
+Create a generic forward.
+
+```json
+{
+  "name": "redis-forward",
+  "upstream_host": "127.0.0.1",
+  "upstream_port": 6379,
+  "tls": false,
+  "certificate_id": "uuid (required when tls=true; must be yours or admin)"
+}
+```
+
+`name` is `[a-z0-9-]`, ≤48 chars — it becomes the stream config filename.
+`upstream_host` accepts an IPv4 literal, a bracketed IPv6 (`[::1]`), or a
+hostname; anything else is refused before the agent is called. The listener
+goes up before the row exists: if the insert fails, the agent-side proxy is
+removed again.
+
+### `DELETE /api/tcp-proxies/{id}`
+Remove a generic proxy's stream file, firewall rule and row. Rows whose
+`database_id` is set refuse with 409 — disable the database's remote access
+instead.
 
 ---
 

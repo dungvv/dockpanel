@@ -68,12 +68,15 @@ is the supported path and the one the WordPress installer uses. A site's PHP,
 Node or Python process runs on the host, not in a container, so the loopback
 publish is reachable to it.
 
-**From your own machine** — there is no direct route, by design. Tunnel over SSH:
+**From your own machine** — tunnel over SSH, the always-available path:
 
 ```bash
 ssh -L 5433:127.0.0.1:<port> root@your-server
 # then point your local client at 127.0.0.1:5433
 ```
+
+…or enable **remote access**, which publishes the database on a public TCP port
+through nginx's stream module — see below.
 
 **From a container** — not possible for a **site-owned** managed database. If you
 need a containerised tool to reach one, either run a plain database container
@@ -90,6 +93,45 @@ managed database (see below) if deployed into the same stack, or against a plain
 database container you run in your own stack. They do **not** work against a
 **site-owned** managed database, for the reasons at the top of this guide —
 pointing one at a site-owned database will fail no matter what you type.
+
+### Remote access over TCP
+
+Every managed database can also be published on a public port with the **Remote**
+button in the database list. What that does, in order:
+
+- nginx (the same public ingress that serves your sites) gains a `stream`
+  listener on a port from the managed pool **40000–44999**, forwarding to the
+  container's *existing* `127.0.0.1` binding — the Docker publish never becomes
+  public, and no container is recreated.
+- The firewall is opened for that port and closed again when you disable it.
+- The panel shows the address to connect to (`server-ip:port`) next to the
+  Remote button and in the panel it opens.
+
+Enabling is per-database and per-owner: tenants can publish only their own
+databases, and a second enable on the same database is refused rather than
+silently re-pointed. Disabling removes the listener, the firewall rule and the
+panel record; deleting the database (or its owning site/stack) takes the
+listener down with it.
+
+**TLS is optional.** With "Terminate TLS" checked, the listener expects a TLS
+handshake before it proxies a byte, using a certificate from the panel's
+certificate registry (`Settings → Certificates`); pick one your account owns.
+Only enable it if your client actually speaks TLS to the database — for
+PostgreSQL that means `sslmode=require` and friends, for MySQL `--ssl-mode`.
+Plain TCP remains the default because most clients talk to these engines in
+the clear.
+
+**It is still a public port.** Anyone who can reach it can attempt to log in,
+so use it for tools, not as a substitute for the SSH tunnel when a tunnel
+suffices — and consider the firewall if the port should only answer one
+office address.
+
+## Generic TCP forwards
+
+Admins can also forward any other TCP service through the same mechanism on the
+**TCP Proxies** page: a name, an upstream `host:port`, an optional TLS
+certificate. Those rows appear here too (kind `database` vs `generic`), but a
+database's own listener stays managed from this page.
 
 ## Databases owned by a Stack
 
