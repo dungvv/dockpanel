@@ -177,5 +177,27 @@ assert_contains "$MIGRATION" 'ON DELETE CASCADE' "db delete cascades its proxy r
 assert_contains "$BACKEND_TCP" '40000' "backend enforces the managed port range"
 
 echo
+echo "── S5: TLS termination contract ──"
+assert_contains "$AGENT_STREAM_ROUTE" '/etc/dockpanel/ssl-registry/' \
+    "agent restricts cert paths to the managed roots"
+assert_contains "$AGENT_STREAM_ROUTE" 'tls requires cert_path' \
+    "tls=true refuses without certificate paths"
+assert_contains "$AGENT_STREAM_SVC" 'listen {listen_port} ssl;' \
+    "TLS listeners render the ssl flag on listen"
+assert_contains "$AGENT_STREAM_SVC" 'ssl_certificate_key' \
+    "TLS listeners reference the registry key in place"
+assert_contains "$BACKEND_TCP" 'tls_certificates' \
+    "backend resolves certs from the registry table"
+assert_contains "$BACKEND_TCP" 'user_id = $3 OR $4' \
+    "certificate lookup is caller-scoped (or admin)"
+assert_contains "$REPO/panel/backend/src/routes/tls_certificates.rs" 'tcp_proxies' \
+    "cert delete refuses while a stream proxy references it"
+# Private key material must never be on the wire or in a log line.
+check "agent never logs key paths" \
+      "$(cat "$AGENT_STREAM_ROUTE" "$AGENT_STREAM_SVC" | grep -cE 'tracing::(info|warn|error)!\([^)]*key')" "0"
+check "backend never sends key material to the agent" \
+      "$(grep -c '"private_key"' "$BACKEND_TCP")" "0"
+
+echo
 printf 'PASS: %d   FAIL: %d\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

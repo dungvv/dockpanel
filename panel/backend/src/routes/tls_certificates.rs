@@ -569,6 +569,30 @@ pub async fn remove(
         ));
     }
 
+    // Same refusal for nginx stream TCP proxies: their server{} files carry
+    // ssl_certificate paths into this directory, and deleting the pair under a
+    // live listener makes the NEXT `nginx -t` on the box fail — every vhost
+    // write, not just this proxy's.
+    let proxy_refs: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM tcp_proxies WHERE certificate_id = $1 ORDER BY name",
+    )
+    .bind(row.id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| internal_error("tls certificate tcp proxy references", e))?;
+    if !proxy_refs.is_empty() {
+        return Err(err(
+            StatusCode::CONFLICT,
+            &format!(
+                "Certificate {} is still used by {} TCP proxy listener(s): {}. Remove them or \
+                 disable remote access first.",
+                row.alias,
+                proxy_refs.len(),
+                proxy_refs.join(", "),
+            ),
+        ));
+    }
+
     let agent =
         crate::helpers::agent_for_site_server(&state, Some(row.server_id), &row.alias).await?;
     match agent.delete(&format!("/ssl/registry/{}", row.alias)).await {

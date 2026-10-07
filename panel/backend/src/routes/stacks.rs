@@ -719,6 +719,26 @@ pub async fn remove(
     // container, which is exactly why the container needs this explicit step). Best-effort,
     // same tolerance the stack's own containers get below ("even if container removal had
     // partial failures").
+    // Stream proxies die before the containers they front: the tcp_proxies
+    // rows cascade with the databases below, but the nginx files and firewall
+    // rules live on the agent — same leak the site delete closes explicitly.
+    let stack_stream_proxies: Vec<(String, i32)> = sqlx::query_as(
+        "SELECT p.name, p.listen_port FROM tcp_proxies p \
+         JOIN databases d ON d.id = p.database_id WHERE d.stack_id = $1",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    for (pname, pport) in &stack_stream_proxies {
+        if let Err(e) = agent
+            .delete(&format!("/nginx/streams/{pname}?listen_port={pport}"))
+            .await
+        {
+            tracing::warn!("Could not remove stack {id}'s stream proxy {pname}: {e}");
+        }
+    }
+
     let owned_dbs: Vec<(Option<String>,)> =
         sqlx::query_as("SELECT container_id FROM databases WHERE stack_id = $1")
             .bind(id)

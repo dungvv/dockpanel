@@ -38,12 +38,18 @@ pub fn router() -> Router<AppState> {
         .route("/nginx/streams/{name}", delete(delete_stream))
 }
 
-/// Certificate/key paths arriving over the API must already live where
-/// DockPanel keeps certificates — a stream config that points outside the
-/// managed roots would let a caller make nginx read (and log) arbitrary
-/// files at reload.
+/// Certificate/key paths arriving over the API must already live under the
+/// managed certificate roots — the registry, the per-site Let's Encrypt tree,
+/// or the system LE live dir. A stream config that points anywhere else would
+/// let a caller make nginx read (and log) arbitrary files at reload.
+const CERT_ROOTS: [&str; 3] = [
+    "/etc/dockpanel/ssl-registry/",
+    "/etc/dockpanel/ssl/",
+    "/etc/letsencrypt/",
+];
+
 fn validate_cert_path(path: &str, field: &str) -> Result<(), (StatusCode, String)> {
-    let ok = (path.starts_with("/etc/dockpanel/") || path.starts_with("/etc/letsencrypt/"))
+    let ok = CERT_ROOTS.iter().any(|root| path.starts_with(root))
         && !path.contains("..")
         && std::path::Path::new(path).is_file();
     if ok {

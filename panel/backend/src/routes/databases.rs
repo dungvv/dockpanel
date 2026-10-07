@@ -461,15 +461,9 @@ pub async fn remove(
     let agent =
         crate::helpers::agent_for_site_server(&state, owner_server_id, &owner_label).await?;
 
-    // Remove container via agent (must succeed before DB deletion)
-    if let Some(cid) = &container_id {
-        let agent_path = format!("/databases/{cid}");
-        agent.delete(&agent_path).await
-            .map_err(|e| agent_error("Database removal", e))?;
-    }
-
-    // Its remote-access stream proxy dies with it: the nginx listener must go
-    // before the row, or the public port stays open proxying a dead container.
+    // Its remote-access stream proxy goes FIRST: close the public listener
+    // (and its firewall rule) before the container dies, or the port stays
+    // open proxying into a dead container for the remainder of the delete.
     let proxy: Option<(String, i32)> = sqlx::query_as(
         "SELECT name, listen_port FROM tcp_proxies WHERE database_id = $1",
     )
@@ -487,6 +481,13 @@ pub async fn remove(
             .execute(&state.db)
             .await
             .ok();
+    }
+
+    // Remove container via agent (must succeed before DB deletion)
+    if let Some(cid) = &container_id {
+        let agent_path = format!("/databases/{cid}");
+        agent.delete(&agent_path).await
+            .map_err(|e| agent_error("Database removal", e))?;
     }
 
     // Delete from DB
@@ -1590,6 +1591,7 @@ pub async fn remote_access_enable(
         certificate_id,
         Some(id),
         Some(container_id.as_str()),
+        claims.role == "admin",
     )
     .await?;
 

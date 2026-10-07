@@ -117,18 +117,24 @@ async fn allocate_listen_port(state: &AppState, server_id: Uuid) -> Result<i32, 
 }
 
 /// Resolve a caller-supplied certificate on THIS server into the registry
-/// paths the agent writes into the stream config. Foreign or missing certs
-/// are a refusal, not a silent downgrade to plain TCP.
+/// paths the agent writes into the stream config. Scoped to the caller (or an
+/// admin): a tenant enabling remote access on their database must not be able
+/// to hang another user's certificate on the listener.
 async fn certificate_paths(
     state: &AppState,
     server_id: Uuid,
     certificate_id: Uuid,
+    user_id: Uuid,
+    is_admin: bool,
 ) -> Result<(String, String), ApiError> {
     let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT cert_path, key_path FROM tls_certificates WHERE id = $1 AND server_id = $2",
+        "SELECT cert_path, key_path FROM tls_certificates \
+         WHERE id = $1 AND server_id = $2 AND (user_id = $3 OR $4)",
     )
     .bind(certificate_id)
     .bind(server_id)
+    .bind(user_id)
+    .bind(is_admin)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| internal_error("resolve certificate", e))?;
@@ -157,6 +163,7 @@ pub(crate) async fn create_proxy(
     certificate_id: Option<Uuid>,
     database_id: Option<Uuid>,
     container_id: Option<&str>,
+    caller_is_admin: bool,
 ) -> Result<TcpProxy, ApiError> {
     let listen_port = allocate_listen_port(state, server_id).await?;
 
@@ -180,7 +187,8 @@ pub(crate) async fn create_proxy(
     if tls {
         let cert_id = certificate_id
             .ok_or_else(|| err(StatusCode::BAD_REQUEST, "tls requires certificate_id"))?;
-        let (cert_path, key_path) = certificate_paths(state, server_id, cert_id).await?;
+        let (cert_path, key_path) =
+            certificate_paths(state, server_id, cert_id, user_id, caller_is_admin).await?;
         agent_body["cert_path"] = serde_json::json!(cert_path);
         agent_body["key_path"] = serde_json::json!(key_path);
     }
@@ -311,6 +319,7 @@ pub async fn create(
         body.certificate_id,
         None,
         None,
+        true,
     )
     .await?;
 
