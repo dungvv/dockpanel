@@ -32,12 +32,6 @@ DB_PORT=5450
 DB_CONTAINER="dockpanel-postgres"
 INSTALL_FROM_RELEASE="${INSTALL_FROM_RELEASE:-0}"
 GITHUB_REPO="ovexro/dockpanel"
-# Which reverse proxy this box is served by: traefik | nginx. Recorded on disk by
-# write_installation_mode and read back by update.sh, which treats a MISSING or
-# unreadable marker as legacy nginx — every install that predates this file is an
-# nginx one, so a traefik-first default must never be applied by inference.
-INSTALLATION_MODE_FILE="${CONFIG_DIR}/installation-mode"
-INSTALLATION_MODE="${INSTALLATION_MODE:-traefik}"
 # Set to 1 by configure_nginx when the panel is served over a self-signed
 # certificate (no domain → no Let's Encrypt). print_summary reads it to print
 # the right scheme and explain the browser warning before it happens.
@@ -68,45 +62,6 @@ agent_rwp_dirs() {
     [ -f "$unit" ] || unit="/etc/systemd/system/dockpanel-agent.service"
     [ -f "$unit" ] || return 0
     sed -n 's/^ReadWritePaths=//p' "$unit" | tr ' ' '\n' | sed 's/^-//' | grep '^/' || true
-}
-
-# ── Installation mode ────────────────────────────────────────────────────
-# The reverse proxy this box is pinned to, read from the marker written here at
-# install time. Only two values are valid; anything else is treated as ABSENT so
-# a corrupted marker can never put a box into a mode it was not installed in.
-# On a fresh install the marker does not exist yet — that is what
-# INSTALLATION_MODE (default traefik, above) is for.
-installation_mode() {
-    local mode="${INSTALLATION_MODE:-traefik}"
-    if [ -r "$INSTALLATION_MODE_FILE" ]; then
-        local v
-        v=$(cat "$INSTALLATION_MODE_FILE" 2>/dev/null || true)
-        v=$(printf '%s' "$v" | tr -d '[:space:]')
-        case "$v" in
-            traefik|nginx) printf '%s' "$v"; return 0 ;;
-        esac
-    fi
-    case "$mode" in
-        traefik|nginx) printf '%s' "$mode" ;;
-        *)             printf '%s' 'traefik' ;;
-    esac
-}
-
-# Persist the resolved mode. A transaction-ordering task (later) wraps this in
-# the install's commit step; kept as its own helper so that step has one writer.
-write_installation_mode() {
-    local mode="${1:-$INSTALLATION_MODE}"
-    case "$mode" in
-        traefik|nginx) ;;
-        *) warn "Refusing to write invalid installation mode '$mode'"; return 1 ;;
-    esac
-    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
-    printf '%s\n' "$mode" > "$INSTALLATION_MODE_FILE"
-}
-
-# True when this box predates the marker and must be served/upgraded as nginx.
-is_legacy_nginx_install() {
-    [ "$(installation_mode)" = "nginx" ]
 }
 
 # ── Colors ───────────────────────────────────────────────────────────────

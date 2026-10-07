@@ -173,32 +173,6 @@ MCP_BIN="/usr/local/bin/dockpanel-mcp"
 INSTALL_FROM_RELEASE="${INSTALL_FROM_RELEASE:-0}"
 GITHUB_REPO="ovexro/dockpanel"
 
-# ── Installation mode ────────────────────────────────────────────────────
-# The reverse proxy this box is pinned to, read from the marker written at install
-# time. A missing or invalid marker is treated as LEGACY nginx: every box that
-# predates this marker IS an nginx one, and the update path must never infer traefik
-# from an existing container or setting — that container could be a test run the
-# operator left behind, and moving a working nginx install onto a broken traefik one
-# is the defect this marker exists to prevent.
-INSTALLATION_MODE_FILE="${CONFIG_DIR:-/etc/dockpanel}/installation-mode"
-
-installation_mode() {
-    if [ -r "$INSTALLATION_MODE_FILE" ]; then
-        local v
-        v=$(cat "$INSTALLATION_MODE_FILE" 2>/dev/null || true)
-        v=$(printf '%s' "$v" | tr -d '[:space:]')
-        case "$v" in
-            traefik|nginx) printf '%s' "$v"; return 0 ;;
-        esac
-    fi
-    warn "Installation mode marker missing or invalid — treating as legacy nginx" >&2
-    printf 'nginx'
-}
-
-is_legacy_nginx_install() {
-    [ "$(installation_mode)" = "nginx" ]
-}
-
 # ── Mode detection (must run BEFORE self-refresh) ─────────────────────────
 # Self-refresh is gated on INSTALL_FROM_RELEASE=1, so the auto-detect that
 # flips it to 1 has to happen first. v2.8.15 and earlier had this in the
