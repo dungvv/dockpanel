@@ -1001,6 +1001,98 @@ if [ "$NGINX_NEEDS_RELOAD" = "1" ] || [ "$NGINX_NEEDS_RESTART" = "1" ]; then
     fi
 fi
 
+# ── nginx stream module: TCP proxies ──────────────────────────────────────
+# Database remote access and generic TCP forwards terminate on nginx's
+# `stream` context — a TOP-LEVEL sibling of `http {}`. Boxes installed before
+# this feature never got the include; wire it idempotently here. Same helpers
+# as setup.sh (scripts do not share code, so both carry a copy).
+nginx_stream_module_ready() {
+    local flags mods
+    flags="$(nginx -V 2>&1)" || return 1
+    case "$flags" in
+        *--with-stream=dynamic*)
+            for mods in /etc/nginx/modules-enabled /etc/nginx/modules.d \
+                        /usr/share/nginx/modules /usr/lib64/nginx/modules; do
+                [ -d "$mods" ] || continue
+                grep -qE 'load_module[^;]*ngx_stream' "$mods"/*.conf 2>/dev/null && return 0
+            done
+            grep -qE '^[[:space:]]*load_module[^;]*ngx_stream' /etc/nginx/nginx.conf 2>/dev/null
+            ;;
+        *--with-stream*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+ensure_stream_include_in() {
+    local conf="$1"
+    [ -f "$conf" ] || return 0
+    grep -qF 'include /etc/nginx/dockpanel-streams/*.conf;' "$conf" && return 0
+    awk '
+        FNR == NR {
+            if ($0 ~ /^[[:space:]]*stream[[:space:]]*\{/) has_stream = 1
+            next
+        }
+        has_stream && !done && /^[[:space:]]*stream[[:space:]]*\{/ {
+            print
+            print "    include /etc/nginx/dockpanel-streams/*.conf;"
+            done = 1
+            next
+        }
+        !has_stream && !done && /^[[:space:]]*http[[:space:]]*\{/ {
+            print "stream {"
+            print "    include /etc/nginx/dockpanel-streams/*.conf;"
+            print "}"
+            print ""
+            done = 1
+        }
+        { print }
+        END {
+            if (!done) {
+                print ""
+                print "stream {"
+                print "    include /etc/nginx/dockpanel-streams/*.conf;"
+                print "}"
+            }
+        }
+    ' "$conf" "$conf" > "$conf.dockpanel-new" &&
+      grep -qF 'dockpanel-streams' "$conf.dockpanel-new" &&
+      mv "$conf.dockpanel-new" "$conf"
+    rm -f "$conf.dockpanel-new"
+}
+
+if command -v nginx > /dev/null 2>&1 && [ -f /etc/nginx/nginx.conf ]; then
+    mkdir -p /etc/nginx/dockpanel-streams
+    if ! grep -qF 'include /etc/nginx/dockpanel-streams/*.conf;' /etc/nginx/nginx.conf; then
+        # The module must be loadable BEFORE the include is written: `stream`
+        # in a module-less nginx is an unknown directive, and the next
+        # restart would refuse the entire config. Best-effort install — the
+        # box keeps working either way; proxy creation fails closed instead.
+        if ! nginx_stream_module_ready; then
+            if command -v apt-get > /dev/null 2>&1; then
+                apt-get install -y libnginx-mod-stream > /dev/null 2>&1 || true
+            elif command -v dnf > /dev/null 2>&1; then
+                dnf install -y nginx-mod-stream > /dev/null 2>&1 || true
+            elif command -v yum > /dev/null 2>&1; then
+                yum install -y nginx-mod-stream > /dev/null 2>&1 || true
+            fi
+        fi
+        if nginx_stream_module_ready; then
+            cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.dockpanel-stream-bak
+            ensure_stream_include_in /etc/nginx/nginx.conf
+            if nginx -t > /dev/null 2>&1; then
+                rm -f /etc/nginx/nginx.conf.dockpanel-stream-bak
+                nginx -s reload > /dev/null 2>&1 || true
+                log "nginx stream include enabled (/etc/nginx/dockpanel-streams/)"
+            else
+                mv /etc/nginx/nginx.conf.dockpanel-stream-bak /etc/nginx/nginx.conf
+                log "WARN: nginx -t rejected the stream include — nginx.conf restored"
+            fi
+        else
+            log "WARN: nginx stream module unavailable — TCP proxies disabled on this box"
+        fi
+    fi
+fi
+
 # ── webmail nginx fragment: healed by the AGENT, not here ─────────
 # This used to hold a hand-copied mirror of the fragment and rewrite it when
 # `sub_filter` was missing. The mirror froze at the v2.10.1 shape and never

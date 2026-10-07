@@ -669,6 +669,109 @@ install_nginx() {
     svc_ok "Nginx${nv:+ $nv}"
 }
 
+# ── Nginx stream module (TCP proxies) ─────────────────────────────────────
+# Database remote access and generic TCP forwards terminate on nginx's
+# `stream` context — a TOP-LEVEL sibling of `http {}`, so the include cannot
+# live in sites-enabled/conf.d. Managed proxies each get one file under
+# /etc/nginx/dockpanel-streams/, written by the agent behind `nginx -t`.
+
+# True only when nginx can actually parse a `stream {}` block: compiled-in
+# (--with-stream) or a loadable dynamic module (=dynamic PLUS a load_module
+# line that reaches the config). `=dynamic` alone only means the build CAN
+# load the .so — it says nothing about the package being installed.
+nginx_stream_module_ready() {
+    local flags mods
+    flags="$(nginx -V 2>&1)" || return 1
+    case "$flags" in
+        *--with-stream=dynamic*)
+            for mods in /etc/nginx/modules-enabled /etc/nginx/modules.d \
+                        /usr/share/nginx/modules /usr/lib64/nginx/modules; do
+                [ -d "$mods" ] || continue
+                grep -qE 'load_module[^;]*ngx_stream' "$mods"/*.conf 2>/dev/null && return 0
+            done
+            grep -qE '^[[:space:]]*load_module[^;]*ngx_stream' /etc/nginx/nginx.conf 2>/dev/null
+            ;;
+        *--with-stream*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Insert the managed include into the nginx.conf passed as $1, exactly once,
+# at top level. The include line itself is the sentinel — an operator's own
+# `stream {}` block gets the include placed inside it rather than a second
+# (illegal duplicate) top-level block.
+ensure_stream_include_in() {
+    local conf="$1"
+    [ -f "$conf" ] || return 0
+    grep -qF 'include /etc/nginx/dockpanel-streams/*.conf;' "$conf" && return 0
+    awk '
+        FNR == NR {
+            if ($0 ~ /^[[:space:]]*stream[[:space:]]*\{/) has_stream = 1
+            next
+        }
+        has_stream && !done && /^[[:space:]]*stream[[:space:]]*\{/ {
+            print
+            print "    include /etc/nginx/dockpanel-streams/*.conf;"
+            done = 1
+            next
+        }
+        !has_stream && !done && /^[[:space:]]*http[[:space:]]*\{/ {
+            print "stream {"
+            print "    include /etc/nginx/dockpanel-streams/*.conf;"
+            print "}"
+            print ""
+            done = 1
+        }
+        { print }
+        END {
+            if (!done) {
+                print ""
+                print "stream {"
+                print "    include /etc/nginx/dockpanel-streams/*.conf;"
+                print "}"
+            }
+        }
+    ' "$conf" "$conf" > "$conf.dockpanel-new" &&
+      grep -qF 'dockpanel-streams' "$conf.dockpanel-new" &&
+      mv "$conf.dockpanel-new" "$conf"
+    rm -f "$conf.dockpanel-new"
+}
+
+ensure_nginx_stream() {
+    command -v nginx > /dev/null 2>&1 || return 0
+    [ -f /etc/nginx/nginx.conf ] || return 0
+    mkdir -p /etc/nginx/dockpanel-streams
+
+    if grep -qF 'include /etc/nginx/dockpanel-streams/*.conf;' /etc/nginx/nginx.conf; then
+        return 0
+    fi
+
+    # The module must be loadable BEFORE the include is written: `stream` in
+    # a module-less nginx is an unknown directive, and the next restart would
+    # refuse the whole config — taking the panel and every site down with it.
+    if ! nginx_stream_module_ready; then
+        case "$PKG_MGR" in
+            apt)     run "Installing nginx stream module" pkg_install libnginx-mod-stream || true ;;
+            dnf|yum) run "Installing nginx stream module" pkg_install nginx-mod-stream || true ;;
+        esac
+    fi
+    if ! nginx_stream_module_ready; then
+        warn "nginx stream module unavailable — TCP proxies disabled, HTTP/HTTPS unaffected"
+        return 0
+    fi
+
+    cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.dockpanel-stream-bak
+    ensure_stream_include_in /etc/nginx/nginx.conf
+    if nginx -t > /dev/null 2>&1; then
+        rm -f /etc/nginx/nginx.conf.dockpanel-stream-bak
+        nginx -s reload > /dev/null 2>&1 || true
+        log "Nginx stream include enabled (/etc/nginx/dockpanel-streams/)"
+    else
+        mv /etc/nginx/nginx.conf.dockpanel-stream-bak /etc/nginx/nginx.conf
+        warn "nginx -t rejected the stream include — nginx.conf restored"
+    fi
+}
+
 install_node() {
     header "Node.js (for frontend build)"
 
@@ -2219,6 +2322,9 @@ main() {
     # open the socket to the API at all, and the denial is silent.
     configure_selinux
     configure_nginx
+    # TCP proxies (database remote access, generic TCP forwards) terminate on
+    # nginx's stream context — this wires the module and the top-level include.
+    ensure_nginx_stream
     create_services
 
     # Wait for services to start
