@@ -13,7 +13,7 @@
 //! validate everything, write temp+rename, `nginx -t`, reload, and roll the
 //! file back with `restore_or_remove` when the test rejects it.
 
-use crate::services::nginx::{restore_or_remove, restore_note, test_config};
+use crate::services::nginx::{restore_note, restore_or_remove, test_config};
 
 /// Where the top-level `stream { include … }` block points. Created by
 /// setup.sh/update.sh; the agent refuses to write when the include is not
@@ -137,16 +137,72 @@ pub fn stream_config_path(name: &str) -> String {
     format!("{STREAM_DIR}/{name}.conf")
 }
 
+/// The loopback port a managed database container is bound to, read from the
+/// container itself. A caller can name `container_id` but never the upstream
+/// — the binding the container actually has is the only honest answer, and
+/// one that survives the panel's own `databases.port` row drifting.
+///
+/// Refuses two ways on purpose: the container must carry the managed label
+/// (a TCP forward into an arbitrary container is a read primitive on
+/// loopback-bound services), and it must already publish on `127.0.0.1` —
+/// this code never adds a public Docker port binding.
+pub async fn container_loopback_port(
+    docker: &bollard::Docker,
+    container_id: &str,
+) -> Result<u16, String> {
+    let info = docker
+        .inspect_container(container_id, None)
+        .await
+        .map_err(|e| format!("cannot inspect container '{container_id}': {e}"))?;
+
+    let managed = info
+        .config
+        .as_ref()
+        .and_then(|c| c.labels.as_ref())
+        .and_then(|l| l.get("dockpanel.managed"))
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if !managed {
+        return Err(format!(
+            "container '{container_id}' is not panel-managed — refusing to proxy to it"
+        ));
+    }
+
+    let bindings = info
+        .host_config
+        .as_ref()
+        .and_then(|h| h.port_bindings.as_ref());
+
+    let port = bindings.and_then(|m| {
+        m.values()
+            .flatten() // Option<Vec<PortBinding>> -> &Vec<PortBinding>
+            .flatten() // &Vec<PortBinding> -> &PortBinding
+            .find_map(|b| {
+                let host_ip_ok = b
+                    .host_ip
+                    .as_deref()
+                    .map(|ip| ip == "127.0.0.1" || ip == "::1")
+                    .unwrap_or(false);
+                if host_ip_ok {
+                    b.host_port.as_deref().and_then(|p| p.parse::<u16>().ok())
+                } else {
+                    None
+                }
+            })
+    });
+
+    port.ok_or_else(|| {
+        format!(
+            "container '{container_id}' has no loopback port binding — refusing to guess an upstream"
+        )
+    })
+}
+
 /// Render one stream `server {}` block. Everything interpolated here has
 /// already passed the validators; the render itself asserts nothing.
-pub fn render_stream_server(
-    listen_port: u16,
-    upstream: &str,
-    tls: Option<&TlsPaths>,
-) -> String {
-    let mut out = String::from(
-        "# Managed by DockPanel — do not edit; rewritten by the agent.\nserver {\n",
-    );
+pub fn render_stream_server(listen_port: u16, upstream: &str, tls: Option<&TlsPaths>) -> String {
+    let mut out =
+        String::from("# Managed by DockPanel — do not edit; rewritten by the agent.\nserver {\n");
     match tls {
         Some(t) => {
             out.push_str(&format!("    listen {listen_port} ssl;\n"));
@@ -212,8 +268,7 @@ pub async fn write_stream_proxy(
     let previous = std::fs::read_to_string(&path).ok();
     let body = render_stream_server(listen_port, &upstream, tls);
 
-    std::fs::create_dir_all(STREAM_DIR)
-        .map_err(|e| format!("cannot create {STREAM_DIR}: {e}"))?;
+    std::fs::create_dir_all(STREAM_DIR).map_err(|e| format!("cannot create {STREAM_DIR}: {e}"))?;
     let tmp = format!("{path}.tmp");
     std::fs::write(&tmp, &body)
         .and_then(|_| std::fs::rename(&tmp, &path))
@@ -285,7 +340,11 @@ pub fn list_stream_proxies() -> Vec<(String, String)> {
         if let Ok(body) = std::fs::read_to_string(entry.path()) {
             let upstream = body
                 .lines()
-                .find_map(|l| l.trim().strip_prefix("proxy_pass ").map(|s| s.trim_end_matches(';')))
+                .find_map(|l| {
+                    l.trim()
+                        .strip_prefix("proxy_pass ")
+                        .map(|s| s.trim_end_matches(';'))
+                })
                 .unwrap_or("")
                 .to_string();
             let listen = body
@@ -325,16 +384,16 @@ mod tests {
         let body = render_stream_server(40002, "127.0.0.1:3306", Some(&tls));
         assert!(body.contains("listen 40002 ssl;"));
         assert!(body.contains("ssl_certificate /etc/dockpanel/ssl/registry/x/fullchain.pem;"));
-        assert!(body.contains(
-            "ssl_certificate_key /etc/dockpanel/ssl/registry/x/privkey.pem;"
-        ));
+        assert!(body.contains("ssl_certificate_key /etc/dockpanel/ssl/registry/x/privkey.pem;"));
     }
 
     #[test]
     fn proxy_names_that_escape_the_directory_are_rejected() {
         assert!(validate_proxy_name("db-main").is_ok());
         assert!(validate_proxy_name("a").is_ok());
-        for bad in ["../evil", "a b", "Name", "x;y", "-lead", "trail-", "", "a/b"] {
+        for bad in [
+            "../evil", "a b", "Name", "x;y", "-lead", "trail-", "", "a/b",
+        ] {
             assert!(validate_proxy_name(bad).is_err(), "accepted '{bad}'");
         }
         let long = "a".repeat(49);
@@ -345,7 +404,14 @@ mod tests {
     fn listen_ports_stay_inside_the_managed_range() {
         assert!(validate_listen_port(LISTEN_PORT_MIN).is_ok());
         assert!(validate_listen_port(LISTEN_PORT_MAX).is_ok());
-        for p in [0u16, 80, 443, 3080, LISTEN_PORT_MIN - 1, LISTEN_PORT_MAX + 1] {
+        for p in [
+            0u16,
+            80,
+            443,
+            3080,
+            LISTEN_PORT_MIN - 1,
+            LISTEN_PORT_MAX + 1,
+        ] {
             assert!(validate_listen_port(p).is_err(), "accepted port {p}");
         }
     }
@@ -354,8 +420,22 @@ mod tests {
     fn upstream_hosts_are_strictly_validated() {
         assert_eq!(normalize_upstream_host("127.0.0.1").unwrap(), "127.0.0.1");
         assert_eq!(normalize_upstream_host("[::1]").unwrap(), "[::1]");
-        assert_eq!(normalize_upstream_host("db.internal").unwrap(), "db.internal");
-        for bad in ["", " ", "a; rm -rf", "a b", "-x", ".x", "x.", "a..b", "[::1", "999.1.1.1"] {
+        assert_eq!(
+            normalize_upstream_host("db.internal").unwrap(),
+            "db.internal"
+        );
+        for bad in [
+            "",
+            " ",
+            "a; rm -rf",
+            "a b",
+            "-x",
+            ".x",
+            "x.",
+            "a..b",
+            "[::1",
+            "999.1.1.1",
+        ] {
             assert!(normalize_upstream_host(bad).is_err(), "accepted '{bad}'");
         }
     }
@@ -372,7 +452,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let with = dir.join("with.conf");
         let without = dir.join("without.conf");
-        std::fs::write(&with, "stream { include /etc/nginx/dockpanel-streams/*.conf; }\nhttp {}\n").unwrap();
+        std::fs::write(
+            &with,
+            "stream { include /etc/nginx/dockpanel-streams/*.conf; }\nhttp {}\n",
+        )
+        .unwrap();
         std::fs::write(&without, "events {} http {}\n").unwrap();
         assert!(stream_available_at(&with));
         assert!(!stream_available_at(&without));

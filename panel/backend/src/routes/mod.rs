@@ -38,6 +38,7 @@ pub mod staging;
 pub mod sites;
 pub mod system_logs;
 pub mod teams;
+pub mod tcp_proxies;
 pub mod tls_certificates;
 pub mod ssl;
 pub mod system;
@@ -1205,6 +1206,11 @@ pub fn router() -> Router<AppState> {
         .route("/api/databases/{id}/reset-password", post(databases::reset_password))
         .route("/api/databases/{id}/dumps", get(databases::dumps))
         .route("/api/databases/{id}/import", post(databases::import))
+        .route("/api/databases/{id}/remote-access", post(databases::remote_access_enable).delete(databases::remote_access_disable))
+        // TCP proxies (nginx stream): generic forwards are admin-level;
+        // kind='database' rows are managed via the remote-access endpoints.
+        .route("/api/tcp-proxies", get(tcp_proxies::list).post(tcp_proxies::create))
+        .route("/api/tcp-proxies/{id}", delete(tcp_proxies::remove))
         // Compose Stacks
         .route("/api/stacks", get(stacks::list).post(stacks::create))
         .route("/api/stacks/{id}", get(stacks::get_one).put(stacks::update).delete(stacks::remove))

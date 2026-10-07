@@ -21,6 +21,17 @@ assert_contains() {
 }
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+AGENT_STREAM_SVC="$REPO/panel/agent/src/services/nginx_stream.rs"
+AGENT_STREAM_ROUTE="$REPO/panel/agent/src/routes/nginx_stream.rs"
+BACKEND_TCP="$REPO/panel/backend/src/routes/tcp_proxies.rs"
+BACKEND_DB="$REPO/panel/backend/src/routes/databases.rs"
+AGENT_DB_SVC="$REPO/panel/agent/src/services/database.rs"
+MIGRATION="$(ls "$REPO"/panel/backend/migrations/*_tcp_proxies.sql 2>/dev/null | head -1)"
+
+echo "── S0: files exist ──"
+for f in "$AGENT_STREAM_SVC" "$AGENT_STREAM_ROUTE" "$BACKEND_TCP" "$MIGRATION"; do
+    [ -n "$f" ] && [ -f "$f" ] && ok "$(basename "$f") exists" || bad "missing: $f"
+done
 
 echo "── S1: source pins ──"
 assert_contains "$SETUP" 'dockpanel-streams' "setup.sh manages a stream include dir"
@@ -131,6 +142,39 @@ check "existing stream block: no second block added" \
       "$(grep -cE '^stream \{' "$TMP/existing.conf")" "1"
 check "no http anchor: block appended" \
       "$(grep -cE '^stream \{' "$TMP/nohttp.conf")" "1"
+
+echo
+echo "── S3: agent service contract ──"
+assert_contains "$AGENT_STREAM_SVC" 'STREAM_DIR: &str = "/etc/nginx/dockpanel-streams"' \
+    "agent writes into the managed stream dir"
+assert_contains "$AGENT_STREAM_SVC" 'restore_or_remove' \
+    "stream writes roll back through the vhost rollback path"
+assert_contains "$AGENT_STREAM_SVC" 'test_config' \
+    "stream writes are gated by nginx -t"
+assert_contains "$AGENT_STREAM_SVC" 'container_loopback_port' \
+    "database upstreams are read off the container, not the wire"
+assert_contains "$AGENT_STREAM_SVC" 'dockpanel.managed' \
+    "container upstreams require the managed label"
+# The render must never be reachable from the route file — routes delegate.
+check "route file has no inline server block" \
+      "$(grep -c 'server {' "$AGENT_STREAM_ROUTE")" "0"
+assert_contains "$AGENT_STREAM_ROUTE" 'write_stream_proxy' "route delegates writes"
+assert_contains "$AGENT_STREAM_ROUTE" 'firewall::add_port' "create opens the firewall port"
+assert_contains "$AGENT_STREAM_ROUTE" 'firewall::remove_port' "delete closes the firewall port"
+
+echo
+echo "── S4: database remote access contract ──"
+assert_contains "$AGENT_DB_SVC" 'host_ip: Some("127.0.0.1".to_string())' \
+    "db containers keep loopback-only port bindings"
+check "no public host_ip publish added for databases" \
+      "$(cat "$AGENT_DB_SVC" "$BACKEND_DB" | grep -cE 'host_ip: Some\("0\.0\.0\.0"')" "0"
+assert_contains "$BACKEND_DB" 'remote_access_enable' "backend exposes the enable endpoint"
+assert_contains "$BACKEND_DB" 'remote_access_disable' "backend exposes the disable endpoint"
+assert_contains "$BACKEND_DB" 'tcp_proxies' "database delete cleans up its stream proxy"
+assert_contains "$MIGRATION" 'kind' "tcp_proxies records the proxy kind"
+assert_contains "$MIGRATION" 'database_id' "tcp_proxies links proxies to databases"
+assert_contains "$MIGRATION" 'ON DELETE CASCADE' "db delete cascades its proxy row"
+assert_contains "$BACKEND_TCP" '40000' "backend enforces the managed port range"
 
 echo
 printf 'PASS: %d   FAIL: %d\n' "$PASS" "$FAIL"

@@ -188,6 +188,7 @@ async fn main() {
         .merge(routes::health::router())
         .merge(routes::system::router())
         .merge(routes::nginx::router())
+        .merge(routes::nginx_stream::router())
         .merge(routes::ssl::router())
         .merge(routes::ssl_registry::router())
         .merge(routes::database::router())

@@ -80,6 +80,11 @@ pub struct Database {
     pub db_user: String,
     pub container_id: Option<String>,
     pub port: Option<i32>,
+    /// Public TCP listen port when remote access is on — NULL otherwise.
+    /// `#[sqlx(default)]` lets queries that predate the column (e.g. create's
+    /// RETURNING) still hydrate the struct.
+    #[sqlx(default)]
+    pub remote_port: Option<i32>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -101,7 +106,9 @@ pub async fn list(
     // owner across the two joins and COALESCE picks whichever is present — one
     // query covers site-owned and stack-owned databases without a UNION.
     let dbs: Vec<Database> = sqlx::query_as(
-        "SELECT d.id, d.site_id, d.stack_id, d.name, d.engine, d.db_user, d.container_id, d.port, d.created_at \
+        "SELECT d.id, d.site_id, d.stack_id, d.name, d.engine, d.db_user, d.container_id, d.port, \
+         (SELECT p.listen_port FROM tcp_proxies p WHERE p.database_id = d.id) AS remote_port, \
+         d.created_at \
          FROM databases d \
          LEFT JOIN sites s ON d.site_id = s.id \
          LEFT JOIN docker_stacks st ON d.stack_id = st.id \
@@ -459,6 +466,27 @@ pub async fn remove(
         let agent_path = format!("/databases/{cid}");
         agent.delete(&agent_path).await
             .map_err(|e| agent_error("Database removal", e))?;
+    }
+
+    // Its remote-access stream proxy dies with it: the nginx listener must go
+    // before the row, or the public port stays open proxying a dead container.
+    let proxy: Option<(String, i32)> = sqlx::query_as(
+        "SELECT name, listen_port FROM tcp_proxies WHERE database_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("lookup database tcp proxy", e))?;
+    if let Some((pname, pport)) = proxy {
+        let ppath = format!("/nginx/streams/{pname}?listen_port={pport}");
+        if let Err(e) = agent.delete(&ppath).await {
+            tracing::warn!("stream proxy {pname} cleanup failed during database delete: {e}");
+        }
+        sqlx::query("DELETE FROM tcp_proxies WHERE database_id = $1")
+            .bind(id)
+            .execute(&state.db)
+            .await
+            .ok();
     }
 
     // Delete from DB
@@ -1469,9 +1497,173 @@ pub async fn import(
     Ok(Json(result))
 }
 
+// ─── Remote access (nginx stream TCP proxy) ───────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct RemoteAccessRequest {
+    #[serde(default)]
+    pub tls: bool,
+    pub certificate_id: Option<Uuid>,
+}
+
+/// The proxy's nginx-side name: `db-` plus the database name rewritten into
+/// the stream slug alphabet (`[a-z0-9-]`), truncated to the 48-char cap with
+/// any trailing '-' a cut could leave behind stripped.
+fn proxy_name_for_db(name: &str) -> String {
+    let slug: String = format!("db-{}", name.replace('_', "-").to_lowercase())
+        .chars()
+        .take(48)
+        .collect();
+    slug.trim_end_matches('-').to_string()
+}
+
+/// Load a caller-owned database row along with its owner's server — the same
+/// LEFT JOIN + COALESCE shape as remove(), because acting on the wrong host
+/// is the defect this ordering exists to prevent.
+#[allow(clippy::type_complexity)]
+async fn owned_db_for_remote_access(
+    state: &AppState,
+    id: Uuid,
+    user_id: Uuid,
+) -> Result<(String, Option<i32>, Option<String>, Option<Uuid>, Option<String>), ApiError> {
+    let row: Option<(String, Option<i32>, Option<String>, Option<Uuid>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT d.name, d.port, d.container_id, COALESCE(s.server_id, st.server_id), \
+             sv.ip_address FROM databases d \
+             LEFT JOIN sites s ON d.site_id = s.id \
+             LEFT JOIN docker_stacks st ON d.stack_id = st.id \
+             LEFT JOIN servers sv ON sv.id = COALESCE(s.server_id, st.server_id) \
+             WHERE d.id = $1 AND (COALESCE(s.user_id, st.user_id) = $2 OR EXISTS \
+             (SELECT 1 FROM users u WHERE u.id = $2 AND u.role = 'admin' \
+              AND (sv.is_local OR sv.user_id = u.id)))",
+        )
+        .bind(id)
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("resolve database for remote access", e))?;
+
+    row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Database not found"))
+}
+
+/// POST /api/databases/{id}/remote-access — publish the database on a public
+/// TCP port through nginx's stream module. The upstream is the container's
+/// existing loopback binding; the agent reads it off the container, so what
+/// is on the wire is a container id, not a guessed port.
+pub async fn remote_access_enable(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    body: Option<Json<RemoteAccessRequest>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (name, port, container_id, server_id, server_ip) =
+        owned_db_for_remote_access(&state, id, claims.sub).await?;
+
+    let container_id = container_id
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| err(
+            StatusCode::CONFLICT,
+            "Database has no container yet — wait for creation to finish",
+        ))?;
+    let port = port.ok_or_else(|| err(StatusCode::CONFLICT, "Database has no bound port"))?;
+    let server_id = server_id
+        .ok_or_else(|| err(StatusCode::CONFLICT, "Database is not associated with a server"))?;
+    let owner_label = format!("database {name}");
+
+    let agent =
+        crate::helpers::agent_for_site_server(&state, Some(server_id), &owner_label).await?;
+
+    let (tls, certificate_id) = body
+        .map(|b| (b.tls, b.certificate_id))
+        .unwrap_or((false, None));
+
+    let row = crate::routes::tcp_proxies::create_proxy(
+        &state,
+        &agent,
+        server_id,
+        claims.sub,
+        &proxy_name_for_db(&name),
+        "database",
+        "127.0.0.1",
+        port,
+        tls,
+        certificate_id,
+        Some(id),
+        Some(container_id.as_str()),
+    )
+    .await?;
+
+    tracing::info!("Database remote access enabled: {name} on :{}", row.listen_port);
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "proxy_id": row.id,
+        "host": server_ip,
+        "listen_port": row.listen_port,
+        "upstream": format!("{}:{}", row.upstream_host, row.upstream_port),
+        "tls": row.tls,
+    })))
+}
+
+/// DELETE /api/databases/{id}/remote-access — remove the stream file, close
+/// the firewall port, and drop the tcp_proxies row.
+pub async fn remote_access_disable(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (name, _port, _container_id, server_id, _ip) =
+        owned_db_for_remote_access(&state, id, claims.sub).await?;
+    let server_id = server_id
+        .ok_or_else(|| err(StatusCode::CONFLICT, "Database is not associated with a server"))?;
+    let owner_label = format!("database {name}");
+    let agent =
+        crate::helpers::agent_for_site_server(&state, Some(server_id), &owner_label).await?;
+
+    let proxy: Option<(Uuid, String, i32)> = sqlx::query_as(
+        "SELECT id, name, listen_port FROM tcp_proxies WHERE database_id = $1 AND server_id = $2",
+    )
+    .bind(id)
+    .bind(server_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("lookup database tcp proxy", e))?;
+
+    let Some((pid, pname, pport)) = proxy else {
+        return Err(err(StatusCode::NOT_FOUND, "Remote access is not enabled for this database"));
+    };
+
+    // File + firewall first, row last — the row is the record of an open port.
+    let ppath = format!("/nginx/streams/{pname}?listen_port={pport}");
+    agent
+        .delete(&ppath)
+        .await
+        .map_err(|e| agent_error("Database remote access removal", e))?;
+
+    sqlx::query("DELETE FROM tcp_proxies WHERE id = $1")
+        .bind(pid)
+        .execute(&state.db)
+        .await
+        .map_err(|e| internal_error("delete database tcp proxy", e))?;
+
+    tracing::info!("Database remote access disabled: {name} (port {pport})");
+
+    Ok(Json(serde_json::json!({ "ok": true, "name": pname })))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_reserved_db_name;
+    use super::{is_reserved_db_name, proxy_name_for_db};
+
+    #[test]
+    fn remote_access_names_stay_in_the_stream_slug_alphabet() {
+        assert_eq!(proxy_name_for_db("blog"), "db-blog");
+        assert_eq!(proxy_name_for_db("app_db"), "db-app-db");
+        assert_eq!(proxy_name_for_db("MY_DATA"), "db-my-data");
+        let long = "x".repeat(60);
+        let n = proxy_name_for_db(&long);
+        assert!(n.len() <= 48 && !n.ends_with('-'), "got '{n}'");
+    }
 
     #[test]
     fn reserved_db_names_rejected_case_insensitive() {
