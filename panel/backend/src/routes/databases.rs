@@ -91,6 +91,8 @@ pub struct Database {
     pub remote_host: Option<String>,
     #[sqlx(default)]
     pub remote_tls: bool,
+    #[sqlx(default)]
+    pub remote_allow: Vec<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -117,6 +119,7 @@ pub async fn list(
          (SELECT sv.ip_address FROM tcp_proxies p JOIN servers sv ON sv.id = p.server_id \
           WHERE p.database_id = d.id) AS remote_host, \
          COALESCE((SELECT p.tls FROM tcp_proxies p WHERE p.database_id = d.id), FALSE) AS remote_tls, \
+         COALESCE((SELECT p.allow_cidrs FROM tcp_proxies p WHERE p.database_id = d.id), '{}') AS remote_allow, \
          d.created_at \
          FROM databases d \
          LEFT JOIN sites s ON d.site_id = s.id \
@@ -1517,6 +1520,9 @@ pub struct RemoteAccessRequest {
     #[serde(default)]
     pub tls: bool,
     pub certificate_id: Option<Uuid>,
+    /// Source IPs/CIDRs allowed to connect; empty means anyone.
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
 }
 
 /// The proxy's nginx-side name: `db-` plus the database name rewritten into
@@ -1586,9 +1592,9 @@ pub async fn remote_access_enable(
     let agent =
         crate::helpers::agent_for_site_server(&state, Some(server_id), &owner_label).await?;
 
-    let (tls, certificate_id) = body
-        .map(|b| (b.tls, b.certificate_id))
-        .unwrap_or((false, None));
+    let (tls, certificate_id, allow_cidrs) = body
+        .map(|b| (b.0.tls, b.0.certificate_id, b.0.allow_cidrs))
+        .unwrap_or((false, None, Vec::new()));
 
     let row = crate::routes::tcp_proxies::create_proxy(
         &state,
@@ -1604,6 +1610,7 @@ pub async fn remote_access_enable(
         Some(id),
         Some(container_id.as_str()),
         claims.role == "admin",
+        &allow_cidrs,
     )
     .await?;
 

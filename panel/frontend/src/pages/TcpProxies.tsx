@@ -17,6 +17,7 @@ interface TcpProxy {
   upstream_host: string;
   upstream_port: number;
   tls: boolean;
+  allow_cidrs: string[];
   created_at: string;
 }
 
@@ -39,6 +40,7 @@ export default function TcpProxies() {
   const [upstreamPort, setUpstreamPort] = useState("");
   const [tls, setTls] = useState(false);
   const [certId, setCertId] = useState("");
+  const [allow, setAllow] = useState("");
   const [certs, setCerts] = useState<TlsCertificateOption[]>([]);
   const [submitting, setSubmitting] = useState(false);
 
@@ -76,6 +78,7 @@ export default function TcpProxies() {
         upstream_port: parseInt(upstreamPort, 10),
         tls,
         ...(tls && certId ? { certificate_id: certId } : {}),
+        allow_cidrs: allow.split(/[\s,]+/).filter(Boolean),
       });
       setShowForm(false);
       setName("");
@@ -83,6 +86,7 @@ export default function TcpProxies() {
       setUpstreamPort("");
       setTls(false);
       setCertId("");
+      setAllow("");
       setSuccessMsg("TCP proxy created");
       fetchData();
     } catch (err) {
@@ -201,6 +205,20 @@ export default function TcpProxies() {
                 />
               </div>
             </div>
+            <div>
+              <label htmlFor="tp-allow" className="block text-sm font-medium text-dark-100 mb-1">
+                Allowed source IPs/CIDRs
+              </label>
+              <input
+                id="tp-allow"
+                type="text"
+                value={allow}
+                onChange={(e) => setAllow(e.target.value)}
+                placeholder="203.0.113.7, 198.51.100.0/24"
+                className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none text-sm"
+              />
+              <p className="text-xs text-dark-300 mt-1">Optional — empty allows anyone</p>
+            </div>
             <div className="flex items-end gap-4 flex-wrap">
               <label className="flex items-center gap-2 text-sm text-dark-200">
                 <input
@@ -277,6 +295,7 @@ export default function TcpProxies() {
                   <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden md:table-cell">Upstream</th>
                   <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden sm:table-cell">Kind</th>
                   <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden sm:table-cell">TLS</th>
+                  <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden md:table-cell">Allowed</th>
                   <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden lg:table-cell">Created</th>
                   <th scope="col" className="text-right text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3">Actions</th>
                 </tr>
@@ -292,6 +311,9 @@ export default function TcpProxies() {
                     <td className="px-5 py-4 text-sm text-dark-200 hidden sm:table-cell">{p.kind}</td>
                     <td className="px-5 py-4 text-sm text-dark-200 hidden sm:table-cell">
                       {p.tls ? "TLS" : "\u2014"}
+                    </td>
+                    <td className="px-5 py-4 text-sm text-dark-200 font-mono hidden md:table-cell">
+                      {p.allow_cidrs?.length ? p.allow_cidrs.join(", ") : "anyone"}
                     </td>
                     <td className="px-5 py-4 text-sm text-dark-200 hidden lg:table-cell">{formatDate(p.created_at)}</td>
                     <td className="px-5 py-4 text-right">

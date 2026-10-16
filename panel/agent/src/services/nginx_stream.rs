@@ -131,6 +131,24 @@ pub fn normalize_upstream(host: &str, port: u16) -> Result<String, String> {
     Ok(format!("{host}:{port}"))
 }
 
+/// Normalize one source-allow entry: an IP or `ip/bits` CIDR. The output is
+/// re-rendered from the parsed address, so nothing the caller typed reaches
+/// the config verbatim.
+pub fn normalize_allow_entry(entry: &str) -> Result<String, String> {
+    let e = entry.trim();
+    let bad = || format!("invalid allow entry '{e}' — use an IP or CIDR like 203.0.113.0/24");
+    let (ip, bits) = match e.split_once('/') {
+        Some((ip, bits)) => (ip, Some(bits.parse::<u8>().map_err(|_| bad())?)),
+        None => (e, None),
+    };
+    let ip: std::net::IpAddr = ip.parse().map_err(|_| bad())?;
+    match bits {
+        None => Ok(ip.to_string()),
+        Some(b) if b <= if ip.is_ipv4() { 32 } else { 128 } => Ok(format!("{ip}/{b}")),
+        Some(_) => Err(bad()),
+    }
+}
+
 /// The one file a proxy lives in. Validated names make this safe to build by
 /// string interpolation alone.
 pub fn stream_config_path(name: &str) -> String {
@@ -200,7 +218,12 @@ pub async fn container_loopback_port(
 
 /// Render one stream `server {}` block. Everything interpolated here has
 /// already passed the validators; the render itself asserts nothing.
-pub fn render_stream_server(listen_port: u16, upstream: &str, tls: Option<&TlsPaths>) -> String {
+pub fn render_stream_server(
+    listen_port: u16,
+    upstream: &str,
+    tls: Option<&TlsPaths>,
+    allow: &[String],
+) -> String {
     let mut out =
         String::from("# Managed by DockPanel — do not edit; rewritten by the agent.\nserver {\n");
     match tls {
@@ -211,6 +234,14 @@ pub fn render_stream_server(listen_port: u16, upstream: &str, tls: Option<&TlsPa
             out.push_str("    ssl_protocols TLSv1.2 TLSv1.3;\n");
         }
         None => out.push_str(&format!("    listen {listen_port};\n")),
+    }
+    // An empty list means open to anyone; otherwise only the listed sources
+    // get a TCP handshake through to the upstream.
+    if !allow.is_empty() {
+        for a in allow {
+            out.push_str(&format!("    allow {a};\n"));
+        }
+        out.push_str("    deny all;\n");
     }
     out.push_str(&format!("    proxy_pass {upstream};\n"));
     // Database connections idle far past nginx's 10m default; killing them
@@ -236,10 +267,15 @@ pub async fn write_stream_proxy(
     upstream_host: &str,
     upstream_port: u16,
     tls: Option<&TlsPaths>,
+    allow: &[String],
 ) -> Result<String, String> {
     validate_proxy_name(name)?;
     validate_listen_port(listen_port)?;
     let upstream = normalize_upstream(upstream_host, upstream_port)?;
+    let allow = allow
+        .iter()
+        .map(|a| normalize_allow_entry(a))
+        .collect::<Result<Vec<_>, _>>()?;
 
     if !stream_available() {
         return Err(
@@ -265,7 +301,7 @@ pub async fn write_stream_proxy(
     }
 
     let path = stream_config_path(name);
-    let body = render_stream_server(listen_port, &upstream, tls);
+    let body = render_stream_server(listen_port, &upstream, tls, &allow);
 
     std::fs::create_dir_all(STREAM_DIR).map_err(|e| format!("cannot create {STREAM_DIR}: {e}"))?;
     // Create never overwrites: a second create for a live name (a double
@@ -376,12 +412,31 @@ mod tests {
 
     #[test]
     fn plain_render_has_listen_proxy_pass_and_timeouts() {
-        let body = render_stream_server(40001, "127.0.0.1:5450", None);
+        let body = render_stream_server(40001, "127.0.0.1:5450", None, &[]);
         assert!(body.contains("listen 40001;"));
         assert!(body.contains("proxy_pass 127.0.0.1:5450;"));
         assert!(body.contains("proxy_connect_timeout"));
         assert!(body.contains("proxy_timeout"));
         assert!(!body.contains("ssl"), "plain proxy must not claim TLS");
+        assert!(!body.contains("deny"), "empty allow list must stay open");
+    }
+
+    #[test]
+    fn allow_list_renders_allow_lines_then_deny_all() {
+        let allow = vec!["203.0.113.0/24".to_string(), "2001:db8::1".to_string()];
+        let body = render_stream_server(40003, "127.0.0.1:5432", None, &allow);
+        let a = body.find("allow 203.0.113.0/24;").unwrap();
+        let d = body.find("deny all;").unwrap();
+        assert!(a < d && body.contains("allow 2001:db8::1;"));
+    }
+
+    #[test]
+    fn allow_entries_are_reparsed_not_echoed() {
+        assert_eq!(normalize_allow_entry(" 10.0.0.0/8 ").unwrap(), "10.0.0.0/8");
+        assert_eq!(normalize_allow_entry("::1").unwrap(), "::1");
+        for bad in ["", "all", "10.0.0.0/33", "::/129", "1.2.3.4; deny", "1.2.3.4/x", "a/8"] {
+            assert!(normalize_allow_entry(bad).is_err(), "accepted '{bad}'");
+        }
     }
 
     #[test]
@@ -390,7 +445,7 @@ mod tests {
             cert: "/etc/dockpanel/ssl/registry/x/fullchain.pem".to_string(),
             key: "/etc/dockpanel/ssl/registry/x/privkey.pem".to_string(),
         };
-        let body = render_stream_server(40002, "127.0.0.1:3306", Some(&tls));
+        let body = render_stream_server(40002, "127.0.0.1:3306", Some(&tls), &[]);
         assert!(body.contains("listen 40002 ssl;"));
         assert!(body.contains("ssl_certificate /etc/dockpanel/ssl/registry/x/fullchain.pem;"));
         assert!(body.contains("ssl_certificate_key /etc/dockpanel/ssl/registry/x/privkey.pem;"));

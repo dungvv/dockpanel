@@ -159,6 +159,10 @@ assert_contains "$AGENT_STREAM_SVC" 'std::fs::hard_link(&tmp, &path)' \
     "create never overwrites an existing proxy file"
 assert_contains "$BACKEND_TCP" 'check tcp proxy name' \
     "backend refuses a taken name before calling the agent"
+assert_contains "$AGENT_STREAM_SVC" 'deny all;' \
+    "allow-listed listeners deny everyone else"
+assert_contains "$AGENT_STREAM_SVC" 'normalize_allow_entry' \
+    "allow entries are re-parsed before reaching the config"
 # The render must never be reachable from the route file — routes delegate.
 check "route file has no inline server block" \
       "$(grep -c 'server {' "$AGENT_STREAM_ROUTE")" "0"

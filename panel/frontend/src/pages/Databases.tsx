@@ -29,6 +29,7 @@ interface Database {
   remote_port: number | null;
   remote_host: string | null;
   remote_tls: boolean;
+  remote_allow?: string[];
   created_at: string;
 }
 
@@ -955,6 +956,7 @@ export default function Databases() {
   const [remoteBusy, setRemoteBusy] = useState(false);
   const [remoteTls, setRemoteTls] = useState(false);
   const [remoteCert, setRemoteCert] = useState("");
+  const [remoteAllow, setRemoteAllow] = useState("");
   const [remoteCerts, setRemoteCerts] = useState<TlsCertificateOption[] | null>(null);
 
   const fetchData = async () => {
@@ -1083,6 +1085,7 @@ export default function Databases() {
     setRemoteId(id);
     setRemoteTls(false);
     setRemoteCert("");
+    setRemoteAllow("");
     // Certificates are only needed if the operator asks for TLS — fetch lazily,
     // once, the first time the checkbox is ticked (see loadRemoteCerts).
     if (remoteCerts === null) {
@@ -1104,6 +1107,7 @@ export default function Databases() {
         await api.post(`/databases/${db.id}/remote-access`, {
           tls: remoteTls,
           ...(remoteTls && remoteCert ? { certificate_id: remoteCert } : {}),
+          allow_cidrs: remoteAllow.split(/[\s,]+/).filter(Boolean),
         });
         setSuccessMsg(`Remote access enabled for "${db.name}"`);
       } else {
@@ -1725,6 +1729,10 @@ export default function Databases() {
                         {copied === "remote_addr" ? "Copied!" : "Copy"}
                       </button>
                     </div>
+                    <p className="text-xs text-dark-300 mb-4">
+                      Allowed sources:{" "}
+                      {db.remote_allow?.length ? db.remote_allow.join(", ") : "anyone"}
+                    </p>
                     <button
                       onClick={() => handleRemoteToggle(db, false)}
                       disabled={remoteBusy}
@@ -1741,6 +1749,17 @@ export default function Databases() {
                       container's existing loopback binding — no Docker port is
                       exposed publicly.
                     </p>
+                    <label htmlFor="remote-allow" className="block text-sm text-dark-200 mb-1">
+                      Allowed source IPs/CIDRs (optional)
+                    </label>
+                    <input
+                      id="remote-allow"
+                      type="text"
+                      value={remoteAllow}
+                      onChange={(e) => setRemoteAllow(e.target.value)}
+                      placeholder="203.0.113.7, 198.51.100.0/24 — empty allows anyone"
+                      className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm bg-dark-800 mb-3"
+                    />
                     <div className="flex items-end gap-3 flex-wrap">
                       <label className="flex items-center gap-2 text-sm text-dark-200">
                         <input

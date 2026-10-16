@@ -121,6 +121,11 @@ PostgreSQL that means `sslmode=require` and friends, for MySQL `--ssl-mode`.
 Plain TCP remains the default because most clients talk to these engines in
 the clear.
 
+**Restrict who can connect.** "Allowed source IPs/CIDRs" (e.g.
+`203.0.113.7, 198.51.100.0/24`) renders nginx `allow …; deny all;` on the
+listener, so everyone else is refused before a byte reaches the database.
+Empty means anyone.
+
 **It is still a public port.** Anyone who can reach it can attempt to log in,
 so use it for tools, not as a substitute for the SSH tunnel when a tunnel
 suffices — and consider the firewall if the port should only answer one

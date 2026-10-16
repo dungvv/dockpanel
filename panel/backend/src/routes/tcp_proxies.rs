@@ -35,6 +35,7 @@ pub struct TcpProxy {
     pub upstream_host: String,
     pub upstream_port: i32,
     pub tls: bool,
+    pub allow_cidrs: Vec<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -52,6 +53,9 @@ pub struct CreateProxyRequest {
     #[serde(default)]
     pub tls: bool,
     pub certificate_id: Option<Uuid>,
+    /// Source IPs/CIDRs allowed to connect; empty means anyone.
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
 }
 
 /// The agent's rule, mirrored: the panel must refuse in its own words rather
@@ -164,7 +168,20 @@ pub(crate) async fn create_proxy(
     database_id: Option<Uuid>,
     container_id: Option<&str>,
     caller_is_admin: bool,
+    allow_cidrs: &[String],
 ) -> Result<TcpProxy, ApiError> {
+    let allow_cidrs: Vec<String> = allow_cidrs
+        .iter()
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .collect();
+    if let Some(bad) = allow_cidrs.iter().find(|a| !crate::helpers::valid_panel_ip_entry(a)) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            &format!("Invalid allowed source '{bad}' — use an IP or CIDR like 203.0.113.0/24"),
+        ));
+    }
+
     // Refuse a taken name/database BEFORE the agent call: the insert's unique
     // violation used to arrive after the agent had already written, and the
     // rollback below then deleted the live proxy's file. (The agent also
@@ -195,6 +212,7 @@ pub(crate) async fn create_proxy(
         "name": name,
         "listen_port": listen_port,
         "tls": tls,
+        "allow_cidrs": allow_cidrs,
     });
     match container_id {
         // Database kind: the agent reads the upstream off the container's own
@@ -234,10 +252,10 @@ pub(crate) async fn create_proxy(
     let row: TcpProxy = match sqlx::query_as(
         "INSERT INTO tcp_proxies \
          (server_id, user_id, database_id, certificate_id, name, kind, listen_port, \
-          upstream_host, upstream_port, tls) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+          upstream_host, upstream_port, tls, allow_cidrs) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
          RETURNING id, server_id, database_id, certificate_id, name, kind, \
-                   listen_port, upstream_host, upstream_port, tls, created_at",
+                   listen_port, upstream_host, upstream_port, tls, allow_cidrs, created_at",
     )
     .bind(server_id)
     .bind(user_id)
@@ -249,6 +267,7 @@ pub(crate) async fn create_proxy(
     .bind(&row_host)
     .bind(row_port)
     .bind(tls)
+    .bind(&allow_cidrs)
     .fetch_one(&state.db)
     .await
     {
@@ -288,7 +307,7 @@ pub async fn list(
     // sees its proxies even when a tenant owns the row.
     let proxies: Vec<TcpProxy> = sqlx::query_as(
         "SELECT p.id, p.server_id, p.database_id, p.certificate_id, p.name, p.kind, \
-         p.listen_port, p.upstream_host, p.upstream_port, p.tls, p.created_at \
+         p.listen_port, p.upstream_host, p.upstream_port, p.tls, p.allow_cidrs, p.created_at \
          FROM tcp_proxies p \
          WHERE p.server_id = $1 \
          AND (p.user_id = $2 OR EXISTS (SELECT 1 FROM users u, servers sv \
@@ -344,6 +363,7 @@ pub async fn create(
         None,
         None,
         true,
+        &body.allow_cidrs,
     )
     .await?;
 

@@ -30,6 +30,9 @@ pub struct StreamProxyRequest {
     pub cert_path: Option<String>,
     #[serde(default)]
     pub key_path: Option<String>,
+    /// Source IPs/CIDRs allowed to connect; empty means anyone.
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -108,6 +111,7 @@ async fn create_stream(
         &upstream_host,
         upstream_port,
         tls.as_ref(),
+        &body.allow_cidrs,
     )
     .await
     .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
