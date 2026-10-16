@@ -1,0 +1,152 @@
+
+limit_req_zone $binary_remote_addr zone=rl_shop_example_com:10m rate=2r/s;
+
+
+fastcgi_cache_path /var/cache/nginx/fastcgi/shop_example_com levels=1:2 keys_zone=fc_shop_example_com:10m max_size=256m inactive=60m use_temp_path=off;
+
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+
+
+
+# HTTP → HTTPS redirect
+server {
+
+    listen 80;
+
+    listen [::]:80;
+    server_name shop.example.com;
+
+    # ACME challenge for Let's Encrypt
+    location /.well-known/acme-challenge/ {
+        root /var/www/acme;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# HTTPS server
+server {
+
+    listen 443 ssl;
+
+    listen [::]:443 ssl;
+    server_name shop.example.com;
+
+    ssl_certificate /etc/dockpanel/ssl/shop.example.com/fullchain.pem;
+    ssl_certificate_key /etc/dockpanel/ssl/shop.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    client_max_body_size 64m;
+
+
+    limit_req zone=rl_shop_example_com burst=4 nodelay;
+    limit_req_status 429;
+
+
+
+
+
+
+
+    set $bot_challenge 0;
+    if ($http_cookie !~* "dp_verified=1") { set $bot_challenge 1; }
+    if ($request_uri = /.well-known/bot-verify) { set $bot_challenge 0; }
+    if ($http_user_agent ~* "googlebot|bingbot|yandexbot|duckduckbot|slurp|baiduspider|facebookexternalhit|twitterbot|linkedinbot|whatsapp|telegrambot|applebot") { set $bot_challenge 0; }
+    if ($bot_challenge) {
+        return 200 '<!DOCTYPE html><html><head><title>Verifying</title><script>document.cookie="dp_verified=1;path=/;max-age=86400";location.reload();</script></head><body>Verifying browser...</body></html>';
+    }
+
+
+
+
+    # WordPress
+    root /var/www/shop.example.com/public;
+    index index.php index.html;
+
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff2?|ttf|eot)$ {
+        expires 30d;
+        access_log off;
+        add_header Cache-Control "public, immutable";
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    }
+
+    # Block xmlrpc
+    location = /xmlrpc.php {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+
+    # Block wp-config
+    location = /wp-config.php {
+        deny all;
+    }
+
+    location ~ /\.(?!well-known) {
+        deny all;
+    }
+
+
+    location ~ \.php$ {
+        fastcgi_pass unix:/run/php/php8.4-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+        fastcgi_buffers 16 16k;
+        fastcgi_buffer_size 32k;
+
+        # FastCGI cache
+        set $skip_cache 0;
+        if ($request_method = POST) { set $skip_cache 1; }
+        if ($query_string != "") { set $skip_cache 1; }
+        if ($http_cookie ~* "comment_author_|wordpress_logged_in_|wp-postpass_|PHPSESSID|laravel_session") { set $skip_cache 1; }
+        if ($request_uri ~* "/wp-admin/|/wp-login.php|/cart/|/checkout/|/my-account/|/admin|/user") { set $skip_cache 1; }
+        fastcgi_cache fc_shop_example_com;
+        fastcgi_cache_valid 200 301 60m;
+        fastcgi_cache_valid 404 1m;
+        fastcgi_cache_bypass $skip_cache;
+        fastcgi_no_cache $skip_cache;
+        fastcgi_cache_key "$scheme$request_method$host$request_uri";
+        add_header X-FastCGI-Cache $upstream_cache_status;
+
+    }
+
+
+    # Security headers
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+
+    add_header Content-Security-Policy "default-src 'self' <x>&" always;
+
+
+    # Gzip
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml text/javascript image/svg+xml;
+    gzip_min_length 256;
+
+
+    # Custom directives
+expires 1d;
+
+
+    access_log /var/log/nginx/shop.example.com.access.log;
+    error_log /var/log/nginx/shop.example.com.error.log;
+}

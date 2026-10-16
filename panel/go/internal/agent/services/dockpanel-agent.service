@@ -1,0 +1,86 @@
+[Unit]
+Description=DockPanel Agent
+# Both roles this binary is installed in are covered here, because there is only
+# one unit: the panel box (setup.sh/update.sh) and a fleet member
+# (install-agent.sh). `Wants=` is a WEAK dependency — naming a unit that is not
+# installed logs a line and starts anyway — so an agent-only box with no nginx
+# and a panel box are both satisfied by the same two names. install-agent.sh
+# used to hand-write a THIRD copy of this file instead, with the entire sandbox
+# turned off under a comment claiming it matched local hardening (s253→s271).
+After=network.target nginx.service docker.service
+Wants=nginx.service docker.service
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+# Fleet members keep AGENT_TOKEN / AGENT_LISTEN_TCP / DOCKPANEL_CENTRAL_URL here;
+# the panel box has no such file and does not need one. The `-` prefix means
+# "read it if it exists" — the same semantics the ReadWritePaths list below
+# leans on, and the reason ONE unit can serve both roles. Without the prefix a
+# panel box would refuse to start; without the line at all a fleet member would
+# start with no token and no central URL and never phone home again.
+EnvironmentFile=-/etc/dockpanel/agent.env
+# RuntimeDirectory= creates /run/dockpanel before namespace setup AND preserves it
+# across stop/start cycles — fixes upgrade-path /run/dockpanel disappearance (v2.8.14).
+RuntimeDirectory=dockpanel
+RuntimeDirectoryPreserve=yes
+ExecStartPre=/bin/sh -c 'mkdir -p /run/dockpanel /var/lib/dockpanel/git'
+ExecStart=/usr/local/bin/dockpanel-agent
+ExecStartPost=/bin/sh -c 'sleep 1 && chgrp $(getent group www-data >/dev/null 2>&1 && echo www-data || echo nginx) /var/run/dockpanel/agent.sock 2>/dev/null; chmod 660 /var/run/dockpanel/agent.sock 2>/dev/null; true'
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+
+# Sandbox hardening (v2.8.13). apt/dpkg/snap/composer-rm operations that need to
+# write outside ReadWritePaths escape via systemd-run — see safe_command_unsandboxed
+# in panel/agent/src/safe_cmd.rs (added v2.8.12).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=~user
+# Paths that only exist on some distros or only after a service is installed
+# carry systemd's `-` prefix, which means "bind this if it exists, otherwise
+# carry on". Without it a single absent directory fails the whole namespace
+# mount and the agent does not start AT ALL — which is what /etc/apt did on
+# every RPM-family box: Debian-only path, listed unconditionally, so the unit
+# was unstartable on Rocky/Alma/CentOS/Fedora with the confusing message
+# "Failed to set up mount namespacing: /etc/apt: No such file or directory".
+# setup.sh and update.sh both pre-create most of this list by hand to dodge that
+# failure; those mirrors are maintained from memory and had missed /etc/apt for
+# as long as the entry existed. The `-` prefix removes the need for them to be
+# perfect, so a future entry added here cannot silently brick the agent.
+# /var/spool/cron is where `crontab` writes its temp file (mkstemp) before
+# renaming it into place, on BOTH families — Debian keeps the tables in
+# crontabs/ beneath it, the RHEL family directly in it. It was missing here
+# while setup.sh pre-created it, so every cron written through the panel failed
+# with "/var/spool/cron/: mkstemp: Read-only file system" and the API answered
+# 500 (measured on a fresh Ubuntu 24.04 box, s268). The mirror knew about the
+# path and the unit did not — the same enumeration miss as s262's
+# /etc/opendkim.conf, with the two lists disagreeing in the other direction.
+# /etc/ssh is the same miss again, found by a reporter on #92 rather than by us:
+# every SSH-hardening action the Security page offers — disable root login,
+# disable password auth, change the port — rewrites /etc/ssh/sshd_config through
+# modify_sshd_config(), which writes a .tmp beside it and renames. The path was
+# never listed, so all three failed with "Failed to write sshd_config: Read-only
+# file system (os error 30)" and the panel answered 502 on EVERY install since the
+# sandbox landed. Reproduced on a fresh Ubuntu 24.04 box (s288). Note the failure
+# is only legible because s287 stopped flattening the agent's message; before that
+# it read "Agent offline".
+ReadWritePaths=/etc/nginx /etc/dockpanel /var/run/dockpanel /var/backups/dockpanel /var/lib/dockpanel /var/www /var/log /etc/systemd/system /opt -/etc/letsencrypt -/etc/apt -/etc/fail2ban -/etc/powerdns -/etc/modsecurity -/etc/cloudflared -/etc/postfix -/etc/dovecot -/var/spool/postfix -/var/spool/cron -/var/vmail -/var/cache/nginx -/etc/ufw -/var/lib/ufw -/etc/php -/etc/ssh -/var/dockpanel-sftp
+
+MemoryMax=512M
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

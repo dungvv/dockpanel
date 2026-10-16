@@ -1,0 +1,77 @@
+
+
+
+
+
+
+server {
+
+    listen 80;
+
+    listen [::]:80;
+    server_name shop.example.com;
+
+    client_max_body_size 64m;
+
+
+
+
+
+
+
+
+
+
+    root /var/www/shop.example.com/public;
+    index index.html index.htm;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    # A site can be switched from php to static while its docroot still holds
+    # application source. Without these, the switch publishes wp-config.php,
+    # .env and .git/config as plain text: every deny below exists in the php
+    # branches and none of them survives the switch.
+    location ~ /\.(?!well-known) {
+        deny all;
+    }
+
+    location ~ \.php$ {
+        deny all;
+    }
+
+    # The one php deny the two above do NOT subsume: it has no dot segment and
+    # no .php suffix, so a drupal site switched to static served everything
+    # under sites/*/private/ — the directory that exists precisely to hold what
+    # drupal was told not to publish. The php branch scopes it to the drupal
+    # preset; a vhost cannot say which preset it came from, so static applies it
+    # to all. The cost is denying an obscure path on a site that was never
+    # drupal; the alternative is the same disclosure v2.68.0 shipped for.
+    location ~ ^/sites/.*/private/ {
+        deny all;
+    }
+
+
+    # ACME challenge for Let's Encrypt
+    location /.well-known/acme-challenge/ {
+        root /var/www/acme;
+    }
+
+    # Security headers
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+
+
+    # Gzip
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml text/javascript image/svg+xml;
+    gzip_min_length 256;
+
+
+
+    access_log /var/log/nginx/shop.example.com.access.log;
+    error_log /var/log/nginx/shop.example.com.error.log;
+}

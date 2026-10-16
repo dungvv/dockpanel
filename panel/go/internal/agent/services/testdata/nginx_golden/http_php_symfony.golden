@@ -1,0 +1,70 @@
+
+
+
+
+
+
+server {
+
+    listen 80;
+
+    listen [::]:80;
+    server_name shop.example.com;
+
+    client_max_body_size 64m;
+
+
+
+
+
+
+
+
+
+
+
+    # Symfony — public/ as document root
+    root /var/www/shop.example.com/public;
+    index index.php index.html;
+
+    location / {
+        try_files $uri /index.php$is_args$args;
+    }
+
+    location ~ /\.(env|git) {
+        deny all;
+    }
+
+
+    location ~ \.php$ {
+        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+        fastcgi_buffers 16 16k;
+        fastcgi_buffer_size 32k;
+
+    }
+
+
+    # ACME challenge for Let's Encrypt
+    location /.well-known/acme-challenge/ {
+        root /var/www/acme;
+    }
+
+    # Security headers
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+
+
+    # Gzip
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml text/javascript image/svg+xml;
+    gzip_min_length 256;
+
+
+
+    access_log /var/log/nginx/shop.example.com.access.log;
+    error_log /var/log/nginx/shop.example.com.error.log;
+}

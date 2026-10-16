@@ -4,7 +4,27 @@ import "net/http"
 
 // registrars mirrors the .merge() list in src/main.rs. Each route file adds
 // its register<M> here (the integration pass owns this list).
-var registrars = []func(*Router){}
+var registrars = []func(*Router){
+	registerHealth,
+	registerSystem,
+	registerTelemetry,
+	registerDiagnostics,
+	registerPanelUpdate,
+	registerUpdates,
+	registerServerUtils,
+	registerLogs,
+	registerTerminal,
+	registerNginx,
+	registerNginxStream,
+	registerTraefik,
+	registerFiles,
+	registerSftp,
+	registerPhp,
+	registerSsl,
+	registerSslRegistry,
+	registerSecurity,
+	registerCrons,
+}
 
 // Handler builds the agent's full HTTP surface: authenticated routes behind
 // audit + auth middleware, plus the public ones that check their own token.

@@ -1,0 +1,87 @@
+
+
+
+
+
+
+server {
+
+    listen 80;
+
+    listen [::]:80;
+    server_name shop.example.com;
+
+    client_max_body_size 64m;
+
+
+
+
+
+
+
+
+
+
+
+    # Magento — pub/ as document root
+    root /var/www/shop.example.com/pub;
+    index index.php index.html;
+
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    location /static/ {
+        expires 30d;
+        location ~* \.(ico|jpg|jpeg|png|gif|svg|js|css|swf|eot|ttf|otf|woff|woff2)$ {
+            add_header Cache-Control "public";
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header X-Frame-Options "SAMEORIGIN" always;
+            add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+            expires +1y;
+            access_log off;
+        }
+    }
+
+    location /media/ {
+        expires 30d;
+        try_files $uri $uri/ /get.php$is_args$args;
+    }
+
+    location ~ /\.(?!well-known) {
+        deny all;
+    }
+
+
+    location ~ \.php$ {
+        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+        fastcgi_buffers 16 16k;
+        fastcgi_buffer_size 32k;
+
+    }
+
+
+    # ACME challenge for Let's Encrypt
+    location /.well-known/acme-challenge/ {
+        root /var/www/acme;
+    }
+
+    # Security headers
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+
+
+    # Gzip
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml text/javascript image/svg+xml;
+    gzip_min_length 256;
+
+
+
+    access_log /var/log/nginx/shop.example.com.access.log;
+    error_log /var/log/nginx/shop.example.com.error.log;
+}
