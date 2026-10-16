@@ -51,7 +51,7 @@ func phpAllowed(v string) bool {
 // pkg's per-name answer said EVERY offered version was installed; there the
 // real version is read from the package database instead.
 func phpIsInstalled(version string) bool {
-	if actual, ok := services.PkgInstalledPhpVersion(); ok {
+	if actual := services.PkgInstalledPhpVersion(); actual != "" {
 		return actual == version
 	}
 	return services.PkgIsInstalled("php" + version + "-fpm")
@@ -60,8 +60,7 @@ func phpIsInstalled(version string) bool {
 // phpSocketExists delegates to the shared resolver that also backs put_site,
 // so the two can never disagree about which family's socket is real.
 func phpSocketExists(version string) bool {
-	_, ok := services.PkgResolvePhpFpmSocket(version)
-	return ok
+	return services.PkgResolvePhpFpmSocket(version) != ""
 }
 
 func phpUnit(version string) string { return services.PkgServiceName("php" + version + "-fpm") }
@@ -78,7 +77,8 @@ func phpListVersions(w http.ResponseWriter, _ *http.Request) {
 		installed := phpIsInstalled(v)
 		real, hasReal := "", false
 		if installed {
-			real, hasReal = services.PkgResolvePhpFpmSocket(v)
+			real = services.PkgResolvePhpFpmSocket(v)
+			hasReal = real != ""
 		}
 		// Falls back to the Debian-shaped guess when nothing real was found.
 		socket := fmt.Sprintf("/run/php/php%s-fpm.sock", v)

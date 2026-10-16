@@ -238,8 +238,8 @@ func (n nginxRoutes) putSite(w http.ResponseWriter, r *http.Request) {
 					version = v
 				}
 			}
-			real, ok := services.PkgResolvePhpFpmSocket(version)
-			if !ok {
+			real := services.PkgResolvePhpFpmSocket(version)
+			if real == "" {
 				// Settings → Services was a dead end for this; the PHP
 				// Version control offers the install itself since v2.49.0.
 				nginxFail(w, http.StatusBadRequest, fmt.Sprintf("PHP %s is not installed, or its PHP-FPM service is not "+

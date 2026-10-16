@@ -73,7 +73,7 @@ func TestListNginxSites(t *testing.T) {
 	files := map[string]string{
 		"b.conf":               "server {\n  server_name b.com www.b.com;\n  proxy_pass http://x;\n  ssl_certificate x;\n}",
 		"a.conf":               "server { listen 80; }\nserver_name a.com;\nfastcgi_pass unix:/x;",
-		"dup.conf":             "server_name a.com;",
+		"dup.conf":             "server_name a.com;\nfastcgi_pass unix:/y;", // dedupe keeps one a.com; which file wins is directory order, as in Rust
 		"catchall.conf":        "server_name _;",
 		"default":              "server_name d.com;",
 		"noname.conf.conf":     "root /var/www;",
