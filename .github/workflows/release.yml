@@ -147,8 +147,6 @@ jobs:
             ~/.cargo/git/db/
             panel/agent/target/
             panel/backend/target/
-            panel/cli/target/
-            panel/mcp/target/
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
@@ -159,19 +157,24 @@ jobs:
       - name: Build API (static musl)
         run: cargo zigbuild --release --target ${{ matrix.target }} --manifest-path panel/backend/Cargo.toml
 
-      - name: Build CLI (static musl)
-        run: cargo zigbuild --release --target ${{ matrix.target }} --manifest-path panel/cli/Cargo.toml
+      # CLI + MCP server are Go (panel/go): CGO_ENABLED=0 gives a static binary
+      # for either arch straight from this runner, no zig needed.
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: panel/go/go.mod
+          cache-dependency-path: panel/go/go.sum
 
-      - name: Build MCP server (static musl)
-        run: cargo zigbuild --release --target ${{ matrix.target }} --manifest-path panel/mcp/Cargo.toml
+      - name: Build CLI + MCP server (Go, static)
+        run: bash scripts/build-go.sh go-out ${{ matrix.arch }}
 
       - name: Package binaries
         run: |
           mkdir -p release
           cp panel/agent/target/${{ matrix.target }}/release/dockpanel-agent release/dockpanel-agent-linux-${{ matrix.arch }}
           cp panel/backend/target/${{ matrix.target }}/release/dockpanel-api release/dockpanel-api-linux-${{ matrix.arch }}
-          cp panel/cli/target/${{ matrix.target }}/release/dockpanel release/dockpanel-cli-linux-${{ matrix.arch }}
-          cp panel/mcp/target/${{ matrix.target }}/release/dockpanel-mcp release/dockpanel-mcp-linux-${{ matrix.arch }}
+          cp go-out/dockpanel release/dockpanel-cli-linux-${{ matrix.arch }}
+          cp go-out/dockpanel-mcp release/dockpanel-mcp-linux-${{ matrix.arch }}
           chmod +x release/*
 
           # Report binary sizes + confirm static linkage
@@ -189,8 +192,15 @@ jobs:
         run: |
           cargo sbom --project-directory panel/agent   --output-format spdx_json_2_3 > release/dockpanel-agent.spdx.json
           cargo sbom --project-directory panel/backend --output-format spdx_json_2_3 > release/dockpanel-api.spdx.json
-          cargo sbom --project-directory panel/cli     --output-format spdx_json_2_3 > release/dockpanel-cli.spdx.json
-          cargo sbom --project-directory panel/mcp     --output-format spdx_json_2_3 > release/dockpanel-mcp.spdx.json
+
+      - name: Generate SBOM for the Go module (CLI + MCP, SPDX JSON)
+        if: matrix.arch == 'amd64'
+        uses: anchore/sbom-action@v0
+        with:
+          path: panel/go
+          format: spdx-json
+          output-file: release/dockpanel-go.spdx.json
+          upload-artifact: false
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7

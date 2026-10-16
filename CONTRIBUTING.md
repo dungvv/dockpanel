@@ -42,7 +42,7 @@ EOF
 # Build everything
 cargo build --release --manifest-path panel/agent/Cargo.toml
 cargo build --release --manifest-path panel/backend/Cargo.toml
-cargo build --release --manifest-path panel/cli/Cargo.toml
+bash scripts/build-go.sh panel/go/bin   # CLI + MCP server (Go)
 cd panel/frontend && npm install && npx vite build && cd ../..
 
 # Run (agent needs root for system operations)

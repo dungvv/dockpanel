@@ -28,6 +28,7 @@ CONFIG_DIR="/etc/dockpanel"
 AGENT_BIN="/usr/local/bin/dockpanel-agent"
 API_BIN="/usr/local/bin/dockpanel-api"
 CLI_BIN="/usr/local/bin/dockpanel"
+MCP_BIN="/usr/local/bin/dockpanel-mcp"
 DB_PORT=5450
 DB_CONTAINER="dockpanel-postgres"
 INSTALL_FROM_RELEASE="${INSTALL_FROM_RELEASE:-0}"
@@ -50,8 +51,7 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FRONTEND_DIR="$REPO_DIR/panel/frontend"
 AGENT_SRC="$REPO_DIR/panel/agent"
 API_SRC="$REPO_DIR/panel/backend"
-CLI_SRC="$REPO_DIR/panel/cli"
-MCP_SRC="$REPO_DIR/panel/mcp"
+MCP_SRC="$REPO_DIR/panel/go"
 
 # Directories the agent unit declares in ReadWritePaths, with any `-` prefix
 # stripped. The unit (panel/agent/dockpanel-agent.service) is the single source
@@ -1258,12 +1258,14 @@ build_binaries() {
     chmod +x "$API_BIN"
     log "API built ($(du -h "$API_BIN" | cut -f1))"
 
-    # Build CLI
-    log "Building CLI..."
-    cargo_build_with_progress "$CLI_SRC" "CLI"
-    cp "$CLI_SRC/target/release/dockpanel" "$CLI_BIN"
-    chmod +x "$CLI_BIN"
-    log "CLI built ($(du -h "$CLI_BIN" | cut -f1))"
+    # Build CLI + MCP server (Go, panel/go; installs the Go toolchain if missing)
+    log "Building CLI and MCP server..."
+    bash "$REPO_DIR/scripts/build-go.sh" /tmp/dockpanel-go-build
+    cp /tmp/dockpanel-go-build/dockpanel "$CLI_BIN"
+    cp /tmp/dockpanel-go-build/dockpanel-mcp "$MCP_BIN"
+    chmod +x "$CLI_BIN" "$MCP_BIN"
+    rm -rf /tmp/dockpanel-go-build
+    log "CLI built ($(du -h "$CLI_BIN" | cut -f1)), MCP built ($(du -h "$MCP_BIN" | cut -f1))"
 
     INSTALLED_VERSION=$(git -C "$REPO_DIR" describe --tags --always 2>/dev/null || echo "")
     INSTALLED_VERSION="${INSTALLED_VERSION:+${INSTALLED_VERSION} (built from source)}"
@@ -1307,7 +1309,7 @@ create_services() {
     cp "$AGENT_SRC/dockpanel-agent.service" /etc/systemd/system/dockpanel-agent.service
     chmod 644 /etc/systemd/system/dockpanel-agent.service
 
-    # MCP server — deploy from repo (single source of truth: panel/mcp/dockpanel-mcp.service).
+    # MCP server — deploy from repo (single source of truth: panel/go/dockpanel-mcp.service).
     # Installed but deliberately NOT enabled/started: v1 has no settings toggle
     # or mint-key UI yet (session 2), so a fresh install would just log
     # "no panel API key configured" forever. `systemctl enable --now
@@ -1590,7 +1592,7 @@ ${PANEL_TLS_BLOCK}
         proxy_send_timeout 3600s;
     }
 
-    # MCP server (read-only v1; opt-in, see panel/mcp) — exact match, not a
+    # MCP server (read-only v1; opt-in, see panel/go) — exact match, not a
     # prefix: Streamable HTTP is one fixed endpoint, not a family of routes
     # like /api/. Not started by default (create_services() installs the unit
     # but never enables it), so this 502s until an operator opts in — expected

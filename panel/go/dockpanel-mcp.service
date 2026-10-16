@@ -14,9 +14,8 @@ Type=simple
 ExecStart=/usr/local/bin/dockpanel-mcp
 Restart=always
 RestartSec=5
-Environment=RUST_LOG=info
 # Optional — LISTEN_ADDR= only; absent file or key falls back to
-# 127.0.0.1:3081 (see panel/mcp/src/main.rs::listen_addr). The `-` prefix
+# 127.0.0.1:3081 (see panel/go/cmd/dockpanel-mcp/main.go). The `-` prefix
 # means "read it if it exists", same convention as the agent unit's
 # EnvironmentFile= for agent.env.
 EnvironmentFile=-/etc/dockpanel/mcp.env

@@ -152,8 +152,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 AGENT_SRC="$REPO_DIR/panel/agent"
 API_SRC="$REPO_DIR/panel/backend"
-CLI_SRC="$REPO_DIR/panel/cli"
-MCP_SRC="$REPO_DIR/panel/mcp"
+MCP_SRC="$REPO_DIR/panel/go"
 
 # Directories the agent unit declares in ReadWritePaths, with any `-` prefix
 # stripped. Derived from the unit that is about to be deployed (or, on a layout
@@ -170,6 +169,7 @@ AGENT_BIN="/usr/local/bin/dockpanel-agent"
 API_BIN="/usr/local/bin/dockpanel-api"
 CLI_BIN="/usr/local/bin/dockpanel"
 MCP_BIN="/usr/local/bin/dockpanel-mcp"
+GO_BUILD_DIR="/tmp/dockpanel-go-build"
 INSTALL_FROM_RELEASE="${INSTALL_FROM_RELEASE:-0}"
 GITHUB_REPO="ovexro/dockpanel"
 
@@ -451,13 +451,8 @@ else
     log "Building API..."
     (cd "$API_SRC" && $CARGO_CMD build --release 2>&1 | tail -1)
 
-    log "Building CLI..."
-    (cd "$CLI_SRC" && $CARGO_CMD build --release 2>&1 | tail -1)
-
-    if [ -d "$MCP_SRC" ]; then
-        log "Building MCP server..."
-        (cd "$MCP_SRC" && $CARGO_CMD build --release 2>&1 | tail -1)
-    fi
+    log "Building CLI and MCP server (Go)..."
+    bash "$REPO_DIR/scripts/build-go.sh" "$GO_BUILD_DIR"
 
     if [ -d "$FRONTEND_DIR" ]; then
         log "Building frontend..."
@@ -608,7 +603,7 @@ else
 fi
 
 # MCP server unit — deploy from repo (single source of truth:
-# panel/mcp/dockpanel-mcp.service). Installed but never enabled/started here:
+# panel/go/dockpanel-mcp.service). Installed but never enabled/started here:
 # see the matching comment in setup.sh's create_services(). An install that
 # already has the service enabled (a manual opt-in) keeps running through the
 # upgrade — this only refreshes the unit FILE, it never touches enablement.
@@ -1170,8 +1165,8 @@ if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
 else
     cp "$AGENT_SRC/target/release/dockpanel-agent" "$AGENT_BIN"
     cp "$API_SRC/target/release/dockpanel-api" "$API_BIN"
-    cp "$CLI_SRC/target/release/dockpanel" "$CLI_BIN"
-    [ -f "$MCP_SRC/target/release/dockpanel-mcp" ] && cp "$MCP_SRC/target/release/dockpanel-mcp" "$MCP_BIN"
+    cp "$GO_BUILD_DIR/dockpanel" "$CLI_BIN"
+    cp "$GO_BUILD_DIR/dockpanel-mcp" "$MCP_BIN"
 fi
 chmod +x "$AGENT_BIN" "$API_BIN" "$CLI_BIN"
 [ -f "$MCP_BIN" ] && chmod +x "$MCP_BIN"
