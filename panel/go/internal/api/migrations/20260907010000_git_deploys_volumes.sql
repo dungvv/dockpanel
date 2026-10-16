@@ -1,0 +1,14 @@
+-- GH #118: a Git Deploy container has no persistent storage — every deploy
+-- replaces the container, so anything the app writes to its own filesystem
+-- (uploads, a SQLite database, a cache) is destroyed on the next deploy.
+--
+-- `volumes` is a JSON array of CONTAINER paths only (e.g. ["/data"]), never
+-- host paths — the host side is always derived under
+-- /var/lib/dockpanel/git-data/{name}{path} by the agent, mirroring
+-- docker_apps.rs's own volume-bind pattern. See the six constraints recorded
+-- beside the code that reads this column (panel/agent/src/services/git_build.rs).
+--
+-- Previews never read this column (git_build.rs refuses a non-empty list for
+-- any scope other than "deploy") — a throwaway PR container must not gain
+-- durable local storage.
+ALTER TABLE git_deploys ADD COLUMN volumes JSONB NOT NULL DEFAULT '[]'::jsonb;

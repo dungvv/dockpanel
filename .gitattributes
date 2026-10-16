@@ -1,1 +1,2 @@
 panel/go/internal/agent/routes/unicode.mapping -text
+panel/go/internal/api/migrations/*.sql -text
