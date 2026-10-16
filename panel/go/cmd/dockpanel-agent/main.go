@@ -179,7 +179,7 @@ func main() {
 		_ = srv.Shutdown(context.Background())
 		close(done)
 	}()
-	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := srv.Serve(hostFixListener{ln}); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("Agent server error: " + err.Error())
 	} else {
 		<-done

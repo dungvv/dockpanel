@@ -36,8 +36,6 @@ if [ "$VERSION" != "$V_BACKEND" ] || [ "$VERSION" != "$V_CLI" ] || [ "$VERSION" 
   exit 1
 fi
 
-# ─── Source cargo env ───
-source /root/.cargo/env 2>/dev/null || true
 
 # ─── Build directory ───
 DIST="dist/release-${VERSION}"
@@ -46,10 +44,9 @@ mkdir -p "$DIST"
 
 # ─── Build x86_64 (native) ───
 echo -e "${YELLOW}Building x86_64...${NC}"
-cd panel/backend && cargo build --release 2>&1 | tail -1 && cd ../..
 bash scripts/build-go.sh "$DIST/go-amd64" amd64
 
-cp panel/backend/target/release/dockpanel-api "$DIST/dockpanel-api-linux-amd64"
+mv "$DIST/go-amd64/dockpanel-api" "$DIST/dockpanel-api-linux-amd64"
 mv "$DIST/go-amd64/dockpanel-agent" "$DIST/dockpanel-agent-linux-amd64"
 mv "$DIST/go-amd64/dockpanel" "$DIST/dockpanel-cli-linux-amd64"
 mv "$DIST/go-amd64/dockpanel-mcp" "$DIST/dockpanel-mcp-linux-amd64"
@@ -57,12 +54,10 @@ rmdir "$DIST/go-amd64"
 
 # ─── Build ARM64 (cross-compile) ───
 echo -e "${YELLOW}Building aarch64...${NC}"
-export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
 
-cd panel/backend && cargo build --release --target aarch64-unknown-linux-gnu 2>&1 | tail -1 && cd ../..
 bash scripts/build-go.sh "$DIST/go-arm64" arm64
 
-cp panel/backend/target/aarch64-unknown-linux-gnu/release/dockpanel-api "$DIST/dockpanel-api-linux-arm64"
+mv "$DIST/go-arm64/dockpanel-api" "$DIST/dockpanel-api-linux-arm64"
 mv "$DIST/go-arm64/dockpanel-agent" "$DIST/dockpanel-agent-linux-arm64"
 mv "$DIST/go-arm64/dockpanel" "$DIST/dockpanel-cli-linux-arm64"
 mv "$DIST/go-arm64/dockpanel-mcp" "$DIST/dockpanel-mcp-linux-arm64"
@@ -75,11 +70,6 @@ tar czf "$DIST/dockpanel-frontend.tar.gz" -C panel/frontend dist/
 
 # ─── Generate SBOMs (SPDX JSON) ───
 echo -e "${YELLOW}Generating SBOMs...${NC}"
-if ! command -v cargo-sbom >/dev/null 2>&1; then
-  echo "  Installing cargo-sbom..."
-  cargo install cargo-sbom --locked --version ^0.10 >/dev/null
-fi
-cargo sbom --project-directory panel/backend --output-format spdx_json_2_3 > "$DIST/dockpanel-api.spdx.json"
 # CLI + MCP are Go (panel/go); syft covers the Go module when installed.
 if command -v syft >/dev/null 2>&1; then
   syft dir:panel/go -o spdx-json > "$DIST/dockpanel-go.spdx.json"

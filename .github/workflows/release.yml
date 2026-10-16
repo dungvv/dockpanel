@@ -116,59 +116,23 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      # Static musl binaries (zero glibc dependency) so the agent/API/CLI run on
-      # the whole support matrix regardless of distro libc version — Debian 11/12,
-      # Ubuntu 20.04+, CentOS/Rocky 9, Amazon Linux 2023 (#70). cargo-zigbuild uses
-      # Zig's bundled clang as the C cross-compiler, which builds aws-lc-sys (the
-      # only C dependency in the tree) statically for both musl targets from a
-      # single x86_64 runner. The rest of the TLS stack is pure rustls.
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.13.0
-
-      - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-zigbuild
-
-      - name: Cache Rust dependencies
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            panel/backend/target/
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-
-
-      - name: Build API (static musl)
-        run: cargo zigbuild --release --target ${{ matrix.target }} --manifest-path panel/backend/Cargo.toml
-
-      # Agent, CLI and MCP server are Go (panel/go): CGO_ENABLED=0 gives a static binary
-      # for either arch straight from this runner, no zig needed.
+      # Every binary is Go (panel/go): CGO_ENABLED=0 gives a static binary for
+      # either arch straight from this runner — no libc dependency, so it runs on
+      # the whole support matrix (Debian 11/12, Ubuntu 20.04+, RHEL 9, AL2023).
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
           go-version-file: panel/go/go.mod
           cache-dependency-path: panel/go/go.sum
 
-      - name: Build agent + CLI + MCP server (Go, static)
+      - name: Build API + agent + CLI + MCP server (Go, static)
         run: bash scripts/build-go.sh go-out ${{ matrix.arch }}
 
       - name: Package binaries
         run: |
           mkdir -p release
           cp go-out/dockpanel-agent release/dockpanel-agent-linux-${{ matrix.arch }}
-          cp panel/backend/target/${{ matrix.target }}/release/dockpanel-api release/dockpanel-api-linux-${{ matrix.arch }}
+          cp go-out/dockpanel-api release/dockpanel-api-linux-${{ matrix.arch }}
           cp go-out/dockpanel release/dockpanel-cli-linux-${{ matrix.arch }}
           cp go-out/dockpanel-mcp release/dockpanel-mcp-linux-${{ matrix.arch }}
           chmod +x release/*
@@ -179,16 +143,7 @@ jobs:
           echo "Linkage check:"
           file release/dockpanel-agent-linux-${{ matrix.arch }}
 
-      - name: Install cargo-sbom
-        if: matrix.arch == 'amd64'
-        run: cargo install cargo-sbom --locked --version ^0.10 --force
-
-      - name: Generate SBOMs (SPDX JSON)
-        if: matrix.arch == 'amd64'
-        run: |
-          cargo sbom --project-directory panel/backend --output-format spdx_json_2_3 > release/dockpanel-api.spdx.json
-
-      - name: Generate SBOM for the Go module (agent + CLI + MCP, SPDX JSON)
+      - name: "Generate SBOM (Go module: API + agent + CLI + MCP, SPDX JSON)"
         if: matrix.arch == 'amd64'
         uses: anchore/sbom-action@v0
         with:

@@ -150,8 +150,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-AGENT_SRC="$REPO_DIR/panel/agent"
-API_SRC="$REPO_DIR/panel/backend"
+AGENT_SRC="$REPO_DIR/panel/go/internal/agent/services"   # holds the agent systemd unit
 MCP_SRC="$REPO_DIR/panel/go"
 
 # Directories the agent unit declares in ReadWritePaths, with any `-` prefix
@@ -181,25 +180,24 @@ GITHUB_REPO="ovexro/dockpanel"
 # to 1 by auto-detect — but with the stale local script still running.
 # Result: binaries upgrade fine, but script-side fixes (unit files, nginx
 # tweaks, install-agent.sh deploy) never reach pre-v2.8.16 panels.
-if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ ! -d "$AGENT_SRC/src" ]; then
+if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ ! -f "$REPO_DIR/panel/go/go.mod" ]; then
     log "No source found — switching to pre-built binary download"
     INSTALL_FROM_RELEASE=1
 fi
 
-# Auto-detect: if Rust toolchain isn't available, use release binaries.
-# Production VPS installs typically don't have cargo on PATH (and usually
-# don't have enough RAM to compile rustc's dep tree — proc-macro2 OOMs at
-# ~1-2 GB). Fall back to the pre-built artifacts on the matching tag rather
-# than asking the operator to install rustup just to update.
+# Auto-detect: if no Go toolchain is available, use release binaries.
+# Production VPS installs typically have none; fall back to the pre-built
+# artifacts on the matching tag rather than installing a toolchain just to
+# update. (BUILD_FROM_SOURCE=1 lets build-go.sh install Go itself.)
 if [ "$INSTALL_FROM_RELEASE" != "1" ] \
-   && ! command -v cargo > /dev/null 2>&1 \
-   && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
-    log "Rust toolchain not found — switching to pre-built binary download"
+   && ! command -v go > /dev/null 2>&1 \
+   && [ ! -x /usr/local/go/bin/go ]; then
+    log "Go toolchain not found — switching to pre-built binary download"
     log "(set BUILD_FROM_SOURCE=1 to force compile-from-source instead)"
     INSTALL_FROM_RELEASE=1
 fi
 
-# Explicit opt-in to keep compile-from-source behaviour even when cargo
+# Explicit opt-in to keep compile-from-source behaviour even when no Go toolchain
 # is on PATH (e.g. for developers iterating on a checkout).
 if [ "${BUILD_FROM_SOURCE:-0}" = "1" ]; then
     INSTALL_FROM_RELEASE=0
@@ -240,8 +238,8 @@ if [ "${SELF_REFRESHED:-0}" != "1" ] && [ "$INSTALL_FROM_RELEASE" = "1" ] \
 fi
 
 # For source builds, verify source exists
-if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ ! -d "$AGENT_SRC/src" ]; then
-    error "Cannot find agent source at $AGENT_SRC"
+if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ ! -f "$REPO_DIR/panel/go/go.mod" ]; then
+    error "Cannot find the Go source tree at $REPO_DIR/panel/go"
     exit 1
 fi
 
@@ -431,24 +429,8 @@ if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
     rm -f "$CHECKSUMS"
     log "Frontend updated"
 else
-    # Build from source
-    # Detect Rust toolchain
-    if command -v cargo &> /dev/null; then
-        CARGO_CMD="cargo"
-    elif [ -f "$HOME/.cargo/bin/cargo" ]; then
-        CARGO_CMD="$HOME/.cargo/bin/cargo"
-    else
-        error "Rust toolchain not found, but BUILD_FROM_SOURCE=1 was requested."
-        error "Recommended: drop BUILD_FROM_SOURCE=1 — update.sh will auto-fetch pre-built binaries."
-        error "If you really want to compile from source: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-        error "(note: building from source needs ~4 GB RAM — most production VPSes won't have it)"
-        exit 1
-    fi
-
-    log "Building API..."
-    (cd "$API_SRC" && $CARGO_CMD build --release 2>&1 | tail -1)
-
-    log "Building agent, CLI and MCP server (Go)..."
+    # Build from source (Go; build-go.sh installs the toolchain if missing)
+    log "Building API, agent, CLI and MCP server (Go)..."
     bash "$REPO_DIR/scripts/build-go.sh" "$GO_BUILD_DIR"
 
     if [ -d "$FRONTEND_DIR" ]; then
@@ -1161,7 +1143,7 @@ if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
     mv /tmp/dockpanel-mcp-new "$MCP_BIN"
 else
     cp "$GO_BUILD_DIR/dockpanel-agent" "$AGENT_BIN"
-    cp "$API_SRC/target/release/dockpanel-api" "$API_BIN"
+    cp "$GO_BUILD_DIR/dockpanel-api" "$API_BIN"
     cp "$GO_BUILD_DIR/dockpanel" "$CLI_BIN"
     cp "$GO_BUILD_DIR/dockpanel-mcp" "$MCP_BIN"
 fi

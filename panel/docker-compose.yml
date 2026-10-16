@@ -29,7 +29,9 @@ services:
         max-file: "3"
 
   api:
-    build: ./backend
+    build:
+      context: ./go
+      dockerfile: Dockerfile.api
     ports:
       - "127.0.0.1:3062:3000"
     environment:

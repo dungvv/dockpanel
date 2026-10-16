@@ -9,12 +9,17 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/ovexro/dockpanel/panel/go/internal/api"
 )
 
 // version is set by scripts/build-go.sh (-X main.version=…).
 var version = ""
+
+// The Rust API serialised every timestamp as DateTime<Utc> ("...Z"); pgx
+// returns timestamptz in time.Local, so pin Local to UTC for the whole process.
+func init() { time.Local = time.UTC }
 
 func main() {
 	if version != "" {

@@ -49,8 +49,7 @@ FW_MGR="none"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FRONTEND_DIR="$REPO_DIR/panel/frontend"
-AGENT_SRC="$REPO_DIR/panel/agent"
-API_SRC="$REPO_DIR/panel/backend"
+AGENT_SRC="$REPO_DIR/panel/go/internal/agent/services"   # holds the agent systemd unit
 MCP_SRC="$REPO_DIR/panel/go"
 
 # Directories the agent unit declares in ReadWritePaths, with any `-` prefix
@@ -447,8 +446,8 @@ check_source() {
     if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
         return
     fi
-    if [ ! -d "$AGENT_SRC/src" ]; then
-        error "Cannot find agent source at $AGENT_SRC"
+    if [ ! -f "$REPO_DIR/panel/go/go.mod" ]; then
+        error "Cannot find the Go source tree at $REPO_DIR/panel/go"
         error "Run this script from the DockPanel repository root,"
         error "or set INSTALL_FROM_RELEASE=1 to download pre-built binaries."
         exit 1
@@ -1201,42 +1200,9 @@ download_binaries() {
     log "Frontend extracted to $FRONTEND_DIST"
 }
 
-# ── Cargo Build with Progress ────────────────────────────────────────────
-cargo_build_with_progress() {
-    local src_dir="$1"
-    local label="$2"
-    local count=0
-    local start_time
-    start_time=$(date +%s)
-
-    (cd "$src_dir" && $CARGO_CMD build --release 2>&1) | while IFS= read -r line; do
-        if echo "$line" | grep -cE '^\s*Compiling ' >/dev/null; then
-            count=$((count + 1))
-            local crate_name
-            crate_name=$(echo "$line" | sed 's/.*Compiling \([^ ]*\).*/\1/')
-            local elapsed=$(( $(date +%s) - start_time ))
-            printf "\r    ${DIM}%s: %d crates (%ds) → %s${NC}                    " "$label" "$count" "$elapsed" "$crate_name" >&2
-        elif echo "$line" | grep -cE '^\s*Finished ' >/dev/null; then
-            local elapsed=$(( $(date +%s) - start_time ))
-            printf "\r    ${DIM}%s: %d crates compiled in %ds${NC}                              \n" "$label" "$count" "$elapsed" >&2
-        fi
-    done
-}
-
 # ── Build Binaries ───────────────────────────────────────────────────────
 build_binaries() {
     header "Building Binaries"
-
-    # Check for Rust toolchain
-    if command -v cargo &> /dev/null; then
-        CARGO_CMD="cargo"
-    elif [ -f "$HOME/.cargo/bin/cargo" ]; then
-        CARGO_CMD="$HOME/.cargo/bin/cargo"
-    else
-        log "Installing Rust toolchain..."
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y > /dev/null 2>&1
-        CARGO_CMD="$HOME/.cargo/bin/cargo"
-    fi
 
     # Stop running services so cp can overwrite their binaries (see note in
     # download_binaries — same "Text file busy" trap).
@@ -1244,21 +1210,17 @@ build_binaries() {
         systemctl stop dockpanel-api dockpanel-agent 2>/dev/null || true
     fi
 
-    # Build agent, CLI and MCP server (Go, panel/go; installs the Go toolchain if missing)
-    log "Building agent, CLI and MCP server..."
+    # Every binary is Go (panel/go); build-go.sh installs the Go toolchain if missing.
+    log "Building API, agent, CLI and MCP server..."
     bash "$REPO_DIR/scripts/build-go.sh" /tmp/dockpanel-go-build
     cp /tmp/dockpanel-go-build/dockpanel-agent "$AGENT_BIN"
     chmod +x "$AGENT_BIN"
     log "Agent built ($(du -h "$AGENT_BIN" | cut -f1))"
 
-    # Build API
-    log "Building API..."
-    cargo_build_with_progress "$API_SRC" "API"
-    cp "$API_SRC/target/release/dockpanel-api" "$API_BIN"
+    cp /tmp/dockpanel-go-build/dockpanel-api "$API_BIN"
     chmod +x "$API_BIN"
     log "API built ($(du -h "$API_BIN" | cut -f1))"
 
-    # CLI + MCP server were built with the agent above.
     cp /tmp/dockpanel-go-build/dockpanel "$CLI_BIN"
     cp /tmp/dockpanel-go-build/dockpanel-mcp "$MCP_BIN"
     chmod +x "$CLI_BIN" "$MCP_BIN"
@@ -2223,7 +2185,7 @@ main() {
     detect_firewall
 
     # Auto-detect: if no source available, use release binaries
-    if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ ! -d "$AGENT_SRC/src" ]; then
+    if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ ! -f "$REPO_DIR/panel/go/go.mod" ]; then
         INSTALL_FROM_RELEASE=1
     fi
 

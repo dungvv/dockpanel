@@ -539,17 +539,15 @@ func EmitGuidance(root string) error {
 	if err := os.MkdirAll(filepath.Dir(module), 0o755); err != nil {
 		return err
 	}
-	// TODO(integration): uncomment once svc_prerequisites.go exists.
-	// if err := os.WriteFile(manual, []byte(PrerequisitesCopyManual()), 0o644); err != nil {
-	// 	return err
-	// }
-	// if err := os.WriteFile(module, []byte(PrerequisitesCopyFrontendModule()), 0o644); err != nil {
-	// 	return err
-	// }
-	// fmt.Println("wrote " + manual)
-	// fmt.Println("wrote " + module)
-	// return nil
-	return fmt.Errorf("guidance generation not ported yet (would write %s and %s)", manual, module)
+	if err := os.WriteFile(manual, []byte(PrerequisitesCopyManual()), 0o644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(module, []byte(PrerequisitesCopyFrontendModule()), 0o644); err != nil {
+		return err
+	}
+	fmt.Println("wrote " + manual)
+	fmt.Println("wrote " + module)
+	return nil
 }
 
 // gracefulShutdownTimeout bounds the drain after a shutdown signal: a 78%
@@ -630,51 +628,51 @@ func Serve(cfg *Config) error {
 	defer cancelShutdown()
 
 	st := NewAppState(db, cfg, agent, agents, shutdown)
-	// TODO(integration): register the broadcast so notify_panel() can send
+	// Register the broadcast so notify_panel() can send
 	// without AppState.
-	// NotificationsInitNotifBroadcast(st.Notif)
+	NotificationsInitNotifBroadcast(st.Notif)
 	st.LoadPersistedAuthState(context.Background())
 
-	// TODO(integration): startup finalizers, in this order.
+	// Startup finalizers, in this order.
 	// Phase 4 W4: close out in-flight panel-update rows from a previous
 	// process lifetime (the api dies mid-binary-swap).
-	// PanelUpdateFinalizePendingOnStartup(context.Background(), db)
+	PanelUpdateFinalizePendingOnStartup(context.Background(), db)
 	// Same argument, one table over: a restart takes running migration
 	// analyses/imports with it, so any row still claiming to run is stale.
-	// rtMigrationFinalizeAnalyzingOnStartup(context.Background(), db)
+	rtMigrationFinalizeAnalyzingOnStartup(context.Background(), db)
 
-	// TODO(integration): status-page subscriber fan-out worker. Started here,
+	// Status-page subscriber fan-out worker. Started here,
 	// not from a service loop, because BOTH the uptime monitor and the
 	// incidents handlers feed it and a request can arrive first. Idempotent.
-	// StatusNoticesStartWorker(db)
+	StatusNoticesStartWorker(db)
 
-	// TODO(integration): background services, in main.rs order. Each
+	// Background services, in main.rs order. Each
 	// <M>Run(ctx, …) returns when ctx (shutdown) is cancelled.
 	// The scheduler decrypts DB credentials for site backups, so it needs
 	// the restore path's secret; fleet-wide, so it gets the registry.
-	// spawnSupervised(shutdown, "backup_scheduler", func(ctx context.Context) { BackupSchedulerRun(ctx, db, agents, cfg.JWTSecret) })
-	// spawnSupervised(shutdown, "server_monitor", func(ctx context.Context) { ServerMonitorRun(ctx, db) })
-	// spawnSupervised(shutdown, "uptime_monitor", func(ctx context.Context) { UptimeRun(ctx, db) })
+	spawnSupervised(shutdown, "backup_scheduler", func(ctx context.Context) { BackupSchedulerRun(ctx, db, agents, cfg.JWTSecret) })
+	spawnSupervised(shutdown, "server_monitor", func(ctx context.Context) { ServerMonitorRun(ctx, db) })
+	spawnSupervised(shutdown, "uptime_monitor", func(ctx context.Context) { UptimeRun(ctx, db) })
 	// Both scanners take a MACHINE as their subject: they sweep the fleet.
-	// spawnSupervised(shutdown, "security_scanner", func(ctx context.Context) { SecurityScannerRun(ctx, db, agents) })
-	// spawnSupervised(shutdown, "image_scanner", func(ctx context.Context) { ImageScannerRun(ctx, db, agents) })
-	// spawnSupervised(shutdown, "wp_vuln_scanner", func(ctx context.Context) { WpVulnScannerRun(ctx, db, agents) })
+	spawnSupervised(shutdown, "security_scanner", func(ctx context.Context) { SecurityScannerRun(ctx, db, agents) })
+	spawnSupervised(shutdown, "image_scanner", func(ctx context.Context) { ImageScannerRun(ctx, db, agents) })
+	spawnSupervised(shutdown, "wp_vuln_scanner", func(ctx context.Context) { WpVulnScannerRun(ctx, db, agents) })
 	// GPU, service-health and container checks run per online server.
-	// spawnSupervised(shutdown, "alert_engine", func(ctx context.Context) { AlertEngineRun(ctx, db, agents) })
+	spawnSupervised(shutdown, "alert_engine", func(ctx context.Context) { AlertEngineRun(ctx, db, agents) })
 	// The healer gets the REGISTRY and nothing else: the two legs that once
 	// took the local client acted on the wrong machine.
-	// spawnSupervised(shutdown, "auto_healer", func(ctx context.Context) { AutoHealerRun(ctx, db, agents) })
+	spawnSupervised(shutdown, "auto_healer", func(ctx context.Context) { AutoHealerRun(ctx, db, agents) })
 	// Reads every online server through its OWN agent (metrics_history).
-	// spawnSupervised(shutdown, "metrics_collector", func(ctx context.Context) { MetricsCollectorRun(ctx, db, agents) })
-	// spawnSupervised(shutdown, "deploy_scheduler", func(ctx context.Context) { DeploySchedulerRun(ctx, db, agents) })
-	// spawnSupervised(shutdown, "preview_cleanup", func(ctx context.Context) { PreviewCleanupRun(ctx, db, agents) })
-	// spawnSupervised(shutdown, "backup_verifier", func(ctx context.Context) { BackupVerifierRun(ctx, db, agents) })
-	// spawnSupervised(shutdown, "backup_policy_executor", func(ctx context.Context) { BackupPolicyExecutorRun(ctx, db, agents, cfg.JWTSecret) })
+	spawnSupervised(shutdown, "metrics_collector", func(ctx context.Context) { MetricsCollectorRun(ctx, db, agents) })
+	spawnSupervised(shutdown, "deploy_scheduler", func(ctx context.Context) { DeploySchedulerRun(ctx, db, agents) })
+	spawnSupervised(shutdown, "preview_cleanup", func(ctx context.Context) { PreviewCleanupRun(ctx, db, agents) })
+	spawnSupervised(shutdown, "backup_verifier", func(ctx context.Context) { BackupVerifierRun(ctx, db, agents) })
+	spawnSupervised(shutdown, "backup_policy_executor", func(ctx context.Context) { BackupPolicyExecutorRun(ctx, db, agents, cfg.JWTSecret) })
 	// A drill restores a backup on the server that owns it.
-	// spawnSupervised(shutdown, "drill_scheduler", func(ctx context.Context) { DrillSchedulerRun(ctx, db, agents) })
-	// spawnSupervised(shutdown, "traffic_accounting_scheduler", func(ctx context.Context) { TrafficAccountingSchedulerRun(ctx, db, agents) })
+	spawnSupervised(shutdown, "drill_scheduler", func(ctx context.Context) { DrillSchedulerRun(ctx, db, agents) })
+	spawnSupervised(shutdown, "traffic_accounting_scheduler", func(ctx context.Context) { TrafficAccountingSchedulerRun(ctx, db, agents) })
 	// Local BY INTENT: it diagnoses the panel host itself (agents.Local()).
-	// spawnSupervised(shutdown, "telemetry_collector", func(ctx context.Context) { TelemetryCollectorRun(ctx, db, agents) })
+	spawnSupervised(shutdown, "telemetry_collector", func(ctx context.Context) { TelemetryCollectorRun(ctx, db, agents) })
 
 	// Periodic cleanup of the token blacklist and rate limiters (15 min).
 	spawnSupervised(shutdown, "cleanup", func(ctx context.Context) { runCleanup(ctx, st) })

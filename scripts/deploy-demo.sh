@@ -49,7 +49,7 @@ declare -A ASSET_DEST=(
 # ── Resolve repo root — same idiom as setup.sh/update.sh ─────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-AGENT_SRC="$REPO_DIR/panel/agent"
+AGENT_SRC="$REPO_DIR/panel/go/internal/agent/services"   # holds the agent systemd unit
 FE_DIST="$REPO_DIR/panel/frontend/dist"
 
 # Directories the agent unit declares in ReadWritePaths, with any `-` prefix

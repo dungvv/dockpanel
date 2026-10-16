@@ -166,6 +166,15 @@ func rowKind[T any]() string {
 func scanRows[T any](rows pgx.Rows, limit int) ([]T, error) {
 	defer rows.Close()
 	fds := rows.FieldDescriptions()
+	// A statement that fails at execution has no field descriptions; surface
+	// the real Postgres error instead of a misleading "no column found".
+	if len(fds) == 0 {
+		for rows.Next() {
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
 	kind := rowKind[T]()
 	var fields map[string]dbField
 	if kind == "struct" {

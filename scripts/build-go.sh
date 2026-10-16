@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# Build the Go binaries (agent, CLI, MCP server) from panel/go.
+# Build every DockPanel binary (API, agent, CLI, MCP server) from panel/go.
 #
 #   bash scripts/build-go.sh <out-dir> [goarch]
 #
-# Produces <out-dir>/{dockpanel-agent,dockpanel,dockpanel-mcp}, statically linked
+# Produces <out-dir>/{dockpanel-api,dockpanel-agent,dockpanel,dockpanel-mcp}, statically linked
 # for linux/<goarch> (default: the host arch). The version stamp comes from
 # panel/backend/Cargo.toml, the release's single version source.
 #
@@ -64,7 +64,7 @@ OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 cd "$REPO_DIR/panel/go"
 export CGO_ENABLED=0 GOOS=linux GOARCH="${GOARCH_TARGET:-$(host_arch)}" GOTOOLCHAIN="${GOTOOLCHAIN:-auto}"
 AGENT_VERSION_VAR="github.com/ovexro/dockpanel/panel/go/internal/agent/services.AgentVersion"
-for bin in dockpanel-agent dockpanel dockpanel-mcp; do
+for bin in dockpanel-api dockpanel-agent dockpanel dockpanel-mcp; do
     "$GO" build -trimpath -ldflags "-s -w -X main.version=${VERSION} -X ${AGENT_VERSION_VAR}=${VERSION}" -o "$OUT_DIR/$bin" "./cmd/$bin"
 done
-echo "Built dockpanel-agent + dockpanel + dockpanel-mcp ${VERSION} (linux/${GOARCH}) into ${OUT_DIR}" >&2
+echo "Built dockpanel-api + dockpanel-agent + dockpanel + dockpanel-mcp ${VERSION} (linux/${GOARCH}) into ${OUT_DIR}" >&2
