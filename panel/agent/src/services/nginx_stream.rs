@@ -283,7 +283,13 @@ pub async fn write_stream_proxy(
 
     match test_config().await {
         Ok(out) if out.success => {
-            crate::services::nginx::reload().await?;
+            // A reload that fails after `nginx -t` passed must not leave the
+            // file behind: the panel records no row on error, so it would be
+            // an orphan listener the next reload silently brings up.
+            if let Err(e) = crate::services::nginx::reload().await {
+                restore_or_remove(&path, None);
+                return Err(e);
+            }
             Ok(path)
         }
         Ok(out) => {
