@@ -310,6 +310,9 @@ const appIcons: Record<string, ReactNode> = {
   keycloak: (
     <svg className="w-6 h-6" viewBox="0 0 128 128"><rect rx="16" fill="#4d4d4d" width="128" height="128"/><path fill="#fff" d="M40 28h48l-12 24H52L40 28z" opacity=".6"/><path fill="#fff" d="M52 52h24v24H52z" opacity=".9"/><path fill="#fff" d="M40 100h48l-12-24H52L40 100z" opacity=".6"/><path fill="#00b4f0" d="M60 58h8v12h-8z"/><circle fill="#00b4f0" cx="64" cy="56" r="4"/></svg>
   ),
+  casdoor: (
+    <svg className="w-6 h-6" viewBox="0 0 128 128"><rect rx="16" fill="#1d4ed8" width="128" height="128"/><circle cx="64" cy="64" r="34" fill="none" stroke="#fff" strokeWidth="14"/><path fill="#1d4ed8" d="M70 44h40v40H70z"/><circle fill="#fff" cx="64" cy="64" r="8"/></svg>
+  ),
   // ─── Dev Tools (additional) ───────────────────────────────────
   woodpecker: (
     <svg className="w-6 h-6" viewBox="0 0 128 128"><rect rx="16" fill="#4caf50" width="128" height="128"/><path fill="#fff" d="M24 96V44l20-20v52L24 96zm28 0V32l20-20v64L52 96zm28 0V20l24-8v68L80 96z" opacity=".85"/></svg>

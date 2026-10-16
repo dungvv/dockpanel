@@ -1,6 +1,6 @@
 {
   "_generated": "Do not edit. Source of truth is TEMPLATES in panel/agent/src/services/docker_apps.rs. Regenerate with UPDATE_TEMPLATE_CATALOGUE=1 cargo test -p dockpanel-agent catalogue",
-  "count": 147,
+  "count": 148,
   "templates": [
     {
       "category": "CMS",
@@ -1025,6 +1025,41 @@
       "image": "quay.io/keycloak/keycloak:26.7",
       "name": "Keycloak",
       "volumes": []
+    },
+    {
+      "category": "Security",
+      "cmd": null,
+      "container_port": "8000/tcp",
+      "default_port": 8007,
+      "env_vars": [
+        {
+          "default": "sqlite",
+          "label": "Database Driver (sqlite, mysql, postgres)",
+          "name": "driverName",
+          "required": false,
+          "secret": false
+        },
+        {
+          "default": "file:/data/casdoor.db?cache=shared",
+          "label": "Database Data Source",
+          "name": "dataSourceName",
+          "required": false,
+          "secret": false
+        },
+        {
+          "default": "http://localhost:8007",
+          "label": "Public URL",
+          "name": "origin",
+          "required": false,
+          "secret": false
+        }
+      ],
+      "id": "casdoor",
+      "image": "casbin/casdoor:4.20.0",
+      "name": "Casdoor",
+      "volumes": [
+        "/data"
+      ]
     },
     {
       "category": "Development",

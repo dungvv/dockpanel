@@ -58,7 +58,7 @@ export const measurements = {
   },
 
   /** Docker app templates in the catalogue. Derived from source by the pin suite. */
-  templates: 147,
+  templates: 148,
 
   /** Install to a working login, Ubuntu 24.04, 1 vCPU. */
   installSeconds: 47,

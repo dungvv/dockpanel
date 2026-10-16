@@ -408,6 +408,8 @@ static TEMPLATE_DOMAIN_ENV: &[(&str, &[(&str, DomainEnv)])] = &[
         ],
     ),
     ("photoprism", &[("PHOTOPRISM_SITE_URL", DomainEnv::Url)]),
+    // Casdoor builds its OIDC issuer and OAuth redirect URLs from `origin`.
+    ("casdoor", &[("origin", DomainEnv::Url)]),
     (
         "graylog",
         &[("GRAYLOG_HTTP_EXTERNAL_URI", DomainEnv::UrlSlash)],
@@ -1409,6 +1411,21 @@ static TEMPLATES: &[AppTemplateDef] = &[
             EnvVarDef { name: "KC_DB_URL", label: "Database JDBC URL", default: "", required: true, secret: false },
         ],
         volumes: &[],
+    },
+    AppTemplateDef {
+        id: "casdoor",
+        name: "Casdoor",
+        description: "UI-first IAM / SSO server with OAuth 2.0, OIDC, SAML, CAS, LDAP and WebAuthn. Runs on SQLite by default; set the driver and data source for MySQL or PostgreSQL. First login is admin / 123 — change it immediately.",
+        category: "Security",
+        image: "casbin/casdoor:4.20.0",
+        default_port: 8007,
+        container_port: "8000/tcp",
+        env_vars: &[
+            EnvVarDef { name: "driverName", label: "Database Driver (sqlite, mysql, postgres)", default: "sqlite", required: false, secret: false },
+            EnvVarDef { name: "dataSourceName", label: "Database Data Source", default: "file:/data/casdoor.db?cache=shared", required: false, secret: false },
+            EnvVarDef { name: "origin", label: "Public URL", default: "http://localhost:8007", required: false, secret: false },
+        ],
+        volumes: &["/data"],
     },
     // ─── Dev Tools ───────────────────────────────────────────────
     AppTemplateDef {
