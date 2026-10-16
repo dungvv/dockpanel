@@ -145,19 +145,15 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            panel/agent/target/
             panel/backend/target/
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
 
-      - name: Build agent (static musl)
-        run: cargo zigbuild --release --target ${{ matrix.target }} --manifest-path panel/agent/Cargo.toml
-
       - name: Build API (static musl)
         run: cargo zigbuild --release --target ${{ matrix.target }} --manifest-path panel/backend/Cargo.toml
 
-      # CLI + MCP server are Go (panel/go): CGO_ENABLED=0 gives a static binary
+      # Agent, CLI and MCP server are Go (panel/go): CGO_ENABLED=0 gives a static binary
       # for either arch straight from this runner, no zig needed.
       - name: Setup Go
         uses: actions/setup-go@v6
@@ -165,13 +161,13 @@ jobs:
           go-version-file: panel/go/go.mod
           cache-dependency-path: panel/go/go.sum
 
-      - name: Build CLI + MCP server (Go, static)
+      - name: Build agent + CLI + MCP server (Go, static)
         run: bash scripts/build-go.sh go-out ${{ matrix.arch }}
 
       - name: Package binaries
         run: |
           mkdir -p release
-          cp panel/agent/target/${{ matrix.target }}/release/dockpanel-agent release/dockpanel-agent-linux-${{ matrix.arch }}
+          cp go-out/dockpanel-agent release/dockpanel-agent-linux-${{ matrix.arch }}
           cp panel/backend/target/${{ matrix.target }}/release/dockpanel-api release/dockpanel-api-linux-${{ matrix.arch }}
           cp go-out/dockpanel release/dockpanel-cli-linux-${{ matrix.arch }}
           cp go-out/dockpanel-mcp release/dockpanel-mcp-linux-${{ matrix.arch }}
@@ -190,10 +186,9 @@ jobs:
       - name: Generate SBOMs (SPDX JSON)
         if: matrix.arch == 'amd64'
         run: |
-          cargo sbom --project-directory panel/agent   --output-format spdx_json_2_3 > release/dockpanel-agent.spdx.json
           cargo sbom --project-directory panel/backend --output-format spdx_json_2_3 > release/dockpanel-api.spdx.json
 
-      - name: Generate SBOM for the Go module (CLI + MCP, SPDX JSON)
+      - name: Generate SBOM for the Go module (agent + CLI + MCP, SPDX JSON)
         if: matrix.arch == 'amd64'
         uses: anchore/sbom-action@v0
         with:

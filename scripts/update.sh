@@ -445,13 +445,10 @@ else
         exit 1
     fi
 
-    log "Building agent..."
-    (cd "$AGENT_SRC" && $CARGO_CMD build --release 2>&1 | tail -1)
-
     log "Building API..."
     (cd "$API_SRC" && $CARGO_CMD build --release 2>&1 | tail -1)
 
-    log "Building CLI and MCP server (Go)..."
+    log "Building agent, CLI and MCP server (Go)..."
     bash "$REPO_DIR/scripts/build-go.sh" "$GO_BUILD_DIR"
 
     if [ -d "$FRONTEND_DIR" ]; then
@@ -1163,7 +1160,7 @@ if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
     mv /tmp/dockpanel-cli-new "$CLI_BIN"
     mv /tmp/dockpanel-mcp-new "$MCP_BIN"
 else
-    cp "$AGENT_SRC/target/release/dockpanel-agent" "$AGENT_BIN"
+    cp "$GO_BUILD_DIR/dockpanel-agent" "$AGENT_BIN"
     cp "$API_SRC/target/release/dockpanel-api" "$API_BIN"
     cp "$GO_BUILD_DIR/dockpanel" "$CLI_BIN"
     cp "$GO_BUILD_DIR/dockpanel-mcp" "$MCP_BIN"

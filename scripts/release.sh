@@ -46,12 +46,11 @@ mkdir -p "$DIST"
 
 # ─── Build x86_64 (native) ───
 echo -e "${YELLOW}Building x86_64...${NC}"
-cd panel/agent && cargo build --release 2>&1 | tail -1 && cd ../..
 cd panel/backend && cargo build --release 2>&1 | tail -1 && cd ../..
 bash scripts/build-go.sh "$DIST/go-amd64" amd64
 
-cp panel/agent/target/release/dockpanel-agent "$DIST/dockpanel-agent-linux-amd64"
 cp panel/backend/target/release/dockpanel-api "$DIST/dockpanel-api-linux-amd64"
+mv "$DIST/go-amd64/dockpanel-agent" "$DIST/dockpanel-agent-linux-amd64"
 mv "$DIST/go-amd64/dockpanel" "$DIST/dockpanel-cli-linux-amd64"
 mv "$DIST/go-amd64/dockpanel-mcp" "$DIST/dockpanel-mcp-linux-amd64"
 rmdir "$DIST/go-amd64"
@@ -60,12 +59,11 @@ rmdir "$DIST/go-amd64"
 echo -e "${YELLOW}Building aarch64...${NC}"
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
 
-cd panel/agent && cargo build --release --target aarch64-unknown-linux-gnu 2>&1 | tail -1 && cd ../..
 cd panel/backend && cargo build --release --target aarch64-unknown-linux-gnu 2>&1 | tail -1 && cd ../..
 bash scripts/build-go.sh "$DIST/go-arm64" arm64
 
-cp panel/agent/target/aarch64-unknown-linux-gnu/release/dockpanel-agent "$DIST/dockpanel-agent-linux-arm64"
 cp panel/backend/target/aarch64-unknown-linux-gnu/release/dockpanel-api "$DIST/dockpanel-api-linux-arm64"
+mv "$DIST/go-arm64/dockpanel-agent" "$DIST/dockpanel-agent-linux-arm64"
 mv "$DIST/go-arm64/dockpanel" "$DIST/dockpanel-cli-linux-arm64"
 mv "$DIST/go-arm64/dockpanel-mcp" "$DIST/dockpanel-mcp-linux-arm64"
 rmdir "$DIST/go-arm64"
@@ -81,7 +79,6 @@ if ! command -v cargo-sbom >/dev/null 2>&1; then
   echo "  Installing cargo-sbom..."
   cargo install cargo-sbom --locked --version ^0.10 >/dev/null
 fi
-cargo sbom --project-directory panel/agent   --output-format spdx_json_2_3 > "$DIST/dockpanel-agent.spdx.json"
 cargo sbom --project-directory panel/backend --output-format spdx_json_2_3 > "$DIST/dockpanel-api.spdx.json"
 # CLI + MCP are Go (panel/go); syft covers the Go module when installed.
 if command -v syft >/dev/null 2>&1; then

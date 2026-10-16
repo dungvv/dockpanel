@@ -1244,10 +1244,10 @@ build_binaries() {
         systemctl stop dockpanel-api dockpanel-agent 2>/dev/null || true
     fi
 
-    # Build agent
-    log "Building agent..."
-    cargo_build_with_progress "$AGENT_SRC" "Agent"
-    cp "$AGENT_SRC/target/release/dockpanel-agent" "$AGENT_BIN"
+    # Build agent, CLI and MCP server (Go, panel/go; installs the Go toolchain if missing)
+    log "Building agent, CLI and MCP server..."
+    bash "$REPO_DIR/scripts/build-go.sh" /tmp/dockpanel-go-build
+    cp /tmp/dockpanel-go-build/dockpanel-agent "$AGENT_BIN"
     chmod +x "$AGENT_BIN"
     log "Agent built ($(du -h "$AGENT_BIN" | cut -f1))"
 
@@ -1258,9 +1258,7 @@ build_binaries() {
     chmod +x "$API_BIN"
     log "API built ($(du -h "$API_BIN" | cut -f1))"
 
-    # Build CLI + MCP server (Go, panel/go; installs the Go toolchain if missing)
-    log "Building CLI and MCP server..."
-    bash "$REPO_DIR/scripts/build-go.sh" /tmp/dockpanel-go-build
+    # CLI + MCP server were built with the agent above.
     cp /tmp/dockpanel-go-build/dockpanel "$CLI_BIN"
     cp /tmp/dockpanel-go-build/dockpanel-mcp "$MCP_BIN"
     chmod +x "$CLI_BIN" "$MCP_BIN"
