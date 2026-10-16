@@ -2072,13 +2072,13 @@ pub async fn remove(
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
+    // Abort on failure: the rows cascade away below, so a listener that
+    // survives here would be a public port the panel no longer records.
     for (pname, pport) in &stream_proxies {
-        if let Err(e) = agent
+        agent
             .delete(&format!("/nginx/streams/{pname}?listen_port={pport}"))
             .await
-        {
-            tracing::warn!("Failed to remove stream proxy {pname} during site delete: {e}");
-        }
+            .map_err(|e| agent_error("Database remote access removal", e))?;
     }
 
     for (_, container_id) in &databases {

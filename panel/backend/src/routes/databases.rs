@@ -482,9 +482,12 @@ pub async fn remove(
     .map_err(|e| internal_error("lookup database tcp proxy", e))?;
     if let Some((pname, pport)) = proxy {
         let ppath = format!("/nginx/streams/{pname}?listen_port={pport}");
-        if let Err(e) = agent.delete(&ppath).await {
-            tracing::warn!("stream proxy {pname} cleanup failed during database delete: {e}");
-        }
+        // Abort, like remote_access_disable: deleting past a failed removal
+        // would drop the row and leave a public listener nobody can see.
+        agent
+            .delete(&ppath)
+            .await
+            .map_err(|e| agent_error("Database remote access removal", e))?;
         sqlx::query("DELETE FROM tcp_proxies WHERE database_id = $1")
             .bind(id)
             .execute(&state.db)

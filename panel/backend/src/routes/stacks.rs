@@ -730,13 +730,13 @@ pub async fn remove(
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
+    // Unlike the containers below, a failure here aborts: the rows cascade
+    // away, so a surviving listener would be a public port nobody records.
     for (pname, pport) in &stack_stream_proxies {
-        if let Err(e) = agent
+        agent
             .delete(&format!("/nginx/streams/{pname}?listen_port={pport}"))
             .await
-        {
-            tracing::warn!("Could not remove stack {id}'s stream proxy {pname}: {e}");
-        }
+            .map_err(|e| agent_error("Database remote access removal", e))?;
     }
 
     let owned_dbs: Vec<(Option<String>,)> =
