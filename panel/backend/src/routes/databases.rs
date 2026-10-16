@@ -1605,6 +1605,11 @@ pub async fn remote_access_enable(
     .await?;
 
     tracing::info!("Database remote access enabled: {name} on :{}", row.listen_port);
+    crate::services::activity::log_activity_on_server(
+        &state.db, claims.sub, &claims.email, "database.remote_access_enabled",
+        Some("database"), Some(&name), Some(&format!("port {}", row.listen_port)),
+        None, Some(server_id), claims.key_id,
+    ).await;
 
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -1658,6 +1663,11 @@ pub async fn remote_access_disable(
         .map_err(|e| internal_error("delete database tcp proxy", e))?;
 
     tracing::info!("Database remote access disabled: {name} (port {pport})");
+    crate::services::activity::log_activity_on_server(
+        &state.db, claims.sub, &claims.email, "database.remote_access_disabled",
+        Some("database"), Some(&name), Some(&format!("port {pport}")),
+        None, Some(server_id), claims.key_id,
+    ).await;
 
     Ok(Json(serde_json::json!({ "ok": true, "name": pname })))
 }

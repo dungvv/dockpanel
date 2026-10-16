@@ -354,6 +354,12 @@ pub async fn create(
         row.upstream_host,
         row.upstream_port
     );
+    crate::services::activity::log_activity_on_server(
+        &state.db, claims.sub, &claims.email, "tcp_proxy.create",
+        Some("tcp_proxy"), Some(&row.name),
+        Some(&format!(":{} -> {}:{}", row.listen_port, row.upstream_host, row.upstream_port)),
+        None, Some(server_id), claims.key_id,
+    ).await;
 
     Ok((StatusCode::CREATED, Json(row)))
 }
@@ -404,6 +410,11 @@ pub async fn remove(
         .map_err(|e| internal_error("delete tcp proxy", e))?;
 
     tracing::info!("TCP proxy deleted: {name} (port {listen_port})");
+    crate::services::activity::log_activity_on_server(
+        &state.db, claims.sub, &claims.email, "tcp_proxy.delete",
+        Some("tcp_proxy"), Some(&name), Some(&format!("port {listen_port}")),
+        None, Some(server_id), claims.key_id,
+    ).await;
 
     Ok(Json(serde_json::json!({ "ok": true, "name": name })))
 }
