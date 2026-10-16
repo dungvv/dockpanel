@@ -155,6 +155,10 @@ assert_contains "$AGENT_STREAM_SVC" 'container_loopback_port' \
     "database upstreams are read off the container, not the wire"
 assert_contains "$AGENT_STREAM_SVC" 'dockpanel.managed' \
     "container upstreams require the managed label"
+assert_contains "$AGENT_STREAM_SVC" 'std::fs::hard_link(&tmp, &path)' \
+    "create never overwrites an existing proxy file"
+assert_contains "$BACKEND_TCP" 'check tcp proxy name' \
+    "backend refuses a taken name before calling the agent"
 # The render must never be reachable from the route file — routes delegate.
 check "route file has no inline server block" \
       "$(grep -c 'server {' "$AGENT_STREAM_ROUTE")" "0"

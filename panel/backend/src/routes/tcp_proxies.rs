@@ -165,6 +165,30 @@ pub(crate) async fn create_proxy(
     container_id: Option<&str>,
     caller_is_admin: bool,
 ) -> Result<TcpProxy, ApiError> {
+    // Refuse a taken name/database BEFORE the agent call: the insert's unique
+    // violation used to arrive after the agent had already written, and the
+    // rollback below then deleted the live proxy's file. (The agent also
+    // refuses to overwrite, which covers two requests racing past this.)
+    let taken: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM tcp_proxies \
+         WHERE (server_id = $1 AND name = $2) OR ($3::uuid IS NOT NULL AND database_id = $3)",
+    )
+    .bind(server_id)
+    .bind(name)
+    .bind(database_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("check tcp proxy name", e))?;
+    if taken.is_some() {
+        return Err(err(
+            StatusCode::CONFLICT,
+            match database_id {
+                Some(_) => "Remote access is already enabled, or another database maps to the same proxy name",
+                None => "A TCP proxy with this name already exists on this server",
+            },
+        ));
+    }
+
     let listen_port = allocate_listen_port(state, server_id).await?;
 
     let mut agent_body = serde_json::json!({

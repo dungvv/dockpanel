@@ -228,8 +228,8 @@ pub fn listen_port_free(port: u16) -> bool {
     std::net::TcpListener::bind(("0.0.0.0", port)).is_ok()
 }
 
-/// Write a managed stream proxy: validate, write temp+rename, `nginx -t`,
-/// reload, roll back on failure. Returns the rendered path on success.
+/// Create a managed stream proxy: validate, write temp+link (never over an
+/// existing name), `nginx -t`, reload, roll back on failure. Returns the rendered path on success.
 pub async fn write_stream_proxy(
     name: &str,
     listen_port: u16,
@@ -265,17 +265,21 @@ pub async fn write_stream_proxy(
     }
 
     let path = stream_config_path(name);
-    let previous = std::fs::read_to_string(&path).ok();
     let body = render_stream_server(listen_port, &upstream, tls);
 
     std::fs::create_dir_all(STREAM_DIR).map_err(|e| format!("cannot create {STREAM_DIR}: {e}"))?;
-    let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, &body)
-        .and_then(|_| std::fs::rename(&tmp, &path))
-        .map_err(|e| {
-            std::fs::remove_file(&tmp).ok();
-            format!("failed to write {path}: {e}")
-        })?;
+    // Create never overwrites: a second create for a live name (a double
+    // click, a slug collision like app_db/app-db) used to replace the live
+    // file, and the panel's rollback then deleted it. `hard_link` publishes
+    // the temp file atomically AND fails if the name is taken; the per-call
+    // temp name keeps two concurrent writers off each other's bytes.
+    let tmp = format!("{path}.{}.tmp", uuid::Uuid::new_v4());
+    let published = std::fs::write(&tmp, &body).and_then(|_| std::fs::hard_link(&tmp, &path));
+    std::fs::remove_file(&tmp).ok();
+    published.map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => format!("stream proxy '{name}' already exists"),
+        _ => format!("failed to write {path}: {e}"),
+    })?;
 
     match test_config().await {
         Ok(out) if out.success => {
@@ -283,15 +287,14 @@ pub async fn write_stream_proxy(
             Ok(path)
         }
         Ok(out) => {
-            let restored = restore_or_remove(&path, previous.as_deref());
+            restore_or_remove(&path, None);
             Err(format!(
-                "nginx -t rejected the stream config: {}{}",
-                out.stderr.trim(),
-                restore_note(restored)
+                "nginx -t rejected the stream config: {}",
+                out.stderr.trim()
             ))
         }
         Err(e) => {
-            restore_or_remove(&path, previous.as_deref());
+            restore_or_remove(&path, None);
             Err(format!("nginx -t could not run: {e}"))
         }
     }
