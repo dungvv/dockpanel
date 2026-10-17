@@ -14,14 +14,19 @@
 # deployment, watched it collapse to the oldest, watched the new index refuse a
 # second) — that half cannot run here, and this file does not pretend it does.
 #
+# Go port: the backend half is panel/go/internal/api/rt_git_deploys.go
+# (rtGitDeploysDeploy / rtGitDeploysListApprovals / rtGitDeploysApproveDeploy /
+# rtGitDeploysUpdate, routes registered in the same file); the migration ships
+# from panel/go/internal/api/migrations.
+#
 #   run: bash tests/deploy-approval-reachable-pin-e2e.sh
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UI="$REPO/panel/frontend/src/pages/GitDeploys.tsx"
-API="$REPO/panel/backend/src/routes/git_deploys.rs"
-ROUTES="$REPO/panel/backend/src/routes/mod.rs"
-MIG="$REPO/panel/backend/migrations/20260815000000_deploy_approvals_one_pending.sql"
+API="$REPO/panel/go/internal/api/rt_git_deploys.go"
+ROUTES="$API"
+MIG="$REPO/panel/go/internal/api/migrations/20260815000000_deploy_approvals_one_pending.sql"
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
@@ -40,13 +45,13 @@ awk '/^  const startDeploy = async/{f=1} f{print} f&&/^  };$/{exit}' "$UI" > "$T
 check "the shared deploy call site was extracted (a fixed window would lie)" \
       "$([ -s "$TMP/startDeploy" ] && echo yes || echo no)" "yes"
 
-# Same discipline on the backend: `deploy()` contains BOTH the approval INSERT and
+# Same discipline on the backend: `rtGitDeploysDeploy` contains BOTH the approval INSERT and
 # an `if filed` that also appears in the response body, so a file-wide count of
 # either would be measuring the wrong occurrences.
-awk '/^pub async fn deploy\(/{f=1} f{print} f&&/^}$/{exit}' "$API" > "$TMP/deploy_fn"
-check "the deploy() body was extracted" \
+awk '/^func rtGitDeploysDeploy\(/{f=1} f{print} f&&/^}$/{exit}' "$API" > "$TMP/deploy_fn"
+check "the rtGitDeploysDeploy body was extracted" \
       "$([ -s "$TMP/deploy_fn" ] && echo yes || echo no)" "yes"
-awk '/^        if filed \{$/{f=1} f{print} f&&/^        \}$/{exit}' "$TMP/deploy_fn" > "$TMP/filed_block"
+awk '/^\t\tif filed \{$/{f=1} f{print} f&&/^\t\t\}$/{exit}' "$TMP/deploy_fn" > "$TMP/filed_block"
 check "the new-request gate block was extracted" \
       "$([ -s "$TMP/filed_block" ] && echo yes || echo no)" "yes"
 
@@ -57,7 +62,7 @@ echo "── A: the approval endpoints are REACHABLE from the panel ──"
 # unanchored count is satisfied by a commented-out registration, and this arm is
 # the positive control the next one leans on.
 check "all three approval routes are registered" \
-      "$(grep -cE '^ +\.route\("/api/deploy-approvals[^\"]*", (get|post)\(git_deploys::' "$ROUTES")" "3"
+      "$(grep -cE '^[[:space:]]+r\.Handle\("(GET|POST) /api/deploy-approvals[^"]*", h\(rtGitDeploys' "$ROUTES")" "3"
 check "the panel LISTS pending approvals" \
       "$(grep -c 'api.get<DeployApproval\[\]>("/deploy-approvals")' "$UI")" "1"
 check "the panel POSTs approve/reject" \
@@ -127,7 +132,7 @@ echo "── D: one pending request per deployment, not one per click ──"
 check "the approval INSERT cannot write a duplicate" \
       "$(grep -c 'ON CONFLICT DO NOTHING' "$TMP/deploy_fn")" "1"
 check "a repeat click does not re-notify every admin" \
-      "$(grep -c 'notify_panel' "$TMP/filed_block")" "1"
+      "$(grep -c 'NotificationsNotifyPanel(' "$TMP/filed_block")" "1"
 check "the requester is told which case they are in" \
       "$(grep -c 'already has a request waiting' "$API")" "1"
 check "the migration creates the constraint" \
@@ -156,8 +161,8 @@ echo "── E: the payload contract, pinned at BOTH ends ──"
 # front of an administrator about to authorise a production deploy — or, for
 # `requested_by`, as `undefined === user.id`, which puts the Approve button back
 # on your own request.
-awk '/^pub async fn list_approvals\(/{f=1} f{print} f&&/^}$/{exit}' "$API" > "$TMP/list_fn"
-grep -oE '^ +"[a-z_]+": ' "$TMP/list_fn" | tr -d '": ' | sort > "$TMP/srv.keys"
+awk '/^func rtGitDeploysListApprovals\(/{f=1} f{print} f&&/^}$/{exit}' "$API" > "$TMP/list_fn"
+grep -oE '^[[:space:]]+"[a-z_]+": ' "$TMP/list_fn" | tr -d '": \t' | sort > "$TMP/srv.keys"
 awk '/^interface DeployApproval \{$/{f=1;next} f&&/^}$/{exit} f{print}' "$UI" \
   | sed -E 's/^ *([a-z_]+)\??:.*/\1/' | sort > "$TMP/cli.keys"
 # Both sides non-empty FIRST — otherwise two empty files diff clean and this whole
@@ -175,16 +180,19 @@ echo "── F: a request whose flag was switched off must not stay approvable �
 check "the list only offers requests that are still protected" \
       "$(grep -c "AND g.deploy_protected AND EXISTS" "$API")" "1"
 check "approve re-reads the flag rather than trusting the row" \
-      "$(grep -c 'if !config.deploy_protected {' "$API")" "1"
+      "$(grep -c 'if !config.DeployProtected {' "$API")" "1"
 check "clearing the flag resolves what was waiting on it" \
       "$(grep -c "SET status = 'cancelled', resolved_at = NOW()" "$API")" "1"
 # FIVE doors replace the running container — deploy, webhook, trigger_deploy_task,
 # approve and rollback. This read FOUR until s364: approve was fixed at s362, and
 # rollback was still writing the status unconditionally and merely warning on
 # error, so a rollback could start on top of a running build and each would swap
-# the container out from under the other.
+# the container out from under the other. Go names the lock once
+# (rtGitDeploysLockSQL) and each door executes it, so: one definition, five uses.
+check "  the atomic build lock is defined once" \
+      "$(grep -c "status IS DISTINCT FROM 'building'" "$API")" "1"
 check "all five container-replacing doors take the atomic build lock" \
-      "$(grep -c "status IS DISTINCT FROM 'building'" "$API")" "5"
+      "$(grep -cE 'execSQL\(ctx, (st\.DB|db), rtGitDeploysLockSQL, ' "$API")" "5"
 check "the approver's name surviving their deletion is the FK's job" \
       "$(grep -c 'ON DELETE SET NULL' "$MIG")" "1"
 
@@ -203,22 +211,22 @@ check "clearing or setting the flag is written to the audit log" \
 # state; the point of the record is that the account disarming its own guard
 # cannot then remove the evidence.
 #
-# Scoped to `update()`'s own body (bounded on the next `pub async fn`, not a
+# Scoped to rtGitDeploysUpdate's own body (bounded on the next `func`, not a
 # fixed line window) rather than grepped across the whole file: the resource-
 # mutation audit-log extension (s480) legitimately added a SECOND, unrelated
-# security_hardening::audit_log call to this file (in `remove()`, for
+# SecurityHardeningAuditLog call to this file (in the remove handler, for
 # git_deploy.remove) — a whole-file count of "1" was only ever true by
 # incidental exclusivity, never the actual property this check means to pin.
-awk '/^pub async fn update\(/{f=1} f&&/^pub async fn /&&!/^pub async fn update\(/{exit} f{print}' "$API" > "$TMP/update_fn"
+awk '/^func rtGitDeploysUpdate\(/{f=1;print;next} f&&/^func /{exit} f{print}' "$API" > "$TMP/update_fn"
 check "the record goes to the immutable log, not the activity feed" \
-      "$(grep -c 'security_hardening::audit_log' "$TMP/update_fn")" "1"
+      "$(grep -c 'SecurityHardeningAuditLog(' "$TMP/update_fn")" "1"
 # A COALESCE write cannot tell "set to true" from "left true", so the previous
 # value has to be read for the comparison to mean anything. Without this the
 # log would fire on every unrelated field edit.
 check "the previous value is fetched so an unchanged flag logs nothing" \
-      "$(grep -c 'deploy_protected != was_protected' "$API")" "1"
+      "$(grep -c 'deploy.DeployProtected != cur.DeployProtected' "$API")" "1"
 # v2.168.0: this query grew d.server_id/d.ssl_email/d.tls_mode/c.alias (the
-# TLS-mode resolution `update()` now needs) and a LEFT JOIN, so the literal
+# TLS-mode resolution the update handler now needs) and a LEFT JOIN, so the literal
 # text changed — the control now asserts what it always meant: deploy_protected
 # is still fetched alongside the pre-existing current values, in this one query.
 check "  [control] the flag is still selected alongside the other current values" \
