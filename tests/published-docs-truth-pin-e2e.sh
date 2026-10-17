@@ -13,7 +13,8 @@
 #       `docs/guides/backup-orchestrator.md` and `docs/guides/status-page.md`
 #       carried the CORRECT tables, so two published surfaces contradicted each
 #       other and the reference was the wrong one.
-#       This is a REPEAT: `routes/mod.rs` already carries a comment, above the
+#       This is a REPEAT: the router (then routes/mod.rs, now
+#       panel/go/internal/api/rt_incidents.go) already carries a comment, above the
 #       status-page unsubscribe route, recording that the handler doc, the guide
 #       prose and the guide's API table had all published DELETE while the route
 #       accepted POST only — "every reader who followed the documentation got a
@@ -25,7 +26,7 @@
 #       swatch grid, per-user persistence that is really per-browser
 #       localStorage, and a four-level Card Depth control that does not exist.
 #   P3  `docs/guides/secrets.md` published seven `dockpanel secrets …` CLI
-#       commands. The CLI crate contains the string "secret" zero times.
+#       commands. The CLI (then a Rust crate, now panel/go/internal/cli) contains the string "secret" zero times.
 #   P4  Two guides sent operators to screens that are not in the product: a
 #       "Status Page > Subscribers" admin list whose endpoint has no caller, and
 #       a "Settings > Notifications" per-type preference screen with no backing
@@ -46,7 +47,7 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-ROUTER=panel/backend/src/routes/mod.rs
+ROUTER_DIR=panel/go/internal/api
 APIREF=docs/api-reference.md
 THEMES=docs/guides/themes.md
 SECRETS=docs/guides/secrets.md
@@ -56,7 +57,8 @@ STATUSPAGE=docs/guides/status-page.md
 INCIDENTS=docs/guides/incidents.md
 NOTIFS=docs/guides/notifications.md
 
-for f in "$ROUTER" "$APIREF" "$THEMES" "$SECRETS" "$LAYOUT" "$SETTINGS" \
+[ -d "$ROUTER_DIR" ] || { echo "missing source dir: $ROUTER_DIR"; exit 1; }
+for f in "$APIREF" "$THEMES" "$SECRETS" "$LAYOUT" "$SETTINGS" \
          "$STATUSPAGE" "$INCIDENTS" "$NOTIFS"; do
   [ -f "$f" ] || { echo "missing source file: $f"; exit 1; }
 done
@@ -64,34 +66,43 @@ done
 echo
 echo "── 1. every documented API row names a route the panel registers ──"
 
-# The whole router is one file today. If that ever stops being true this arm
-# would silently narrow to whatever mod.rs still held, so measure it: `grep -r`
-# (NOT `git grep`, which enumerates nothing outside a checkout) over the backend
-# for any OTHER registrar.
-STRAY=$(grep -rl --include=*.rs '\.route(' panel/backend/src | grep -v 'routes/mod\.rs$' | wc -l)
+# The Go router is spread over every rt_*.go registrar, each calling
+# r.Handle("<METHOD> <path>", ...). The parse below only sees string-literal
+# patterns (plus the one table-driven loop it expands, rtSystemServices), so
+# measure that: any OTHER non-literal registration would silently narrow it.
+# `grep -r` (NOT `git grep`, which enumerates nothing outside a checkout).
+STRAY=$(grep -rhE '\.Handle\(' --include=*.go "$ROUTER_DIR" | grep -v '_test\.go' \
+  | grep -vE '\.Handle\("(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) /[^"]*",' \
+  | grep -vE '^\s*func \(rt \*Router\) Handle\(' \
+  | grep -vF 'r.Handle("POST /api/services/"+s.path,' | wc -l)
 if [ "$STRAY" -eq 0 ]; then
-  ok "routes/mod.rs is the only file registering routes, so parsing it is complete"
+  ok "every route registration in $ROUTER_DIR is a literal pattern (or the expanded rtSystemServices loop), so parsing them is complete"
 else
-  bad "routes are registered outside routes/mod.rs in $STRAY file(s) — this suite's parse is now partial"
+  bad "$STRAY route registration(s) in $ROUTER_DIR use a non-literal pattern — this suite's parse is now partial"
 fi
 
-ROUTE_REPORT=$(python3 - "$ROUTER" "$APIREF" <<'PY'
-import re, sys
-router_path, doc_path = sys.argv[1], sys.argv[2]
-mod = open(router_path).read()
+ROUTE_REPORT=$(python3 - "$ROUTER_DIR" "$APIREF" <<'PY'
+import glob, os, re, sys
+router_dir, doc_path = sys.argv[1], sys.argv[2]
 
-# .route("<path>", get(..).post(..)) — the handler chain can span lines, so scan a
-# bounded window forward and stop at the next .route( so we never absorb a sibling.
+# r.Handle("<METHOD> <path>", ...) in every non-test Go file of the api package.
 routes = {}
-for m in re.finditer(r'\.route\(\s*"([^"]+)"\s*,', mod):
-    tail = mod[m.end():m.end() + 400].split('.route(')[0]
-    verbs = re.findall(r'\b(get|post|put|delete|patch|head|options)\s*\(', tail)
-    routes.setdefault(m.group(1), set()).update(v.upper() for v in verbs)
+for fn in sorted(glob.glob(os.path.join(router_dir, '*.go'))):
+    if fn.endswith('_test.go'):
+        continue
+    src = open(fn).read()
+    for m in re.finditer(r'\.Handle\("(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) (/[^"]*)",', src):
+        routes.setdefault(m.group(2), set()).add(m.group(1))
+    # The one table-driven registrar: POST /api/services/<path> per rtSystemServices row.
+    if 'r.Handle("POST /api/services/"+s.path,' in src:
+        tbl = re.search(r'var rtSystemServices = \[\]struct\{[^}]*\}\{(.*?)\n\}', src, re.S)
+        for path in re.findall(r'\{"([^"]+)", "', tbl.group(1) if tbl else ''):
+            routes.setdefault('/api/services/' + path, set()).add('POST')
 
 def norm(p):
     # A documented row may carry an example query string; it is not part of the path.
     # Param NAMES differ between the docs ({id}) and the router ({vault_id}) by
-    # convention, so compare on shape.
+    # convention, so compare on shape ({rest...} wildcards included).
     return re.sub(r'\{[^}]*\}', '{}', p.split('?')[0].rstrip('/'))
 
 registered = {}
@@ -113,18 +124,39 @@ if len(rows) < 100:
     print(f"ENUM-FAIL reference yielded {len(rows)} documented rows")
     raise SystemExit
 
+# ServeMux cannot hold some sibling patterns that axum could, so a few
+# registrars take one wildcard pattern and dispatch on the segment inside the
+# handler (rt_alerts.go: PUT /api/alerts/{a}/{b} serves .../{id}/acknowledge
+# and .../{id}/resolve). Fall back to that: a pattern with the SAME number of
+# segments whose wildcards cover the documented row's concrete segments.
+# Never a trailing {rest...} wildcard — that would match everything.
+def wild_verbs(n):
+    segs = n.split('/')
+    verbs = set()
+    for p, v in registered.items():
+        ps = p.split('/')
+        if len(ps) == len(segs) and '...' not in p and \
+           all(a == b or a == '{}' for a, b in zip(ps, segs)):
+            verbs |= v
+    return verbs
+
 bad = []
+via_wild = 0
 for ln, meth, path in rows:
     if not path.startswith('/api/'):
         continue          # SPA paths and external URLs are not this arm's subject
     n = norm(path)
-    if n not in registered:
+    verbs = registered.get(n, set())
+    if meth not in verbs and meth in wild_verbs(n):
+        via_wild += 1
+        continue
+    if not verbs and not wild_verbs(n):
         bad.append(f"{doc_path}:{ln} {meth} {path} — no such path in the router")
-    elif meth not in registered[n]:
-        have = ",".join(sorted(registered[n]))
+    elif meth not in verbs:
+        have = ",".join(sorted(verbs | wild_verbs(n)))
         bad.append(f"{doc_path}:{ln} {meth} {path} — 405, router registers {have}")
 
-print(f"ENUM-OK {len(routes)} routes / {len(rows)} documented rows")
+print(f"ENUM-OK {len(routes)} route paths / {len(rows)} documented rows ({via_wild} via a dispatching wildcard)")
 for b in bad:
     print("MISMATCH " + b)
 PY
@@ -224,20 +256,22 @@ fi
 echo
 echo "── 3. the secrets guide publishes no CLI the CLI does not have ──"
 
-CLI_SECRET_HITS=$(grep -ric 'secret' panel/cli/src 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
-CLI_FN=$(grep -rc 'fn ' panel/cli/src/main.rs | awk -F: '{print $NF}')
+CLI_SRC="panel/go/internal/cli panel/go/cmd/dockpanel"
+# shellcheck disable=SC2086
+CLI_SECRET_HITS=$(grep -ric --include=*.go --exclude=*_test.go 'secret' $CLI_SRC 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
+CLI_FN=$(grep -c '^func ' panel/go/internal/cli/cli.go 2>/dev/null)
 if [ "${CLI_FN:-0}" -ge 1 ]; then
-  ok "CLI crate is readable (control: main.rs matches 'fn ')"
+  ok "CLI source is readable (control: internal/cli/cli.go matches 'func ')"
 else
-  bad "positive control failed — cannot read panel/cli/src/main.rs, so the arm below proves nothing"
+  bad "positive control failed — cannot read panel/go/internal/cli/cli.go, so the arm below proves nothing"
 fi
 DOC_CLI=$(grep -c 'dockpanel secrets' "$SECRETS")
 if [ "$DOC_CLI" -eq 0 ]; then
   ok "secrets.md publishes no 'dockpanel secrets' command (the CLI has no secrets subcommand)"
 elif [ "${CLI_SECRET_HITS:-0}" -gt 0 ]; then
-  ok "secrets.md publishes $DOC_CLI CLI example(s) and the CLI crate does mention secrets"
+  ok "secrets.md publishes $DOC_CLI CLI example(s) and the CLI source does mention secrets"
 else
-  bad "secrets.md publishes $DOC_CLI 'dockpanel secrets' command(s); the CLI crate mentions 'secret' $CLI_SECRET_HITS times"
+  bad "secrets.md publishes $DOC_CLI 'dockpanel secrets' command(s); the CLI source mentions 'secret' $CLI_SECRET_HITS times"
 fi
 
 # The inject endpoint is site-scoped. A guide that omits the site makes the
@@ -248,7 +282,7 @@ else
   bad "secrets.md documents an inject endpoint without /{site_id} — the router has no such route"
 fi
 
-# There is no rollback handler in routes/secrets.rs; the version list returns
+# There is no rollback handler in rt_secrets.go; the version list returns
 # metadata only, so an old value cannot even be read back.
 if grep -qiE 'roll ?back to a previous version' "$SECRETS"; then
   bad "secrets.md offers rolling back to a previous secret version; no such endpoint exists"
@@ -261,7 +295,7 @@ echo "── 4. a guide that sends the operator to a screen names one that exist
 
 # The endpoint is real and admin-gated; what does not exist is a panel screen.
 # So the pin is the PAIR: the docs may name the screen only if something calls it.
-SUBS_CALLERS=$(grep -rl 'status-page/subscribers' panel/frontend/src panel/cli 2>/dev/null | wc -l)
+SUBS_CALLERS=$(grep -rl 'status-page/subscribers' panel/frontend/src panel/go/internal/cli 2>/dev/null | wc -l)
 SUBS_DOC=$(grep -lE '\*\*Status Page\*\* > \*\*Subscribers\*\*' "$STATUSPAGE" "$INCIDENTS" 2>/dev/null | wc -l)
 # Control: the frontend really is greppable for sibling status-page calls.
 SUBS_CONTROL=$(grep -rl 'status-page' panel/frontend/src 2>/dev/null | wc -l)

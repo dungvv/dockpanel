@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # backend-hot-file-audit-pin-e2e.sh — s463
 #
-# panel/backend/src/{routes,services} had never had its own exhaustion status
-# directly re-verified (agent crate: s461, panel/cli/src: s462). A LOC-rank +
+# The Rust backend's src/{routes,services} had never had its own exhaustion
+# status directly re-verified (agent crate: s461, CLI src: s462). A LOC-rank +
 # two-direction pre-selection check (git-log + memory-mention grep, filtering
 # a cosmetic mass-commit that touches nearly every backend file) surfaced 5
 # files with genuinely zero prior dedicated scrutiny: dns.rs, security.rs +
@@ -52,8 +52,20 @@
 #      all, so `/api/update/rollback` could race update.sh's binary swap
 #      against restore-snapshot.sh's binary swap on the same files.
 #
+# Go port (panel/go/internal/api): dns.rs → rt_dns.go (rtDnsUpdateRecord /
+# rtDnsDeleteRecord, rtDnsIsHex32, rtDnsPdnsParseRecordID); security.rs →
+# rt_security.go (rtSecurityComplianceReport, rtSecurityHTMLEscape);
+# databases.rs → rt_databases.go (rtDatabasesList/Credentials/Remove/
+# GetDbInfo/PitrConfig, the shared rtDatabasesCallerPredicate, create's
+# rtDatabasesResolveOwner + SiteCallerPredicate); panel_update.rs →
+# svc_panel_update.go (PanelUpdateBuildFleetPlan / StartPanelUpdate /
+# RollbackToSnapshot, a mutex-guarded PanelUpdateStateHandle); update.rs →
+# rt_update.go (rtUpdateApplyFleet, rtUpdateRejectApplyTarget,
+# rtUpdateRollback). The pure predicates (§A record-id shape, §B escaping)
+# are Go tests in pin_backend_hot_file_audit_test.go.
+#
 # Read-only/authz-widening changes mostly; the one behavior addition beyond
-# tightening is databases.rs's admin-visibility widening, which grants
+# tightening is the databases handlers' admin-visibility widening, which grants
 # nothing create() didn't already grant — it makes read/manage consistent
 # with what create() already authorized.
 
@@ -75,16 +87,19 @@ code() {
   perl -0777 -pe '
     s{^[ \t]*/\*.*?\*/[ \t]*$}{}gms;
     s{^\s*//.*$}{}gm;
-    s{^\s*///.*$}{}gm;
   ' "$1"
 }
 
 has()    { grep -qE -- "$2" <<< "$1"; }
 lacks()  { ! grep -qE -- "$2" <<< "$1"; }
+count()  { grep -oE -- "$2" <<< "$1" | wc -l | tr -d ' '; }
+flat()   { tr -s '[:space:]' ' ' <<< "$1"; }
+# Line of the first match of $2 in $1 (0 = absent).
+lineof() { local n; n=$(grep -nE -- "$2" <<< "$1" | head -1 | cut -d: -f1); echo "${n:-0}"; }
 
 fnbody() {
   awk -v fn="$2" '
-    index($0, "fn " fn "(") && !started { started=1 }
+    !started && (index($0, "func " fn "(") == 1 || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) { started=1 }
     started {
       n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
       if (opened || n>0) opened=1
@@ -93,202 +108,218 @@ fnbody() {
   ' <<< "$1"
 }
 
-DNS=panel/backend/src/routes/dns.rs
+API=panel/go/internal/api
+DNS=$API/rt_dns.go
 DNS_C=$(code "$DNS")
-SECURITY=panel/backend/src/routes/security.rs
+SECURITY=$API/rt_security.go
 SECURITY_C=$(code "$SECURITY")
-DATABASES=panel/backend/src/routes/databases.rs
+DATABASES=$API/rt_databases.go
 DATABASES_C=$(code "$DATABASES")
-PANEL_UPDATE=panel/backend/src/services/panel_update.rs
+PANEL_UPDATE=$API/svc_panel_update.go
 PANEL_UPDATE_C=$(code "$PANEL_UPDATE")
-UPDATE=panel/backend/src/routes/update.rs
+UPDATE=$API/rt_update.go
 UPDATE_C=$(code "$UPDATE")
 
-UPDATE_RECORD_BODY=$(fnbody "$DNS_C" "update_record")
-DELETE_RECORD_BODY=$(fnbody "$DNS_C" "delete_record")
-COMPLIANCE_BODY=$(fnbody "$SECURITY_C" "compliance_report")
-DB_LIST_BODY=$(fnbody "$DATABASES_C" "list")
-DB_CREDENTIALS_BODY=$(fnbody "$DATABASES_C" "credentials")
-DB_REMOVE_BODY=$(fnbody "$DATABASES_C" "remove")
-DB_GET_INFO_BODY=$(fnbody "$DATABASES_C" "get_db_info")
-DB_PITR_CONFIG_BODY=$(fnbody "$DATABASES_C" "pitr_config")
-BUILD_FLEET_PLAN_BODY=$(fnbody "$PANEL_UPDATE_C" "build_fleet_plan")
-START_UPDATE_BODY=$(fnbody "$PANEL_UPDATE_C" "start_panel_update")
-ROLLBACK_BODY=$(fnbody "$PANEL_UPDATE_C" "rollback_to_snapshot")
-APPLY_FLEET_BODY=$(fnbody "$UPDATE_C" "apply_fleet")
+for f in "$DNS" "$SECURITY" "$DATABASES" "$PANEL_UPDATE" "$UPDATE"; do [ -f "$f" ] || bad "MISSING SUBJECT FILE: $f"; done
 
-# ── §A dns.rs: record_id validated before URL interpolation ─────────────
-echo "── §A dns.rs: CF record_id is allowlisted (32-char hex) before use ──"
+UPDATE_RECORD_BODY=$(fnbody "$DNS_C" "rtDnsUpdateRecord")
+DELETE_RECORD_BODY=$(fnbody "$DNS_C" "rtDnsDeleteRecord")
+COMPLIANCE_BODY=$(fnbody "$SECURITY_C" "rtSecurityComplianceReport")
+DB_LIST_BODY=$(fnbody "$DATABASES_C" "rtDatabasesList")
+DB_CREDENTIALS_BODY=$(fnbody "$DATABASES_C" "rtDatabasesCredentials")
+DB_REMOVE_BODY=$(fnbody "$DATABASES_C" "rtDatabasesRemove")
+DB_GET_INFO_BODY=$(fnbody "$DATABASES_C" "rtDatabasesGetDbInfo")
+DB_PITR_CONFIG_BODY=$(fnbody "$DATABASES_C" "rtDatabasesPitrConfig")
+DB_CREATE_BODY=$(fnbody "$DATABASES_C" "rtDatabasesCreate")
+DB_RESOLVE_OWNER_BODY=$(fnbody "$DATABASES_C" "rtDatabasesResolveOwner")
+BUILD_FLEET_PLAN_BODY=$(fnbody "$PANEL_UPDATE_C" "PanelUpdateBuildFleetPlan")
+START_UPDATE_BODY=$(fnbody "$PANEL_UPDATE_C" "PanelUpdateStartPanelUpdate")
+ROLLBACK_BODY=$(fnbody "$PANEL_UPDATE_C" "PanelUpdateRollbackToSnapshot")
+APPLY_FLEET_BODY=$(fnbody "$UPDATE_C" "rtUpdateApplyFleet")
+ROLLBACK_ROUTE_BODY=$(fnbody "$UPDATE_C" "rtUpdateRollback")
 
-if has "$UPDATE_RECORD_BODY" 'record_id\.len\(\) != 32' && has "$UPDATE_RECORD_BODY" 'is_ascii_hexdigit'; then
-  ok "A1 update_record validates record_id as 32-char hex on the cloudflare arm"
-else
-  bad "A1 update_record's cloudflare arm no longer validates record_id shape"
-fi
+# ── §A rt_dns.go: record_id validated before URL interpolation ──────────
+echo "── §A rt_dns.go: CF record_id is allowlisted (32-char hex) before use ──"
+# The predicate itself (32 hex, path-shaped ids refused) is
+# TestPinBackendHotFileAuditCfRecordID (panel/go/internal/api/pin_backend_hot_file_audit_test.go);
+# these arms pin that each Cloudflare arm calls it BEFORE building the URL.
 
-if has "$DELETE_RECORD_BODY" 'record_id\.len\(\) != 32' && has "$DELETE_RECORD_BODY" 'is_ascii_hexdigit'; then
-  ok "A2 delete_record validates record_id as 32-char hex on the cloudflare arm"
-else
-  bad "A2 delete_record's cloudflare arm no longer validates record_id shape"
-fi
+cf_guard() { # id body label
+  local g u
+  g=$(lineof "$2" 'if !rtDnsIsHex32\(recordID\) \{')
+  u=$(lineof "$2" 'dns_records/%s", rtDnsCFAPI, rtDnsDeref\(zone\.CfZoneID\), recordID\)')
+  if [ "$g" -gt 0 ] && [ "$u" -gt 0 ] && [ "$g" -lt "$u" ]; then
+    ok "$1 $3 validates record_id via rtDnsIsHex32 before interpolating it into the Cloudflare URL"
+  else
+    bad "$1 $3's cloudflare arm no longer validates record_id shape before the URL (guard line $g, URL line $u)"
+  fi
+}
+cf_guard A1 "$UPDATE_RECORD_BODY" rtDnsUpdateRecord
+cf_guard A2 "$DELETE_RECORD_BODY" rtDnsDeleteRecord
 
 # Positive control: the PowerDNS arm's record_id (a hex-encoded composite of
-# variable length, decoded via pdns_parse_record_id) must NOT be forced
+# variable length, decoded via rtDnsPdnsParseRecordID) must NOT be forced
 # through the same fixed-32-hex check — it was never the bug and a blanket
 # fix would break every PowerDNS record update/delete.
-if has "$UPDATE_RECORD_BODY" 'pdns_parse_record_id'; then
-  ok "A3 (control) update_record's powerdns arm still parses record_id via pdns_parse_record_id"
+if has "$UPDATE_RECORD_BODY" 'rtDnsPdnsParseRecordID\(recordID\)'; then
+  ok "A3 (control) rtDnsUpdateRecord's powerdns arm still parses record_id via rtDnsPdnsParseRecordID"
 else
   bad "A3 (control) powerdns record parsing regressed"
 fi
 
-# ── §B security.rs: compliance_report escapes scan-derived HTML ─────────
-echo "── §B security.rs: compliance_report HTML-escapes findings before interpolation ──"
+# ── §B rt_security.go: compliance report escapes scan-derived HTML ──────
+echo "── §B rt_security.go: rtSecurityComplianceReport HTML-escapes findings before interpolation ──"
 
-if has "$SECURITY_C" 'fn html_escape'; then
-  ok "B1 an html_escape helper exists in security.rs"
-else
-  bad "B1 no html_escape helper found"
-fi
+# B1 retired: covered by TestPinBackendHotFileAuditHTMLEscape (panel/go/internal/api/pin_backend_hot_file_audit_test.go)
 
-if has "$COMPLIANCE_BODY" 'html_escape\(severity\)' \
-  && has "$COMPLIANCE_BODY" 'html_escape\(title\)' \
-  && has "$COMPLIANCE_BODY" 'html_escape\(description\)'; then
+COMPLIANCE_FLAT=$(flat "$COMPLIANCE_BODY")
+if has "$COMPLIANCE_FLAT" 'color, rtSecurityHTMLEscape\(f\.A\), rtSecurityHTMLEscape\(f\.B\), rtSecurityHTMLEscape\(f\.C\), remediation\)'; then
   ok "B2 severity/title/description are escaped before interpolation"
 else
   bad "B2 one of severity/title/description is no longer escaped — regressed"
 fi
 
-if has "$COMPLIANCE_BODY" 'remediation\.as_deref\(\)\.map\(html_escape\)'; then
-  ok "B3 remediation is escaped via its Option map, not interpolated raw"
+if has "$COMPLIANCE_BODY" 'remediation = rtSecurityHTMLEscape\(\*f\.E\)'; then
+  ok "B3 remediation is escaped when present, not interpolated raw"
 else
   bad "B3 remediation is no longer escaped"
 fi
 
-# Negative control: the OLD unescaped format! shape (bare {severity}/{title}/
-# {description} placeholders with no escape call) must be gone.
-if lacks "$COMPLIANCE_BODY" '"<tr><td[^"]*\{severity\}'; then
-  ok "B4 (control) the old raw {severity}-in-format! shape is gone"
+# Negative control: no scan-derived field reaches the HTML unescaped — every
+# use of title/description/remediation goes through the escaper.
+if [ -n "$COMPLIANCE_BODY" ] \
+  && [ "$(count "$COMPLIANCE_BODY" 'f\.B')" = "$(count "$COMPLIANCE_BODY" 'rtSecurityHTMLEscape\(f\.B\)')" ] \
+  && [ "$(count "$COMPLIANCE_BODY" 'f\.C')" = "$(count "$COMPLIANCE_BODY" 'rtSecurityHTMLEscape\(f\.C\)')" ] \
+  && [ "$(count "$COMPLIANCE_BODY" 'f\.E\b')" = "$(( $(count "$COMPLIANCE_BODY" 'rtSecurityHTMLEscape\(\*f\.E\)') + $(count "$COMPLIANCE_BODY" 'f\.E != nil') ))" ] \
+  && lacks "$COMPLIANCE_BODY" 'f\.D'; then
+  ok "B4 (control) no raw title/description/remediation/file_path is interpolated anywhere in the report"
 else
-  bad "B4 (control) findings_html still interpolates a raw {severity} placeholder"
+  bad "B4 (control) a scan-derived field reaches the report HTML without rtSecurityHTMLEscape"
 fi
 
-# ── §C databases.rs: read/manage handlers admin-widened to match create() ─
-echo "── §C databases.rs: list/credentials/remove/get_db_info/pitr_config admin-widened ──"
+# ── §C rt_databases.go: read/manage handlers admin-widened to match create ─
+echo "── §C rt_databases.go: list/credentials/remove/getDbInfo/pitrConfig admin-widened ──"
 
-for pair in "DB_LIST_BODY:C1:list" "DB_CREDENTIALS_BODY:C2:credentials" "DB_REMOVE_BODY:C3:remove" "DB_GET_INFO_BODY:C4:get_db_info"; do
+ADMIN_WIDEN_RE="u\.role = 'admin'.*sv\.is_local OR sv\.user_id = u\.id"
+SHARED_PRED=$(flat "$(awk '/^const rtDatabasesCallerPredicate = /{f=1} f{print} f && !/\+ *$/{exit}' <<< "$DATABASES_C")")
+widened() { has "$(flat "$1")" "$ADMIN_WIDEN_RE" \
+  || { has "$1" '"WHERE "\+rtDatabasesCallerPredicate' && has "$SHARED_PRED" "$ADMIN_WIDEN_RE"; }; }
+for pair in "DB_LIST_BODY:C1:rtDatabasesList" "DB_CREDENTIALS_BODY:C2:rtDatabasesCredentials" "DB_REMOVE_BODY:C3:rtDatabasesRemove" "DB_GET_INFO_BODY:C4:rtDatabasesGetDbInfo"; do
   var="${pair%%:*}"; rest="${pair#*:}"; id="${rest%%:*}"; name="${rest#*:}"
   body="${!var}"
-  if has "$body" "u\.role = 'admin'" && has "$body" 'sv\.is_local OR sv\.user_id = u\.id'; then
+  if [ -n "$body" ] && widened "$body"; then
     ok "$id $name() carries the admin-widening EXISTS clause"
   else
     bad "$id $name() is missing the admin-widening EXISTS clause — creator/reader mismatch regressed"
   fi
 done
 
-if has "$DB_PITR_CONFIG_BODY" "u\.role = 'admin'" && has "$DB_PITR_CONFIG_BODY" 'sv\.is_local OR sv\.user_id = u\.id'; then
-  ok "C5 pitr_config's inline ownership check carries the same admin-widening"
+if has "$(flat "$DB_PITR_CONFIG_BODY")" "$ADMIN_WIDEN_RE"; then
+  ok "C5 rtDatabasesPitrConfig's inline ownership check carries the same admin-widening"
 else
-  bad "C5 pitr_config's inline check is missing the admin-widening"
+  bad "C5 rtDatabasesPitrConfig's inline check is missing the admin-widening"
 fi
 
-# Positive control: create()'s own predicate (the source of truth these were
+# Positive control: create's own predicate (the source of truth these were
 # widened to match) must still be there, unchanged.
-if has "$DATABASES_C" 'SITE_CALLER_PREDICATE'; then
-  ok "C6 (control) create() still uses helpers::SITE_CALLER_PREDICATE"
+if has "$DB_CREATE_BODY" 'rtDatabasesResolveOwner\(' && has "$DB_RESOLVE_OWNER_BODY" 'SiteCallerPredicate'; then
+  ok "C6 (control) create still authorizes through SiteCallerPredicate (rtDatabasesResolveOwner)"
 else
-  bad "C6 (control) create()'s own predicate regressed"
+  bad "C6 (control) create's own predicate regressed"
 fi
 
-# ── §D panel_update.rs: build_fleet_plan sees the whole fleet for admins ──
-echo "── §D panel_update.rs: build_fleet_plan admin-widened, mirroring servers.rs/dashboard.rs ──"
+# ── §D svc_panel_update.go: fleet plan sees the whole fleet for admins ──
+echo "── §D svc_panel_update.go: PanelUpdateBuildFleetPlan admin-widened, mirroring servers/dashboard ──"
 
-if has "$BUILD_FLEET_PLAN_BODY" 'is_admin: bool'; then
-  ok "D1 build_fleet_plan takes an is_admin parameter"
+if has "$BUILD_FLEET_PLAN_BODY" '^func PanelUpdateBuildFleetPlan\([^)]*isAdmin bool'; then
+  ok "D1 PanelUpdateBuildFleetPlan takes an isAdmin parameter"
 else
-  bad "D1 build_fleet_plan has no is_admin parameter — still owner-only"
+  bad "D1 PanelUpdateBuildFleetPlan has no isAdmin parameter — still owner-only"
 fi
 
-if has "$BUILD_FLEET_PLAN_BODY" '\(\$2 OR user_id = \$1\)'; then
-  ok "D2 the fleet-plan query widens to (\$2 OR user_id = \$1)"
+if has "$BUILD_FLEET_PLAN_BODY" '\(\$2 OR user_id = \$1\)' && has "$BUILD_FLEET_PLAN_BODY" 'userID, isAdmin\)'; then
+  ok "D2 the fleet-plan query widens to (\$2 OR user_id = \$1) with \$2 = isAdmin"
 else
   bad "D2 the fleet-plan query still hard-scopes to a single admin's own servers"
 fi
 
-if has "$APPLY_FLEET_BODY" 'build_fleet_plan\(&state\.db, claims\.sub, claims\.role == "admin"'; then
-  ok "D3 apply_fleet passes the caller's admin status through to build_fleet_plan"
+if has "$APPLY_FLEET_BODY" 'PanelUpdateBuildFleetPlan\(r\.Context\(\), st\.DB, c\.Sub, c\.Role == "admin"'; then
+  ok "D3 rtUpdateApplyFleet passes the caller's admin status through to PanelUpdateBuildFleetPlan"
 else
-  bad "D3 apply_fleet no longer threads admin status into build_fleet_plan"
+  bad "D3 rtUpdateApplyFleet no longer threads admin status into PanelUpdateBuildFleetPlan"
 fi
 
-# ── §E update.rs: apply_fleet's include_panel path enforces direction ───
-echo "── §E update.rs: apply_fleet(include_panel) reuses reject_apply_target ──"
+# ── §E rt_update.go: apply-fleet's include_panel path enforces direction ─
+echo "── §E rt_update.go: rtUpdateApplyFleet(include_panel) reuses rtUpdateRejectApplyTarget ──"
 
-if has "$APPLY_FLEET_BODY" 'if body\.include_panel' && has "$APPLY_FLEET_BODY" 'reject_apply_target'; then
-  ok "E1 apply_fleet calls reject_apply_target when include_panel is set"
+if has "$APPLY_FLEET_BODY" 'if body\.IncludePanel \{' && has "$APPLY_FLEET_BODY" 'rtUpdateRejectApplyTarget\('; then
+  ok "E1 rtUpdateApplyFleet calls rtUpdateRejectApplyTarget when include_panel is set"
 else
-  bad "E1 apply_fleet's include_panel path still skips the direction/advertised-match guard"
+  bad "E1 rtUpdateApplyFleet's include_panel path still skips the direction/advertised-match guard"
 fi
 
-if has "$APPLY_FLEET_BODY" "update_available_version"; then
-  ok "E2 apply_fleet reads the same advertised-version row apply_update checks"
+if has "$APPLY_FLEET_BODY" '"update_available_version"'; then
+  ok "E2 rtUpdateApplyFleet reads the same advertised-version row apply checks"
 else
-  bad "E2 apply_fleet does not consult the advertised-version row"
+  bad "E2 rtUpdateApplyFleet does not consult the advertised-version row"
 fi
 
-# Positive control: apply_update's own guard (the logic being reused) is
-# unchanged.
-if has "$UPDATE_C" 'fn reject_apply_target'; then
-  ok "E3 (control) reject_apply_target itself is still defined and exported to apply_fleet"
+# Positive control: apply's own guard (the logic being reused) is unchanged.
+if has "$UPDATE_C" '^func rtUpdateRejectApplyTarget\('; then
+  ok "E3 (control) rtUpdateRejectApplyTarget itself is still defined and reused by apply-fleet"
 else
-  bad "E3 (control) reject_apply_target regressed"
+  bad "E3 (control) rtUpdateRejectApplyTarget regressed"
 fi
 
-# ── §F panel_update.rs: start_panel_update reserves InFlight atomically ──
-echo "── §F panel_update.rs: start_panel_update closes the create_snapshot TOCTOU ──"
+# ── §F svc_panel_update.go: StartPanelUpdate reserves InFlight atomically ─
+echo "── §F svc_panel_update.go: PanelUpdateStartPanelUpdate closes the create_snapshot TOCTOU ──"
 
-if has "$START_UPDATE_BODY" 'let mut s = handle\.write\(\)\.await;' ; then
-  ok "F1 the concurrent-apply guard now acquires a MUTABLE write lock up front (not read-then-later-write)"
+# The guard block: from the first h.mu.Lock() to the function-level
+# h.mu.Unlock() that follows the reservation (the early-return Unlock is
+# indented inside the if, so it doesn't end the block).
+GUARD_BLOCK=$(awk '/h\.mu\.Lock\(\)/{f=1} f{print} f && /^\th\.mu\.Unlock\(\)/{exit}' <<< "$START_UPDATE_BODY")
+LOCK_LN=$(lineof "$START_UPDATE_BODY" 'h\.mu\.Lock\(\)')
+SNAP_LN=$(lineof "$START_UPDATE_BODY" 'PanelSnapshotCreateSnapshot\(')
+if [ "$LOCK_LN" -gt 0 ] && [ "$SNAP_LN" -gt 0 ] && [ "$LOCK_LN" -lt "$SNAP_LN" ]; then
+  ok "F1 the concurrent-apply guard takes the state lock up front, before the create_snapshot pipeline"
 else
-  bad "F1 start_panel_update's guard no longer opens with a mutable write lock — TOCTOU reopened"
+  bad "F1 PanelUpdateStartPanelUpdate no longer locks the state before create_snapshot — TOCTOU reopened"
 fi
 
-# The write-lock acquisition and the InFlight reservation must be the SAME
-# statement block — grep the guard block specifically (from the write-lock
-# open to its matching close) rather than the whole function, so a write
-# lock added elsewhere in the body for an unrelated reason can't fake this.
-GUARD_BLOCK=$(awk '/let mut s = handle\.write\(\)\.await;/{f=1} f{print; if (/^    \}/) exit}' <<< "$START_UPDATE_BODY")
-if has "$GUARD_BLOCK" 'AlreadyInFlight' && has "$GUARD_BLOCK" 'UpdateState::InFlight \{'; then
-  ok "F2 the guard checks AND reserves InFlight inside the same write-lock hold"
+if has "$GUARD_BLOCK" 'PanelUpdateErrAlreadyInFlight' && has "$GUARD_BLOCK" 'h\.s = PanelUpdateUpdateState\{Kind: "in_flight"'; then
+  ok "F2 the guard checks AND reserves InFlight inside the same lock hold"
 else
-  bad "F2 the reservation is not inside the same write-lock block as the check — race window reopened"
+  bad "F2 the reservation is not inside the same lock hold as the check — race window reopened"
 fi
 
-if has "$START_UPDATE_BODY" 'UpdateState::Idle' && has "$START_UPDATE_BODY" 'Err\(e\) =>' ; then
+SNAP_FAIL=$(awk '/PanelSnapshotCreateSnapshot\(/{f=1} f{print} f && /PanelUpdateErrSnapshot/{exit}' <<< "$START_UPDATE_BODY")
+if has "$SNAP_FAIL" 'if err != nil \{' && has "$SNAP_FAIL" 'h\.set\(panelUpdateIdle\(\)\)'; then
   ok "F3 a failed snapshot releases the reservation back to Idle"
 else
   bad "F3 no release-on-snapshot-failure path found — a failed attempt could permanently lock the guard"
 fi
 
-# ── §G panel_update.rs: rollback_to_snapshot gets an in-flight guard ────
-echo "── §G panel_update.rs: rollback_to_snapshot no longer races a concurrent apply ──"
+# ── §G svc_panel_update.go: rollback gets an in-flight guard ────────────
+echo "── §G svc_panel_update.go: PanelUpdateRollbackToSnapshot no longer races a concurrent apply ──"
 
-if has "$ROLLBACK_BODY" 'handle: UpdateStateHandle'; then
-  ok "G1 rollback_to_snapshot now takes the UpdateStateHandle"
+if has "$ROLLBACK_BODY" '^func PanelUpdateRollbackToSnapshot\([^)]*h \*PanelUpdateStateHandle'; then
+  ok "G1 PanelUpdateRollbackToSnapshot takes the PanelUpdateStateHandle"
 else
-  bad "G1 rollback_to_snapshot has no handle parameter — still unguarded"
+  bad "G1 PanelUpdateRollbackToSnapshot has no handle parameter — still unguarded"
 fi
 
-if has "$ROLLBACK_BODY" 'AlreadyInFlight' && has "$ROLLBACK_BODY" 'UpdateState::InFlight \{'; then
-  ok "G2 rollback_to_snapshot checks and reserves InFlight before calling spawn_restore"
+RB_GUARD=$(lineof "$ROLLBACK_BODY" 'h\.s = PanelUpdateUpdateState\{Kind: "in_flight"')
+RB_SPAWN=$(lineof "$ROLLBACK_BODY" 'PanelSnapshotSpawnRestore\(')
+if has "$ROLLBACK_BODY" 'PanelUpdateErrAlreadyInFlight' && [ "$RB_GUARD" -gt 0 ] && [ "$RB_SPAWN" -gt 0 ] && [ "$RB_GUARD" -lt "$RB_SPAWN" ]; then
+  ok "G2 PanelUpdateRollbackToSnapshot checks and reserves InFlight before calling PanelSnapshotSpawnRestore"
 else
-  bad "G2 rollback_to_snapshot no longer reserves InFlight — race reopened"
+  bad "G2 PanelUpdateRollbackToSnapshot no longer reserves InFlight before the restore — race reopened"
 fi
 
-if has "$UPDATE_C" 'rollback_to_snapshot\(state\.panel_update_state\.clone\(\), state\.db\.clone\(\)'; then
-  ok "G3 the rollback route threads the handle through to rollback_to_snapshot"
+if has "$ROLLBACK_ROUTE_BODY" 'PanelUpdateRollbackToSnapshot\([^,]*, PanelUpdateState, st\.DB,'; then
+  ok "G3 the rollback route threads the shared state handle through to PanelUpdateRollbackToSnapshot"
 else
-  bad "G3 the rollback route call site was not updated — likely a compile error, or the guard is dead"
+  bad "G3 the rollback route does not pass the shared PanelUpdateState handle — the guard is dead"
 fi
 
 echo
