@@ -27,6 +27,11 @@
 #   §B  the agent takes the scope AND the log type FROM the ticket, not the params
 #   §C  the two ends agree on the system marker
 #
+# Subjects are the Go ports: panel/go/internal/api/rt_logs.go (rtLogsStreamToken,
+# the mint) and panel/go/internal/agent/routes/logs.go (logsStreamHandler +
+# logsResolveStreamType, the agent). The agent's type-resolution behaviour is a
+# pure function in Go, so its refusal arms are Go unit tests now.
+#
 # Pure source analysis: no box, no network, no build.
 #
 # NO PIPES INTO `grep -q` (SIGPIPE + pipefail = flaky red). Every arm feeds grep a
@@ -39,8 +44,8 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-BE=panel/backend/src/routes/logs.rs
-AG=panel/agent/src/routes/logs.rs
+BE=panel/go/internal/api/rt_logs.go
+AG=panel/go/internal/agent/routes/logs.go
 
 for f in "$BE" "$AG"; do [ -f "$f" ] || bad "MISSING SUBJECT FILE: $f"; done
 
@@ -71,41 +76,38 @@ AG_S=$(subj "$AG" || true)
 
 echo "§A  the panel binds the scope INTO the signed ticket"
 
-# A1 — the signed struct carries a scope field. The struct is what gets HS256'd.
-if [ -z "$BE_S" ]; then
-  bad "A1 SKIPPED: $BE did not yield source"
+MINT=$(fn_body '^func rtLogsStreamToken[(]' "$BE_S")
+MINT_FLAT=$(tr '\n' ' ' <<< "$MINT" | tr -s ' \t' ' ')
+
+# A1 — the signed claims carry a scope. The Go mint signs a jwt.MapClaims
+# literal (no struct), so the scope must be a key IN that HS256'd literal.
+if [ -z "$MINT" ]; then
+  bad "A1 SKIPPED: could not bound rtLogsStreamToken in $BE"
+elif has "$MINT_FLAT" 'jwt\.NewWithClaims\(jwt\.SigningMethodHS256, jwt\.MapClaims\{[^}]*"scope": *scope,[^}]*\}\)'; then
+  ok "A1 the signed stream ticket carries a scope"
 else
-  TICKET=$(fn_body 'struct StreamTicket' "$BE_S")
-  if [ -n "$TICKET" ] && has "$TICKET" 'scope: String'; then
-    ok "A1 the signed StreamTicket carries a scope"
-  else
-    bad "A1 the signed ticket has no scope field — the log decision is not in the signature"
-  fi
+  bad "A1 the signed ticket has no scope field — the log decision is not in the signature"
 fi
 
 # A2 — and it is set from the ownership-resolved domain, `@system` the only
 # fallback (which the mint reaches only after the admin check for a site-less
 # request). Keyed on the whole derivation, not the field name.
-if [ -z "$BE_S" ]; then
-  bad "A2 SKIPPED: $BE did not yield source"
+if [ -z "$MINT" ]; then
+  bad "A2 SKIPPED: could not bound rtLogsStreamToken in $BE"
+elif has "$MINT_FLAT" 'scope := "@system" if domain != nil \{ scope = \*domain \}' \
+  && has "$MINT_FLAT" 'domain, err = queryScalarOpt\[string\]\(r\.Context\(\), st\.DB, "SELECT s\.domain FROM sites s WHERE "\+SiteCallerPredicate, siteID, c\.Sub\)'; then
+  ok "A2 the scope is set from the ownership-resolved domain, @system as the only fallback"
 else
-  MINT=$(fn_body 'pub async fn stream_token' "$BE_S")
-  MINT_FLAT=$(tr '\n' ' ' <<< "$MINT" | tr -s ' ')
-  if [ -n "$MINT" ] \
-    && has "$MINT_FLAT" 'let scope = domain\.clone\(\)\.unwrap_or_else\(\|\| "@system"'; then
-    ok "A2 the scope is set from the ownership-resolved domain, @system as the only fallback"
-  else
-    bad "A2 the ticket scope is not derived from the resolved domain — an attacker-supplied value could reach it"
-  fi
+  bad "A2 the ticket scope is not derived from the resolved domain — an attacker-supplied value could reach it"
 fi
 
 # A3 — the ownership check still gates the site branch, AND the admin check still
 # gates the site-less (system) request. The scope is only as good as these.
-if [ -z "$BE_S" ]; then
-  bad "A3 SKIPPED: $BE did not yield source"
-elif has "$BE_S" 'SITE_CALLER_PREDICATE' \
-  && has "$BE_S" 'Site not found' \
-  && has "$BE_S" 'Admin access required for system log streaming'; then
+if [ -z "$MINT" ]; then
+  bad "A3 SKIPPED: could not bound rtLogsStreamToken in $BE"
+elif has "$MINT" 'SiteCallerPredicate' \
+  && has "$MINT" 'Site not found' \
+  && has "$MINT" 'Admin access required for system log streaming'; then
   ok "A3 the site domain is resolved under the ownership predicate and system streaming still needs admin"
 else
   bad "A3 the ownership/admin resolution behind the scope is gone — the signed scope would certify nothing"
@@ -113,71 +115,51 @@ fi
 
 echo "§B  the agent takes the scope AND the log type FROM the ticket, not the params"
 
-# B1 — the agent's decode struct carries the scope, so the value it acts on is
+# B1 — the agent's decoded ticket carries the scope, so the value it acts on is
 # the signed one.
-if [ -z "$AG_S" ]; then
-  bad "B1 SKIPPED: $AG did not yield source"
+ATICKET=$(fn_body '^type logsStreamTicket struct' "$AG_S")
+AVALID=$(fn_body '^func logsValidateTicket[(]' "$AG_S")
+if [ -n "$ATICKET" ] && has "$ATICKET" 'Scope +\*string' \
+  && has "$AVALID" 'claims\["scope"\]' && has "$AVALID" 't\.Scope = &s'; then
+  ok "B1 the agent decodes the ticket's scope"
 else
-  ATICKET=$(fn_body 'struct StreamTicket' "$AG_S")
-  if [ -n "$ATICKET" ] && has "$ATICKET" 'scope: Option<String>'; then
-    ok "B1 the agent decodes the ticket's scope"
-  else
-    bad "B1 the agent does not read a scope off the ticket — it can only be trusting the query params"
-  fi
+  bad "B1 the agent does not read a scope off the ticket — it can only be trusting the query params"
 fi
 
-# B2 — THE ARM THAT MATTERS. The log_type is chosen by matching on the TICKET
-# scope, reached before any q.domain read. A regression that binds from q.domain
-# up front is the defect.
-if [ -z "$AG_S" ]; then
-  bad "B2 SKIPPED: $AG did not yield source"
+# B2 — THE ARM THAT MATTERS. The log_type the handler opens is the one
+# logsResolveStreamType derives from the VALIDATED TICKET, and nothing else
+# reaches LogsResolveLogPath. (Which type each scope yields is behaviour:
+# TestLogsResolveStreamType pins it, including a site ticket + ?domain=other.)
+WS=$(fn_body '^func logsStreamHandler[(]' "$AG_S")
+if [ -z "$WS" ]; then
+  bad "B2 SKIPPED: could not bound logsStreamHandler"
+elif has "$WS" 'logType, ok := logsResolveStreamType\(ticket, requested, domain\)' \
+  && before "$WS" 'logsValidateTicket\(' 'logsResolveStreamType\(' \
+  && before "$WS" 'logsResolveStreamType\(' 'services\.LogsResolveLogPath\(logType\)' \
+  && [ "$(count "$WS" 'LogsResolveLogPath\(')" = "1" ]; then
+  ok "B2 the log is chosen from the signed scope; the query param is not read up front"
 else
-  WS=$(fn_body 'async fn stream_handler' "$AG_S")
-  if [ -z "$WS" ]; then
-    bad "B2 SKIPPED: could not bound stream_handler"
-  elif has "$WS" 'let log_type = match claims\.scope' \
-    && before "$WS" 'match claims\.scope' 'q\.domain'; then
-    ok "B2 the log is chosen from the signed scope; the query param is not read up front"
-  else
-    bad "B2 the log is bound from the query param, not the ticket scope — the escalation is restored"
-  fi
+  bad "B2 the log is bound from the query param, not the ticket scope — the escalation is restored"
 fi
 
-# B3 — a SITE scope may stream only that site's own log types. The refusal of a
-# system type is the arm that stops `type=auth`. The pass-through `other =>
-# other.to_string()` must NOT live in the site branch — it is legacy-only.
-if [ -z "$AG_S" ]; then
-  bad "B3 SKIPPED: $AG did not yield source"
-else
-  WS=$(fn_body 'async fn stream_handler' "$AG_S")
-  N=$(count "$WS" 'other => other\.to_string\(\)')
-  if [ -n "$WS" ] \
-    && has "$WS" 'Log type not permitted for a site-scoped stream' \
-    && has "$WS" 'Some\(domain\) =>' \
-    && [ "$N" = "1" ]; then
-    ok "B3 a site scope maps only its own log types and refuses a system type (one legacy pass-through only)"
-  else
-    bad "B3 a site scope can pass an arbitrary type through (${N} pass-throughs) — type=auth reaches the host logs"
-  fi
-fi
+# B3 retired: covered by TestLogsResolveStreamType + TestLogsStreamHandlerRejects (panel/go/internal/agent/routes/logs_test.go) — a site scope refuses type=auth / non-site types with 403
 
 # B4 — the system logs are reachable ONLY through the signed @system sentinel,
 # and the legacy param fallback is confined to the no-scope branch AND logged.
-if [ -z "$AG_S" ]; then
-  bad "B4 SKIPPED: $AG did not yield source"
+# Source-level: the browser's `domain` is referenced only above the point where
+# the signed scope takes over, inside the `t.Scope == nil` block that warns.
+RS=$(fn_body '^func logsResolveStreamType[(]' "$AG_S")
+RS_LEGACY="${RS%%scope := \*t.Scope*}"
+RS_SIGNED="${RS#*scope := \*t.Scope}"
+if [ -n "$RS" ] && [ "$RS_LEGACY" != "$RS" ] \
+  && has "$RS_LEGACY" 'if t\.Scope == nil \{' \
+  && has "$RS_LEGACY" 'slog\.Warn' \
+  && has "$RS_LEGACY" '\*domain' \
+  && has "$RS_SIGNED" 'if scope == "@system" \{' \
+  && ! has "$RS_SIGNED" '\bdomain\b'; then
+  ok "B4 host logs need the signed @system marker; the param fallback is legacy-only and logged"
 else
-  WS=$(fn_body 'async fn stream_handler' "$AG_S")
-  ND=$(count "$WS" 'q\.domain\.as_deref\(\)')
-  if [ -n "$WS" ] \
-    && has "$WS" 'Some\("@system"\) =>' \
-    && has "$WS" 'None =>' \
-    && before "$WS" 'None =>' 'q\.domain\.as_deref\(\)' \
-    && [ "$ND" = "1" ] \
-    && has "$WS" 'tracing::warn'; then
-    ok "B4 host logs need the signed @system marker; the param fallback is legacy-only and logged"
-  else
-    bad "B4 the param is read outside the legacy branch (${ND} reads) or an unscoped stream is silent"
-  fi
+  bad "B4 the ?domain= param is read outside the legacy (nil-scope) branch, or an unscoped stream is silent"
 fi
 
 echo "§C  the two ends agree on the system marker"
@@ -191,7 +173,7 @@ else
 fi
 
 # C2 — the marker is not a legal domain, so no site can claim it. The agent's own
-# validate_domain rejects '@'.
+# domain validation rejects '@'.
 if [[ "@system" == *@* ]]; then
   ok "C2 the system marker (@system) is not a valid domain, so no site can claim it"
 else
@@ -200,10 +182,10 @@ fi
 
 # C3 — a site-scoped stream still reaches its OWN logs (guards a fix that carries
 # the scope but forgets to serve the site): the site branch still builds
-# nginx_access:{domain} and the handler still resolves through resolve_log_path.
+# "nginx_access:" + scope and the handler still resolves through LogsResolveLogPath.
 if [ -z "$AG_S" ]; then
   bad "C3 SKIPPED: $AG did not yield source"
-elif has "$AG_S" 'nginx_access:\{domain\}' && has "$AG_S" 'resolve_log_path'; then
+elif has "$RS_SIGNED" '"nginx_access:" \+ scope' && has "$AG_S" 'services\.LogsResolveLogPath\('; then
   ok "C3 a site-scoped stream still serves that site's own logs"
 else
   bad "C3 the site-scoped stream no longer serves the site's own logs"

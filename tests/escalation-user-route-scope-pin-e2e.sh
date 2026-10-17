@@ -5,7 +5,8 @@
 # user the policy's owner is allowed to page — themselves, or a user they
 # directly manage — never an arbitrary third party.
 #
-# `panel/backend/src/routes/escalation_policies.rs`'s `validate_route` only
+# `panel/go/internal/api/rt_escalation_policies.go`'s `rtEscalationPoliciesValidateRoute`
+# (ported from the Rust `validate_route`) only
 # parsed `user:<uuid>` as a UUID shape check. Its sibling shape,
 # `on_call_schedule:<uuid>`, got an ownership check at s437
 # (`validate_schedule_routes`) after the identical class of bug was found for
@@ -19,8 +20,11 @@
 # email/Slack/Discord/PagerDuty/webhook with no consent and no way for them
 # to trace who set it up.
 #
-# Fix: `validate_user_routes`, called from both `create_policy` and
-# `update_policy` right alongside `validate_schedule_routes`. A `user:`
+# Fix: `validate_user_routes` (Go: `rtEscalationPoliciesValidateUserRoutes`),
+# called from both `create_policy` and `update_policy` right alongside
+# `validate_schedule_routes`. In Go both handlers route through
+# `rtEscalationPoliciesValidateAll`, which runs the schedule check then the
+# user check. A `user:`
 # target must be the caller themselves OR a user whose `reseller_id` is the
 # caller (the same ownership shape `sites.rs`/`databases.rs`/
 # `reseller_dashboard.rs` already use for "which users does this admin
@@ -28,7 +32,7 @@
 #
 # §A validate_user_routes exists and checks the right table/predicate.
 # §B self-routes (paging yourself) need no DB check.
-# §C both create_policy and update_policy call it.
+# §C both create_policy and update_policy call it (via ValidateAll in Go).
 # §D position: it runs BEFORE the row is written, alongside
 #    validate_schedule_routes (not instead of it).
 # §E the "does not exist" non-disclosure convention is preserved (never
@@ -61,7 +65,7 @@ has()  { grep -qE -- "$2" <<< "$1"; }
 
 fnbody() {
   awk -v fn="$2" '
-    index($0, "fn " fn "(") && !started { started=1 }
+    !started && (index($0, "func " fn "(") || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) { started=1 }
     started {
       n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
       if (opened || n>0) opened=1
@@ -88,11 +92,14 @@ before() {
   [ "$o1" != -1 ] && [ "$o2" != -1 ] && [ "$o1" -lt "$o2" ]
 }
 
-EP=panel/backend/src/routes/escalation_policies.rs
+EP=panel/go/internal/api/rt_escalation_policies.go
+[ -f "$EP" ] || { echo "missing $EP"; exit 1; }
 EP_C=$(code "$EP")
-VALIDATE_USER_BODY=$(fnbody "$EP_C" "validate_user_routes")
-CREATE_BODY=$(fnbody "$EP_C" "create_policy")
-UPDATE_BODY=$(fnbody "$EP_C" "update_policy")
+VALIDATE_USER_BODY=$(fnbody "$EP_C" "rtEscalationPoliciesValidateUserRoutes")
+VALIDATE_ALL_BODY=$(fnbody "$EP_C" "rtEscalationPoliciesValidateAll")
+CREATE_BODY=$(fnbody "$EP_C" "rtEscalationPoliciesCreatePolicy")
+UPDATE_BODY=$(fnbody "$EP_C" "rtEscalationPoliciesUpdatePolicy")
+VALIDATE_ALL_CALL='rtEscalationPoliciesValidateAll(r.Context(), st.DB, &input, claims.Sub)'
 
 # ── §A validate_user_routes exists and checks the right ownership predicate ──
 echo "── §A validate_user_routes exists, scoped by reseller_id ──"
@@ -103,7 +110,7 @@ else
   bad "A1 validate_user_routes is missing — every arm below measures nothing"
 fi
 
-if has "$VALIDATE_USER_BODY" 'strip_prefix\("user:"\)'; then
+if has "$VALIDATE_USER_BODY" 'strings\.CutPrefix\(step\.Route, "user:"\)'; then
   ok "A2 it inspects user: steps specifically"
 else
   bad "A2 it doesn't scan for the user: route shape"
@@ -115,64 +122,70 @@ else
   bad "A3 the ownership predicate is missing or uses a different (unverified) shape"
 fi
 
-if has "$VALIDATE_USER_BODY" '\.bind\(target_id\)' && has "$VALIDATE_USER_BODY" '\.bind\(owner_id\)'; then
+if has "$VALIDATE_USER_BODY" 'reseller_id = \$2", targetID, ownerID\)'; then
   ok "A4 the query binds the target and the caller, not some other pair"
 else
-  bad "A4 the query's bound parameters don't match target_id/owner_id"
+  bad "A4 the query's bound parameters don't match targetID/ownerID"
 fi
 
 # ── §B self-routes need no DB round trip ──────────────────────────────────
 echo "── §B paging yourself doesn't need an ownership check ──"
 
-if has "$VALIDATE_USER_BODY" 'target_id == owner_id'; then
+if has "$VALIDATE_USER_BODY" 'targetID == ownerID'; then
   ok "B1 a self-route is special-cased"
 else
   bad "B1 no self-route special case — an admin might not even be able to page themselves"
 fi
 
-if before "$VALIDATE_USER_BODY" "target_id == owner_id" "sqlx::query_as"; then
+if before "$VALIDATE_USER_BODY" "targetID == ownerID" "queryScalarOpt"; then
   ok "B2 the self-check happens BEFORE the DB round trip (short-circuits it)"
 else
   bad "B2 the self-check is positioned after the DB query — dead code or wrong order"
 fi
 
 # ── §C both write paths call it ───────────────────────────────────────────
-echo "── §C create_policy and update_policy both call validate_user_routes ──"
+echo "── §C create_policy and update_policy both call validate_user_routes (via ValidateAll) ──"
 
-if has "$CREATE_BODY" 'validate_user_routes\(&state\.db, &input, claims\.sub\)'; then
-  ok "C1 create_policy calls validate_user_routes(&state.db, &input, claims.sub)"
+if has "$VALIDATE_ALL_BODY" 'rtEscalationPoliciesValidateUserRoutes\(ctx, db, input, ownerID\)'; then
+  ok "C0 rtEscalationPoliciesValidateAll calls ValidateUserRoutes(ctx, db, input, ownerID)"
 else
-  bad "C1 create_policy does not call validate_user_routes with the right arguments"
+  bad "C0 rtEscalationPoliciesValidateAll does not call ValidateUserRoutes with the caller as owner"
 fi
 
-if has "$UPDATE_BODY" 'validate_user_routes\(&state\.db, &input, claims\.sub\)'; then
-  ok "C2 update_policy calls validate_user_routes(&state.db, &input, claims.sub)"
+if grep -qF -- "$VALIDATE_ALL_CALL" <<< "$CREATE_BODY"; then
+  ok "C1 create_policy calls ValidateAll(r.Context(), st.DB, &input, claims.Sub)"
 else
-  bad "C2 update_policy does not call validate_user_routes with the right arguments"
+  bad "C1 create_policy does not call ValidateAll (→ validate_user_routes) with the right arguments"
+fi
+
+if grep -qF -- "$VALIDATE_ALL_CALL" <<< "$UPDATE_BODY"; then
+  ok "C2 update_policy calls ValidateAll(r.Context(), st.DB, &input, claims.Sub)"
+else
+  bad "C2 update_policy does not call ValidateAll (→ validate_user_routes) with the right arguments"
 fi
 
 # ── §D position: validated before the write, alongside the schedule check ──
 echo "── §D validation runs before the row is written, not instead of the schedule check ──"
 
-if before "$CREATE_BODY" "validate_schedule_routes" "validate_user_routes"; then
-  ok "D1 create_policy still calls validate_schedule_routes (not replaced)"
+if before "$VALIDATE_ALL_BODY" "rtEscalationPoliciesValidateScheduleRoutes(" "rtEscalationPoliciesValidateUserRoutes("; then
+  ok "D1 ValidateAll (create_policy's path) still calls validate_schedule_routes (not replaced)"
 else
-  bad "D1 create_policy no longer calls validate_schedule_routes before validate_user_routes — the schedule fix may have been dropped"
+  bad "D1 ValidateAll no longer calls validate_schedule_routes before validate_user_routes — the schedule fix may have been dropped"
 fi
 
-if before "$CREATE_BODY" "validate_user_routes" "INSERT INTO escalation_policies"; then
+if before "$CREATE_BODY" "$VALIDATE_ALL_CALL" "INSERT INTO escalation_policies"; then
   ok "D2 create_policy validates before the INSERT"
 else
   bad "D2 create_policy's validation runs after (or the INSERT doesn't wait for it) — position wrong"
 fi
 
-if before "$UPDATE_BODY" "validate_schedule_routes" "validate_user_routes"; then
-  ok "D3 update_policy still calls validate_schedule_routes (not replaced)"
+if grep -qF -- "$VALIDATE_ALL_CALL" <<< "$UPDATE_BODY" && before "$VALIDATE_ALL_BODY" "rtEscalationPoliciesValidateScheduleRoutes(" "rtEscalationPoliciesValidateUserRoutes("; then
+  ok "D3 update_policy's path still calls validate_schedule_routes (not replaced)"
 else
   bad "D3 update_policy no longer calls validate_schedule_routes before validate_user_routes"
 fi
 
-if before "$UPDATE_BODY" "validate_user_routes" "UPDATE escalation_policies"; then
+if before "$UPDATE_BODY" "$VALIDATE_ALL_CALL" "UPDATE escalation_policies"; then
   ok "D4 update_policy validates before the UPDATE"
 else
   bad "D4 update_policy's validation runs after (or the UPDATE doesn't wait for it) — position wrong"

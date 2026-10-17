@@ -16,7 +16,7 @@
 #
 # s437 UPDATE: those same two modules (on_call.rs, escalation_policies.rs) were
 # exactly the ones grepped-verified to hold ALL FIVE remaining occurrences each
-# of the undestructured spelling in `panel/backend/src/routes/` — the entire
+# of the undestructured spelling in the Rust routes tree — the entire
 # population. Adding tenant scoping to both required `claims.sub` in every
 # handler, which meant destructuring the extractor everywhere it was bound —
 # so the undestructured spelling is now retired from the codebase, not merely
@@ -49,6 +49,11 @@
 #   §G  Dashboard recommendations resolve their link through the nav registry.
 #   §H  administrator pages refuse BEFORE they fetch.
 #
+# GO PORT: the backend subjects are now panel/go/internal/api/rt_*.go (the Rust
+# routes tree is no longer built). Go has no extractor types: the admin gate is a
+# call, `st.adminUser(r)`, whose claims are either bound to a name or discarded
+# with `_`. §A's census is over THOSE spellings now.
+#
 # Pure source analysis: no box, no network, no build.
 
 set -u
@@ -60,15 +65,17 @@ FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-ROUTES="$REPO/panel/backend/src/routes"
+ROUTES="$REPO/panel/go/internal/api"
 ALERTS="$REPO/panel/frontend/src/pages/Alerts.tsx"
 CERTS="$REPO/panel/frontend/src/pages/Certificates.tsx"
 BACKUPS="$REPO/panel/frontend/src/pages/Backups.tsx"
 TERMINAL="$REPO/panel/frontend/src/pages/Terminal.tsx"
 DASH="$REPO/panel/frontend/src/pages/Dashboard.tsx"
-DESTS="$ROUTES/backup_destinations.rs"
-SCHED="$ROUTES/backup_schedules.rs"
-MODRS="$ROUTES/mod.rs"
+DESTS="$ROUTES/rt_backup_destinations.go"
+SCHED="$ROUTES/rt_backup_schedules.go"
+MODRS="$ROUTES/rt_backup_destinations.go"
+# Route modules only (rt_*.go), never their _test.go fixtures.
+ROUTE_FILES=$(ls "$ROUTES"/rt_*.go | grep -v '_test\.go$')
 
 for f in "$ALERTS" "$CERTS" "$BACKUPS" "$TERMINAL" "$DASH" "$DESTS" "$SCHED" "$MODRS"; do
   [ -f "$f" ] || { echo "FATAL: missing subject $f"; exit 1; }
@@ -77,7 +84,7 @@ done
 
 # Strip comments before measuring. Load-bearing here: every subject is commented
 # with the reason for its gate, and those comments NAME the tokens the arms grep
-# for — `isAdmin`, `AdminUser`, `require_admin`, `selectable`. Grepping raw
+# for — `isAdmin`, `adminUser`, `requireAdmin`, `selectable`. Grepping raw
 # source would match the sentence explaining the check instead of the check
 # ([[feedback_source_pin_prose_trap]]). JSX `{/* ... */}` is handled first and
 # non-greedily because five of the eight subjects are .tsx.
@@ -110,7 +117,7 @@ echo "§0  the stripper actually stripped (a blinded stripper makes every arm be
 
 # Each subject carries a comment naming a token an arm greps for. If the
 # stripper is blinded these go red before any real arm can pass for the wrong
-# reason. Three subjects, three comment styles: JSX braces, // in .tsx, // in .rs.
+# reason. Three subjects, three comment styles: JSX braces, // in .tsx, // in .go.
 # The token must sit entirely on ONE line: these greps are line-based, so a
 # phrase that wraps can never match and the arm is green against every input
 # (lesson #409 — caught here by M19, which found this arm was vacuous).
@@ -126,10 +133,12 @@ else
   ok  "0.2 Dashboard.tsx: comments stripped"
 fi
 
-if has "$DESTS_S" 'cannot be forgotten in a future edit'; then
-  bad "0.3 backup_destinations.rs: comments survived the strip"
+if has "$DESTS_S" 'Reader and writer now interpolate this one string'; then
+  bad "0.3 rt_backup_destinations.go: comments survived the strip"
+elif ! grep -qF 'Reader and writer now interpolate this one string' "$DESTS"; then
+  bad "0.3 rt_backup_destinations.go: the control comment is gone from the raw file — this arm measures nothing, re-anchor it"
 else
-  ok  "0.3 backup_destinations.rs: comments stripped"
+  ok  "0.3 rt_backup_destinations.go: comments stripped"
 fi
 
 # And the inverse: a stripper that deleted CODE would make every ABSENCE arm
@@ -147,69 +156,40 @@ fi
 echo
 echo "§A  the census idiom — the mechanism that hid two of these surfaces for two sessions"
 
-# Two route modules used to bind the admin extractor WITHOUT destructuring it.
-# A search anchored on the open paren returned zero on both, which is why a
-# sweep that used one reported them as carrying no administrator-gated
-# handler at all. s437's tenant-scoping fix needed `claims.sub` in every
-# handler of both files, which meant destructuring the extractor everywhere —
-# grep-verified (s437) that these two files held the ENTIRE population of the
-# undestructured spelling in $ROUTES, so it is now retired codebase-wide, not
-# just from these two files. A1 now pins that retirement directly instead of
-# demonstrating the blind spot it used to require.
-UNNAMED_FILES=$(grep -rlE '^\s*_[a-z_]+: AdminUser,' "$ROUTES" | sort)
-UNNAMED_COUNT=$(grep -rhE '^\s*_[a-z_]+: AdminUser,' "$ROUTES" | wc -l)
-
-if [ "$UNNAMED_COUNT" -eq 0 ]; then
-  ok  "A1 the undestructured spelling is retired codebase-wide (s437) — on_call.rs/escalation_policies.rs were its entire population"
-else
-  bad "A1 the undestructured spelling has reappeared ($UNNAMED_COUNT handler(s) in: $UNNAMED_FILES) — re-verify it stays invisible to a paren-anchored 'AdminUser(' census before trusting one again"
-fi
-
-# The historical control (A2) no longer has a subject to check blindness
-# against now that A1 is 0 — a loop over an empty $UNNAMED_FILES would just
-# print a hollow "ok" either way. If A1 ever goes non-zero again, restore the
-# blindness check that used to live here (git log this file) before trusting
-# any `AdminUser(`-anchored census again.
+# A1 retired (obsolete in Go): it pinned the retirement of the Rust `_x: AdminUser,` extractor binding, which a paren-anchored `AdminUser(` grep could not see. Go has no extractor syntax; both Go spellings (claims bound or `_`-discarded) contain `st.adminUser(r)`, so A3 below classifies them both.
 
 # THE ARM WORTH THE MOST — and it must not be enumerated the way the sweep that
-# missed these two modules was. Detection is spelling-INDEPENDENT (any signature
-# naming the extractor type at all); classification is enumerated. So a fourth
-# idiom is DETECTED even though it is not RECOGNISED, which is exactly the case
-# the paren-anchored sweep got wrong: it could only find what it already knew to
-# look for, so its blind spot was invisible in its own output.
-SIGS=$(awk '/^pub async fn /{c=1} c{print} /^\) ->/{c=0}' $(find "$ROUTES" -name '*.rs') 2>/dev/null)
-UNCLASSIFIED=$(awk '
-  /^pub async fn /   { fn=$4; sub(/\(.*/,"",fn); sig=""; c=1 }
-  c                  { sig = sig $0 "\n" }
-  /^\) ->/           {
-    c=0
-    if (sig ~ /AdminUser/ &&
-        sig !~ /AdminUser\(/ &&
-        sig !~ /_[a-z_]+: AdminUser/) print fn
-  }
-' $(find "$ROUTES" -name '*.rs') 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
+# missed these two modules was. Detection is spelling-INDEPENDENT (any line in a
+# route module naming the admin gate at all); classification is enumerated. So a
+# third idiom is DETECTED even though it is not RECOGNISED, which is exactly the
+# case the paren-anchored sweep got wrong: it could only find what it already
+# knew to look for, so its blind spot was invisible in its own output.
+#   spelling 1:  claims, err := st.adminUser(r)        (claims bound)
+#   spelling 2:  if _, err := st.adminUser(r); err != nil {   (claims discarded)
+SIGS=$(for f in $ROUTE_FILES; do code "$f" | grep -n 'adminUser' | sed "s|^|$(basename "$f"):|"; done)
+UNCLASSIFIED=$(grep -vE ':[[:space:]]*[a-z][A-Za-z0-9]*, err :?= st\.adminUser\(r\)[[:space:]]*$|:[[:space:]]*if _, err := st\.adminUser\(r\); err != nil \{[[:space:]]*$' <<< "$SIGS" | grep . | cut -d: -f1,2 | tr '\n' ' ' | sed 's/ $//')
 
 if [ -z "$UNCLASSIFIED" ]; then
   ok  "A3 every signature naming the admin extractor uses one of the two enumerated spellings — a census covering both covers all of them"
 else
-  bad "A3 a THIRD way to bind the admin extractor appeared in: $UNCLASSIFIED — every existing sweep is now blind to it, exactly as they were to the undestructured form"
+  bad "A3 a THIRD way to call the admin gate appeared at: $UNCLASSIFIED — every existing sweep is now blind to it"
 fi
 
-# A3 is only worth anything if it is looking at signatures at all.
-SIG_COUNT=$(grep -c 'AdminUser' <<< "$SIGS")
+# A3 is only worth anything if it is looking at gate calls at all.
+SIG_COUNT=$(grep -c 'adminUser' <<< "$SIGS")
 if [ "$SIG_COUNT" -gt 50 ]; then
-  ok  "A3b the signature scan sees $SIG_COUNT admin-extractor mentions — A3's silence means classified, not unexamined"
+  ok  "A3b the gate scan sees $SIG_COUNT admin-gate calls — A3's silence means classified, not unexamined"
 else
-  bad "A3b the signature scan found only $SIG_COUNT admin-extractor mentions — the extraction broke and A3 passed on an empty set"
+  bad "A3b the gate scan found only $SIG_COUNT admin-gate calls — the extraction broke and A3 passed on an empty set"
 fi
 
 # The two modules behind the Alerts tabs must still be admin-gated. If one is
 # ever relaxed, §B's gating becomes wrong rather than merely redundant.
 for m in on_call escalation_policies; do
-  if grep -qE '(AdminUser|require_admin)' "$ROUTES/$m.rs"; then
-    ok  "A4 $m.rs is administrator-gated — the tab that fronts it must stay gated too"
+  if [ -f "$ROUTES/rt_$m.go" ] && code "$ROUTES/rt_$m.go" | grep -qE 'st\.adminUser\(r\)|requireAdmin\('; then
+    ok  "A4 rt_$m.go is administrator-gated — the tab that fronts it must stay gated too"
   else
-    bad "A4 $m.rs is no longer administrator-gated — §B hides a tab a client is now allowed to use"
+    bad "A4 rt_$m.go is no longer administrator-gated — §B hides a tab a client is now allowed to use"
   fi
 done
 
@@ -320,7 +300,7 @@ fi
 echo
 echo "§E  the severed pair — the reader and the writer share one predicate"
 
-if has "$DESTS_S" 'pub const DESTINATION_CALLER_PREDICATE'; then
+if [ "$(grep -c '^const rtBackupDestinationsDestinationCallerPredicate = ' <<< "$DESTS_S")" -eq 1 ]; then
   ok  "E1 the predicate is declared once"
 else
   bad "E1 the shared predicate is gone — reader and writer are free to drift again"
@@ -328,13 +308,13 @@ fi
 
 # Both sides must INTERPOLATE it rather than spell the rule out. Two copies of a
 # rule is how this pair came apart in the first place.
-if has "$DESTS_S" 'WHERE \{DESTINATION_CALLER_PREDICATE\}'; then
+if has "$DESTS_S" '"WHERE "\+rtBackupDestinationsDestinationCallerPredicate\+'; then
   ok  "E2 the READER interpolates the shared predicate"
 else
   bad "E2 the reader carries its own copy of the rule — the set a caller is offered can drift from the set the writer accepts"
 fi
 
-if has "$SCHED_S" 'DESTINATION_CALLER_PREDICATE'; then
+if has "$SCHED_S" '"WHERE "\+rtBackupDestinationsDestinationCallerPredicate\+'; then
   ok  "E3 the WRITER interpolates the shared predicate"
 else
   bad "E3 the writer carries its own copy of the rule — same drift, other direction"
@@ -343,8 +323,8 @@ fi
 # The reader must be reachable by the callers the writer admits. If it is ever
 # tightened back to AdminUser the pair is severed again, with the writer still
 # granting a permission nothing can enumerate.
-SEL_SIG=$(sed -n '/pub async fn selectable/,/^) ->/p' <<< "$DESTS_S")
-if has "$SEL_SIG" 'AuthUser'; then
+SEL_SIG=$(sed -n '/^func rtBackupDestinationsSelectable(/,/^}/p' <<< "$DESTS_S")
+if has "$SEL_SIG" 'st\.authUser\(r\)' && hasnt "$SEL_SIG" 'st\.adminUser\(|requireAdmin\('; then
   ok  "E4 the reader is open to every authenticated caller, as the writer already is"
 else
   bad "E4 the reader is no longer AuthUser — the writer still admits site owners to a choice they cannot see"
@@ -353,14 +333,14 @@ fi
 # And it must not be able to leak the credentials. The lean struct has no
 # `config` field at all; an arm on the masking pass would pass the day someone
 # forgets to call it.
-SEL_STRUCT=$(sed -n '/pub struct SelectableDestination/,/^}/p' <<< "$DESTS_S")
-if [ -n "$SEL_STRUCT" ] && hasnt "$SEL_STRUCT" 'config'; then
+SEL_STRUCT=$(sed -n '/^type rtBackupDestinationsSelectableDestination struct/,/^}/p' <<< "$DESTS_S")
+if [ -n "$SEL_STRUCT" ] && has "$SEL_STRUCT" 'json:"id"' && hasnt "$SEL_STRUCT" '[Cc]onfig'; then
   ok  "E5 the caller-facing struct has no credentials field to forget to mask"
 else
   bad "E5 the caller-facing struct carries config — bucket credentials are one serialization away from every site owner"
 fi
 
-if grep -qE '"/api/backup-destinations/selectable"' "$MODRS"; then
+if grep -qE 'r\.Handle\("GET /api/backup-destinations/selectable", h\(rtBackupDestinationsSelectable\)\)' "$MODRS"; then
   ok  "E6 the caller-scoped route is registered"
 else
   bad "E6 the caller-scoped route is not registered — the picker calls an endpoint that 404s"
@@ -383,13 +363,13 @@ SHARE_GUARDED=$(awk '
 if [ "$SHARE_GUARDED" = "GUARDED" ]; then
   ok  "F1 the control that posts to the share endpoint is the one behind the role flag"
 elif [ "$SHARE_GUARDED" = "OPEN" ]; then
-  bad "F1 the share control is offered to callers whose request calls require_admin"
+  bad "F1 the share control is offered to callers whose request calls requireAdmin"
 else
   bad "F1 could not locate the share control at all — the arm is measuring nothing, not passing"
 fi
 
-SHARE_BODY=$(sed -n '/pub async fn share_output/,/^}/p' "$ROUTES/terminal.rs")
-if has "$SHARE_BODY" 'require_admin'; then
+SHARE_BODY=$(code "$ROUTES/rt_terminal.go" | sed -n '/^func rtTerminalShareOutput(/,/^}/p')
+if has "$SHARE_BODY" 'requireAdmin\(c\.Role\)|st\.adminUser\(r\)'; then
   ok  "F2 the share endpoint is still administrator-only, so F1's gate is still correct"
 else
   bad "F2 the share endpoint was opened up — F1 now hides a control the caller is allowed to use"

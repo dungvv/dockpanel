@@ -37,11 +37,11 @@ eq()  { [ "$2" = "$3" ] && ok "$1" || bad "$1" "expected '$3', got '$2'"; }
 # real binary explicitly (dockpanel-ops-p2, s357).
 G=/usr/bin/grep
 
-MIG=panel/backend/migrations
-GD=panel/backend/src/routes/git_deploys.rs
-ST=panel/backend/src/routes/sites.rs
-DB=panel/backend/src/routes/databases.rs
-PC=panel/backend/src/services/preview_cleanup.rs
+MIG=panel/go/internal/api/migrations
+GD=panel/go/internal/api/rt_git_deploys.go
+ST=panel/go/internal/api/rt_sites.go
+DB=panel/go/internal/api/rt_databases.go
+PC=panel/go/internal/api/svc_preview_cleanup.go
 
 for f in "$GD" "$ST" "$DB" "$PC"; do
   [ -f "$f" ] || { bad "SETUP" "$f missing"; exit 1; }
@@ -223,37 +223,42 @@ echo "── C. A failed record is a refusal, not a warning ──────�
 # for cannot fail ([[feedback_verifier_shares_source]]); it can only vanish.
 # Verified by mutation: P1 and P5 now turn C1 and C2 red directly.
 GD_UPSERT_WARN=$($G -n 'Failed to upsert git preview record' "$GD" | head -1 | cut -d: -f1)
-GD_SPAWN=$($G -n 'tokio::spawn' "$GD" | awk -F: -v w="${GD_UPSERT_WARN:-0}" '$1 > w {print $1; exit}')
+GD_SPAWN=$($G -nE '^\s*go func\(\)' "$GD" | awk -F: -v w="${GD_UPSERT_WARN:-0}" '$1 > w {print $1; exit}')
 
 if [ -n "$GD_UPSERT_WARN" ] && [ -n "$GD_SPAWN" ] && [ "$GD_SPAWN" -gt "$GD_UPSERT_WARN" ]; then
   ok "C0 both anchors resolved (upsert warn $GD_UPSERT_WARN, spawn $GD_SPAWN)"
   BLOCK=$(sed -n "${GD_UPSERT_WARN},$((GD_SPAWN - 1))p" "$GD")
+  # Go: the refusal lives inside the `if err != nil {` that owns the warn, so
+  # the measured block is the warn through that if's closing brace (neither
+  # end is the refusal itself). The wider warn→spawn span also holds
+  # markFailed's own warn, which would muddy the C2 counts.
+  BLOCK=$(printf '%s\n' "$BLOCK" | awk '{print} /^[[:space:]]*}[[:space:]]*$/ {exit}')
 
   # C1 is the defect itself. Between logging the failed write and spawning the
   # build there must be a return: otherwise the container, the port, the vhost
   # and the certificate are created for a row that does not exist.
-  printf '%s\n' "$BLOCK" | $G -qE 'return Err\(' \
+  printf '%s\n' "$BLOCK" | $G -qE '^\s*return "' \
     && ok "C1 the failed upsert RETURNS before the spawn — no build starts without a row" \
     || bad "C1 the failed upsert returns before the spawn" \
            "nothing between line $GD_UPSERT_WARN and the spawn at $GD_SPAWN returns — the deploy proceeds with no row"
 
   # C2: the reason is echoed verbatim into the webhook's HTTP body at :1684 and
   # from there into GitHub's delivery log, and that door has no auth extractor.
-  # An interpolated sqlx error there publishes the constraint name, the table,
+  # An interpolated pgx error there publishes the constraint name, the table,
   # and on some paths the conflicting value.
   eq "C2 the refusal interpolates nothing — it cannot carry database detail to an unauthenticated caller" \
-     "$(printf '%s\n' "$BLOCK" | $G -c 'format!')" "0"
+     "$(printf '%s\n' "$BLOCK" | $G -E '^\s*return ' | $G -cE 'Sprintf|err|%|" *\+')" "0"
   eq "C2b the one interpolation in the block is the log's, not the refusal's" \
-     "$(printf '%s\n' "$BLOCK" | $G -c '{e}')" "1"
+     "$(printf '%s\n' "$BLOCK" | $G -c '%v')" "1"
   eq "C2b-control there is exactly one log line in the block to own it" \
-     "$(printf '%s\n' "$BLOCK" | $G -c 'tracing::warn!')" "1"
+     "$(printf '%s\n' "$BLOCK" | $G -c 'slog\.Warn')" "1"
 else
   bad "C0 anchors" "warn='$GD_UPSERT_WARN' spawn='$GD_SPAWN' — §C cannot be evaluated"
 fi
 
 # C3: the operator still gets the detail the pusher does not.
-eq "C3 the sqlx error is logged for the operator, with the branch that produced it" \
-   "$($G -cE 'Failed to upsert git preview record for branch .\{branch\}.: \{e\}' "$GD")" "1"
+eq "C3 the DB error is logged for the operator, with the branch that produced it" \
+   "$($G -cE "Failed to upsert git preview record for branch '%s': %v\", branch, err" "$GD")" "1"
 
 echo "── D. sites.proxy_port — the collision the operator was told was a domain ──"
 
@@ -269,14 +274,14 @@ $G -qE 'DROP INDEX IF EXISTS idx_sites_proxy_port;' "$MIGF" \
 # D2: the message. Two unique indexes can reject that INSERT and they mean
 # opposite things; collapsing them sent the operator to look at DNS.
 eq "D2 a port collision is reported as a port collision, not as a taken domain" \
-   "$($G -cE 'msg\.contains\("idx_sites_proxy_port_server"\)' "$ST")" "1"
+   "$($G -cE 'strings\.Contains\(msg, "idx_sites_proxy_port_server"\)' "$ST")" "1"
 eq "D2-control the domain arm still exists below it" \
-   "$($G -cE 'msg\.contains\("duplicate key"\) \|\| msg\.contains\("unique"\)' "$ST")" "1"
+   "$($G -cE 'strings\.Contains\(msg, "duplicate key"\) \|\| strings\.Contains\(msg, "unique"\)' "$ST")" "1"
 
 # D3: the range comment. It said 4000-4999 while the query said 5000-5999, in
 # the two lines that have to agree for anyone to reason about this at all.
 eq "D3 the allocator comment names the range the query actually walks" \
-   "$($G -cE 'first free port in the 5000-5999 range' "$ST")" "1"
+   "$($G -cE 'first free one in 5000-5999' "$ST")" "1"
 eq "D3-control the query walks that range" \
    "$($G -cE 'generate_series\(5000, 5999\)' "$ST")" "1"
 
