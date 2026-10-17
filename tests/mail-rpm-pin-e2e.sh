@@ -122,7 +122,7 @@ echo "── 3. R3+R4: the OpenDKIM arrangement does not depend on the distro's 
 sockconst=$(code "$AGENT_MAIL" | grep -E '^[[:space:]]*mailOpendkimSocket[[:space:]]*=')
 if [ -z "$sockconst" ] || ! has "$AGENT_MAIL" '"Socket " + mailOpendkimSocket'; then
   bad "could not read the emitted Socket value — the chroot arm would measure nothing"
-elif hasre "$AGENT_MAIL" 'Socket (local:)?/?var/spool/postfix' || grep -q 'var/spool/postfix' <<< "$sockconst"; then
+elif hasre "$AGENT_MAIL" 'Socket (local:)?/?var/spool/postfix' || grep >/dev/null -c 'var/spool/postfix' <<< "$sockconst"; then
   bad "the milter socket is back inside Postfix's chroot — SELinux denies dkim_milter_t search on postfix_spool_t"
 else
   ok "the milter socket is not inside Postfix's chroot"

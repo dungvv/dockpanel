@@ -257,7 +257,7 @@ if [ "$NUPSERT" -ge 20 ]; then
 else
   bad "B1-control rtAlertsUpsertRules body extracted — only $NUPSERT lines (the extractor broke)"
 fi
-if grep -A1 -E 'NotificationsUnknownSuppressibleTypes\(' <<< "$UPSERT" | grep -qE 'http\.StatusBadRequest'; then
+if grep -A1 -E 'NotificationsUnknownSuppressibleTypes\(' <<< "$UPSERT" | grep >/dev/null -cE 'http\.StatusBadRequest'; then
   ok "B1 the live edit path refuses a suppression token it cannot honour"
 else
   bad "B1 the live edit path refuses a suppression token it cannot honour"
@@ -442,7 +442,7 @@ if [ "$NSNWR" -ge 60 ]; then
 else
   bad "F1-control NotificationsSendNotificationWithRunbook body extracted — only $NSNWR lines (the extractor broke)"
 fi
-if head -1 <<< "$SNWR" | grep -qE '\bseverity string,' && [ "$(grep -cE 'notificationsDeriveSeverity\(' <<< "$SNWR")" -eq 0 ]; then
+if head -1 <<< "$SNWR" | grep >/dev/null -cE '\bseverity string,' && [ "$(grep -cE 'notificationsDeriveSeverity\(' <<< "$SNWR")" -eq 0 ]; then
   ok "F1 the fired-alert send path takes severity as a parameter, not a subject-text guess"
 else
   bad "F1 the fired-alert send path takes severity as a parameter, not a subject-text guess"
@@ -462,7 +462,7 @@ fi
 NSENDS=$(grep -cE '(notificationsFanoutToUser|NotificationsSendNotificationWithRunbook)\(' <<< "$DISPATCH")
 NSEV=$(grep -E '(notificationsFanoutToUser|NotificationsSendNotificationWithRunbook)\(' <<< "$DISPATCH" | grep -cE ', severity, runbookExcerpt, runbookURL\)')
 NOWNER=$(grep -cE '^\s*toOwner\(\)$' <<< "$DISPATCH")
-if head -1 <<< "$DISPATCH" | grep -qE '\bseverity string,' && [ "$NSEV" -ge 3 ] && [ "$NSEV" -eq "$NSENDS" ] && [ "$NOWNER" -ge 3 ]; then
+if head -1 <<< "$DISPATCH" | grep >/dev/null -cE '\bseverity string,' && [ "$NSEV" -ge 3 ] && [ "$NSEV" -eq "$NSENDS" ] && [ "$NOWNER" -ge 3 ]; then
   ok "F2 every route shape in NotificationsDispatchEscalationStep passes the real severity onward — $NSEV/$NSENDS sends, $NOWNER owner fallbacks"
 else
   bad "F2 NotificationsDispatchEscalationStep passes severity to every route shape — $NSEV of $NSENDS sends carry it (expected >= 3, all), $NOWNER toOwner() routes (expected >= 3)"
@@ -477,7 +477,7 @@ if [ "$NFAN" -ge 12 ]; then
 else
   bad "F3-control notificationsFanoutToUser body extracted — only $NFAN lines (the extractor broke)"
 fi
-if head -1 <<< "$FANOUT" | grep -qE '\bseverity string,' \
+if head -1 <<< "$FANOUT" | grep >/dev/null -cE '\bseverity string,' \
    && grep -qE 'NotificationsSendNotificationWithRunbook\(.*, severity, runbookExcerpt, runbookURL\)' <<< "$FANOUT"; then
   ok "F3 notificationsFanoutToUser forwards severity to the actual send"
 else
@@ -508,7 +508,7 @@ fi
 # ONE severity->colour mapping. Before this they were two copies of the same
 # match arms in two files, free to drift the moment either one was edited alone.
 if [ "$(grep -c '^func NotificationsSeverityColor(severity string)' "$NOTIF")" -eq 1 ] \
-   && fnbody NotificationsTryFireAlert "$NOTIF" | grep -qE 'NotificationsSeverityColor\(severity\)'; then
+   && fnbody NotificationsTryFireAlert "$NOTIF" | grep >/dev/null -cE 'NotificationsSeverityColor\(severity\)'; then
   ok "F5 severity->colour is single-sourced, not duplicated per caller"
 else
   bad "F5 severity->colour is single-sourced, not duplicated per caller"
@@ -626,7 +626,7 @@ fi
 # were never switchable — slow_response, security, ssl_renewal_failure,
 # container_* and the rest. That is the difference between "the operator turned
 # this off" and "we stopped paging for two thirds of the catalogue".
-if grep -A1 -E '^\s*default:$' <<< "$ENAB" | grep -qE '^\s*return true$'; then
+if grep -A1 -E '^\s*default:$' <<< "$ENAB" | grep >/dev/null -cE '^\s*return true$'; then
   ok "H2 a type with no column answers TRUE — the twelve unswitchable types still escalate"
 else
   bad "H2 a type with no column answers TRUE — the twelve unswitchable types still escalate"

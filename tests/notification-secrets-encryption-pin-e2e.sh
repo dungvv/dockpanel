@@ -68,7 +68,7 @@ if [ "$N" -ge 1 ]; then
 else
   bad "A1 rtAlertsUpsertRules calls SecretsCryptoEncryptCredential"
 fi
-uhas() { printf '%s\n' "$UPSERT" | grep -qE -- "$1" && ok "$2" || bad "$2"; }
+uhas() { printf '%s\n' "$UPSERT" | grep >/dev/null -cE -- "$1" && ok "$2" || bad "$2"; }
 uhas 'encSlackURL := encryptOpt\(body\.NotifySlackURL\)' \
   "A2 notify_slack_url is routed through the encrypting closure"
 uhas 'encDiscordURL := encryptOpt\(body\.NotifyDiscordURL\)' \
@@ -80,16 +80,16 @@ uhas 'encWebhookURL := encryptOpt\(body\.NotifyWebhookURL\)' \
 # The execSQL argument list ($1..$27), from `execSQL(ctx, st.DB, query,` to
 # the `); err != nil` that closes it.
 ARGS=$(printf '%s\n' "$UPSERT" | awk '/execSQL\(ctx, st\.DB, query,/{on=1} on{print} on && /\); err != nil/{exit}')
-if printf '%s\n' "$ARGS" | grep -qE 'encSlackURL, encDiscordURL, body\.CooldownMinutes, encPagerdutyKey, encWebhookURL'; then
+if printf '%s\n' "$ARGS" | grep >/dev/null -cE 'encSlackURL, encDiscordURL, body\.CooldownMinutes, encPagerdutyKey, encWebhookURL'; then
   ok "A6 the SQL argument list uses the ENCRYPTED locals, not the raw body fields"
 else
   bad "A6 the SQL argument list uses the ENCRYPTED locals, not the raw body fields"
 fi
 # Negative control: the raw plaintext must not still be what gets bound.
 # Positive anchor: the argument block was found (it carries body.CPUThreshold).
-if ! printf '%s\n' "$ARGS" | grep -q 'body\.CPUThreshold'; then
+if ! printf '%s\n' "$ARGS" | grep >/dev/null -c 'body\.CPUThreshold'; then
   bad "A7 CONTROL: could not locate the execSQL argument list — the pattern is wrong, not the code"
-elif printf '%s\n' "$ARGS" | grep -qE 'body\.Notify(Slack|Discord|Webhook)URL|body\.NotifyPagerdutyKey'; then
+elif printf '%s\n' "$ARGS" | grep >/dev/null -cE 'body\.Notify(Slack|Discord|Webhook)URL|body\.NotifyPagerdutyKey'; then
   bad "A7 CONTROL: a raw body.Notify* field is bound directly again (plaintext bind)"
 else
   ok "A7 CONTROL: no raw body.Notify* field is bound directly"
@@ -100,21 +100,21 @@ echo "== §B  rt_alerts.go::rtAlertsGetRules decrypts all four before serializin
 
 GETR=$(fnbody "$ALERTS" rtAlertsGetRules)
 N=$(printf '%s\n' "$GETR" | grep -cE 'rules\[i\]\.Notify(SlackURL|DiscordURL|PagerdutyKey|WebhookURL) = dec\(rules\[i\]\.Notify')
-if [ "$N" -ge 4 ] && printf '%s\n' "$GETR" | grep -qE 'SecretsCryptoDecryptCredentialOrLegacy\(\*p, st\.Config\.JWTSecret\)'; then
+if [ "$N" -ge 4 ] && printf '%s\n' "$GETR" | grep >/dev/null -cE 'SecretsCryptoDecryptCredentialOrLegacy\(\*p, st\.Config\.JWTSecret\)'; then
   ok "B1 rtAlertsGetRules decrypts all 4 fields via SecretsCryptoDecryptCredentialOrLegacy ($N in-place decrypts)"
 else
   bad "B1 rtAlertsGetRules decrypts all 4 fields via SecretsCryptoDecryptCredentialOrLegacy (found $N in-place decrypts)"
 fi
-printf '%s\n' "$GETR" | grep -qE 'rules\[i\]\.NotifySlackURL = dec\(rules\[i\]\.NotifySlackURL\)' \
+printf '%s\n' "$GETR" | grep >/dev/null -cE 'rules\[i\]\.NotifySlackURL = dec\(rules\[i\]\.NotifySlackURL\)' \
   && ok "B2 notify_slack_url is decrypted in place" || bad "B2 notify_slack_url is decrypted in place"
-printf '%s\n' "$GETR" | grep -qE 'rules\[i\]\.NotifyPagerdutyKey = dec\(rules\[i\]\.NotifyPagerdutyKey\)' \
+printf '%s\n' "$GETR" | grep >/dev/null -cE 'rules\[i\]\.NotifyPagerdutyKey = dec\(rules\[i\]\.NotifyPagerdutyKey\)' \
   && ok "B3 notify_pagerduty_key is decrypted in place" || bad "B3 notify_pagerduty_key is decrypted in place"
 
 echo
 echo "== §C  contexts with only a pool decrypt via SecretsCryptoDecryptCredentialFromEnv =="
 
 CHAN=$(fnbody "$NOTIFICATIONS" NotificationsGetUserChannels)
-printf '%s\n' "$CHAN" | grep -qE 'SecretsCryptoDecryptCredentialFromEnv\(\*p\)' \
+printf '%s\n' "$CHAN" | grep >/dev/null -cE 'SecretsCryptoDecryptCredentialFromEnv\(\*p\)' \
   && ok "C1 NotificationsGetUserChannels decrypts via the AppState-free helper" \
   || bad "C1 NotificationsGetUserChannels decrypts via the AppState-free helper"
 # notificationsRuleCols selects notify_email, slack, discord, pagerduty, webhook,
@@ -126,12 +126,12 @@ else
   bad "C2 NotificationsGetUserChannels decrypts all 4 fields (found $N, want >=4, or the column order moved)"
 fi
 SEND=$(fnbody "$UPTIME" uptimeSendAlerts)
-printf '%s\n' "$SEND" | grep -qE 'SecretsCryptoDecryptCredentialFromEnv\(\*p\)' \
+printf '%s\n' "$SEND" | grep >/dev/null -cE 'SecretsCryptoDecryptCredentialFromEnv\(\*p\)' \
   && ok "C3 uptimeSendAlerts uses the same AppState-free helper" \
   || bad "C3 uptimeSendAlerts uses the same AppState-free helper"
 N=0
 for f in 'SlackURL: dec\(m\.AlertSlackURL\)' 'DiscordURL: dec\(m\.AlertDiscordURL\)' 'PagerdutyKey: dec\(pdKey\)' 'WebhookURL: dec\(webhook\)'; do
-  printf '%s\n' "$SEND" | grep -qE "$f" && N=$((N+1))
+  printf '%s\n' "$SEND" | grep >/dev/null -cE "$f" && N=$((N+1))
 done
 if [ "$N" -ge 4 ]; then
   ok "C4 uptimeSendAlerts decrypts pagerduty/webhook/slack/discord ($N uses)"
@@ -152,11 +152,11 @@ else
 fi
 CREATE=$(fnbody "$MONITORS" rtMonitorsCreate)
 UPDATE=$(fnbody "$MONITORS" rtMonitorsUpdate)
-printf '%s\n' "$CREATE" | grep -qE 'encSlack, err := encryptOpt\(slackURL\)' \
+printf '%s\n' "$CREATE" | grep >/dev/null -cE 'encSlack, err := encryptOpt\(slackURL\)' \
   && ok "D3 create() encrypts before the INSERT" || bad "D3 create() encrypts before the INSERT"
-printf '%s\n' "$UPDATE" | grep -qE 'encSlack, err := encryptOpt\(body\.AlertSlackURL\)' \
+printf '%s\n' "$UPDATE" | grep >/dev/null -cE 'encSlack, err := encryptOpt\(body\.AlertSlackURL\)' \
   && ok "D4 update() encrypts before the UPDATE" || bad "D4 update() encrypts before the UPDATE"
-printf '%s\n' "$CREATE" | grep -qE 'slackURL = dec\(global\.A\)' \
+printf '%s\n' "$CREATE" | grep >/dev/null -cE 'slackURL = dec\(global\.A\)' \
   && ok "D5 create()'s inherit-from-global fallback decrypts BEFORE the SSRF check runs on it" \
   || bad "D5 create()'s inherit-from-global fallback decrypts BEFORE the SSRF check runs on it"
 # Ordering control: the decrypt of the inherited global value must appear

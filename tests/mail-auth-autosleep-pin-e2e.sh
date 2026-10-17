@@ -48,7 +48,7 @@ strip() { perl -0pe 's{/\*.*?\*/}{}gs; s{(^|[^:"])//[^\n]*}{$1}g' "$1"; }
 fnbody() { strip "$1" | awk -v fn="$2" '
   !inb && (index($0, "func " fn "(") == 1 || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) {inb=1}
   inb {print} inb && /^}/ {exit}'; }
-inbody() { if fnbody "$3" "$4" | grep -qF -- "$2"; then ok "$1"; else bad "$1"; fi; }
+inbody() { if fnbody "$3" "$4" | grep >/dev/null -cF -- "$2"; then ok "$1"; else bad "$1"; fi; }
 
 for f in "$MAIL" "$NGINX" "$HEALER" "$APPS_API"; do
   [ -f "$f" ] || bad "source exists: ${f#$REPO/}"
@@ -63,8 +63,8 @@ inbody "the passwd-file is written 0640, not owner-only" \
 # Absence arm with a positive anchor: the helper body must exist (above) and
 # neither it nor any line naming the users path may use an owner-only mode.
 if [ -n "$(fnbody "$MAIL" mailWriteDovecotUsers)" ] \
-   && ! fnbody "$MAIL" mailWriteDovecotUsers | grep -q '0o600' \
-   && ! strip "$MAIL" | grep -q 'mailDovecotUsers.*0o600'; then
+   && ! fnbody "$MAIL" mailWriteDovecotUsers | grep >/dev/null -c '0o600' \
+   && ! strip "$MAIL" | grep >/dev/null -c 'mailDovecotUsers.*0o600'; then
   ok "no caller writes the passwd-file owner-only any more"
 else
   bad "no caller writes the passwd-file owner-only any more"
@@ -75,7 +75,7 @@ inbody "the group is handed to dovecot" \
 # published with permissions that lock auth out.
 if fnbody "$MAIL" mailWriteDovecotUsers \
    | grep -n 'root:dovecot\|os\.Rename' | head -2 | paste -sd' ' - \
-   | grep -q 'root:dovecot.*os\.Rename'; then
+   | grep >/dev/null -c 'root:dovecot.*os\.Rename'; then
   ok "ownership is set BEFORE the atomic rename"
 else
   bad "ownership is set BEFORE the atomic rename"
@@ -91,8 +91,8 @@ has  "the agent reports when a domain last served a request" \
      '/nginx/last-activity/{domain}' "$NGINX"
 has  "…and it is routed" \
      'r.Handle("GET /nginx/last-activity/{domain}", n.lastActivity)' "$NGINX"
-if fnbody "$NGINX" lastActivity | grep -qF 'os.Stat(logFile)' \
-   && fnbody "$NGINX" lastActivity | grep -qF 'ModTime()'; then
+if fnbody "$NGINX" lastActivity | grep >/dev/null -cF 'os.Stat(logFile)' \
+   && fnbody "$NGINX" lastActivity | grep >/dev/null -cF 'ModTime()'; then
   ok "…from the access log's mtime, not a parse"
 else
   bad "…from the access log's mtime, not a parse"
@@ -100,8 +100,8 @@ fi
 # "No log" must not be reported as "no traffic": a silent zero is exactly what
 # would let the timer stop a container it knows nothing about. secondsAgo stays
 # a nil `any` (JSON null) unless the stat succeeded.
-if fnbody "$NGINX" lastActivity | grep -qF 'var secondsAgo any' \
-   && fnbody "$NGINX" lastActivity | grep -qF '"seconds_ago": secondsAgo'; then
+if fnbody "$NGINX" lastActivity | grep >/dev/null -cF 'var secondsAgo any' \
+   && fnbody "$NGINX" lastActivity | grep >/dev/null -cF '"seconds_ago": secondsAgo'; then
   ok "a domain with no access log reports unknown, not idle"
 else
   bad "a domain with no access log reports unknown, not idle"
@@ -114,8 +114,8 @@ has  "…and treats a null answer as unknown" \
      'if secs, ok := jsonU64(jsonGet(res, "seconds_ago")); ok {' "$HEALER"
 # The domain is now read, where the old code explicitly discarded it: it is
 # selected from container_sleep_config and consulted per row.
-if strip "$HEALER" | grep -qF 'SELECT container_id, container_name, domain, sleep_after_minutes' \
-   && strip "$HEALER" | grep -qF 'if c.Domain != nil && *c.Domain != ""'; then
+if strip "$HEALER" | grep >/dev/null -cF 'SELECT container_id, container_name, domain, sleep_after_minutes' \
+   && strip "$HEALER" | grep >/dev/null -cF 'if c.Domain != nil && *c.Domain != ""'; then
   ok "the sleeper no longer throws the domain away"
 else
   bad "the sleeper no longer throws the domain away"

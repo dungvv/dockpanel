@@ -169,7 +169,7 @@ bail_at=$(grep -nE '^[[:space:]]*return$' <<<"$HEAL_FN" | head -1 | cut -d: -f1)
 write_at=$(grep -nE 'os\.WriteFile\(mailWebmailNginxConf' <<<"$HEAL_FN" | head -1 | cut -d: -f1)
 if [ -n "$read_at" ] && [ -n "$bail_at" ] && [ -n "$write_at" ] \
    && [ "$bail_at" -le $((read_at + 2)) ] && [ "$bail_at" -lt "$write_at" ] \
-   && sed -n "$((read_at + 1))p" <<<"$HEAL_FN" | grep -qF 'err != nil'; then
+   && sed -n "$((read_at + 1))p" <<<"$HEAL_FN" | grep >/dev/null -cF 'err != nil'; then
   ok "the heal is a no-op when webmail was never installed"
 else
   bad "the heal no longer checks the fragment exists — it may install a proxy to nothing"

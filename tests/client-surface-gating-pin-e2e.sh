@@ -186,7 +186,7 @@ fi
 # The two modules behind the Alerts tabs must still be admin-gated. If one is
 # ever relaxed, §B's gating becomes wrong rather than merely redundant.
 for m in on_call escalation_policies; do
-  if [ -f "$ROUTES/rt_$m.go" ] && code "$ROUTES/rt_$m.go" | grep -qE 'st\.adminUser\(r\)|requireAdmin\('; then
+  if [ -f "$ROUTES/rt_$m.go" ] && code "$ROUTES/rt_$m.go" | grep >/dev/null -cE 'st\.adminUser\(r\)|requireAdmin\('; then
     ok  "A4 rt_$m.go is administrator-gated — the tab that fronts it must stay gated too"
   else
     bad "A4 rt_$m.go is no longer administrator-gated — §B hides a tab a client is now allowed to use"

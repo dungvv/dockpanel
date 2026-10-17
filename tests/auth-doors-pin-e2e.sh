@@ -443,7 +443,7 @@ else
   for d in $DECODERS; do
     f=${d%%:*}; fn=${d##*:}; tag="$(basename "$f"):$fn"
     case "$DECODER_EXEMPT" in *" $tag "*) ok "  $tag exempt: branding-only read, grants nothing"; continue ;; esac
-    if door_body "$f" "$fn" | grep -qF 'sessionsRevokedAt()'; then
+    if door_body "$f" "$fn" | grep >/dev/null -cF 'sessionsRevokedAt()'; then
       ok "  $tag enforces session revocation on its own decode path"
     else
       bad "  $tag decodes a JWT by hand and never checks sessionsRevokedAt — panic cannot close this channel"

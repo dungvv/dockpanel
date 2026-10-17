@@ -180,7 +180,7 @@ fi
 DEST_BIND=$(grep -oE '[^ ,]*DestID[^ ,]*' <<< "$SCHED_ARGS" | head -1)
 if [ -z "$DEST_BIND" ]; then
   bad "the scheduler binds no destination_id at all — a scheduled off-site copy records no destination"
-elif [ "$DEST_BIND" != row.DestID ] || grep -qiE 'if uploaded' <<< "$SCHED_ARGS"; then
+elif [ "$DEST_BIND" != row.DestID ] || grep >/dev/null -ciE 'if uploaded' <<< "$SCHED_ARGS"; then
   bad "destination_id is bound only when the upload succeeded, so a failed off-site copy cannot be told from a schedule that never had a destination: $DEST_BIND"
 else
   ok "destination_id is bound from the schedule's own destination whatever the upload did"
