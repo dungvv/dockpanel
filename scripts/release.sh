@@ -11,13 +11,13 @@ NC='\033[0m'
 cd "$(dirname "$0")/.."
 
 # ─── Determine version ───
-VERSION=$(grep '^version' panel/agent/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+VERSION=$(tr -d '[:space:]' < VERSION)
 TAG="v${VERSION}"
 LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "none")
 
 if [ "$TAG" = "$LATEST_TAG" ]; then
   echo -e "${RED}Version $VERSION already has a tag ($TAG). Bump version first.${NC}"
-  echo "  Edit: panel/agent/Cargo.toml, panel/backend/Cargo.toml, panel/cli/Cargo.toml, panel/mcp/Cargo.toml, panel/frontend/package.json"
+  echo "  Edit: VERSION and panel/frontend/package.json"
   exit 1
 fi
 
@@ -26,13 +26,10 @@ echo "  Previous tag: $LATEST_TAG"
 echo ""
 
 # ─── Version consistency check ───
-V_BACKEND=$(grep '^version' panel/backend/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-V_CLI=$(grep '^version' panel/cli/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-V_MCP=$(grep '^version' panel/mcp/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 V_FRONTEND=$(grep '"version"' panel/frontend/package.json | head -1 | sed 's/.*: *"\(.*\)".*/\1/')
 
-if [ "$VERSION" != "$V_BACKEND" ] || [ "$VERSION" != "$V_CLI" ] || [ "$VERSION" != "$V_MCP" ] || [ "$VERSION" != "$V_FRONTEND" ]; then
-  echo -e "${RED}Version mismatch: agent=$VERSION backend=$V_BACKEND cli=$V_CLI mcp=$V_MCP frontend=$V_FRONTEND${NC}"
+if [ "$VERSION" != "$V_FRONTEND" ]; then
+  echo -e "${RED}Version mismatch: VERSION=$VERSION frontend=$V_FRONTEND${NC}"
   exit 1
 fi
 

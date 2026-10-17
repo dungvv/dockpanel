@@ -6,17 +6,17 @@
 #
 # Produces <out-dir>/{dockpanel-api,dockpanel-agent,dockpanel,dockpanel-mcp}, statically linked
 # for linux/<goarch> (default: the host arch). The version stamp comes from
-# panel/backend/Cargo.toml, the release's single version source.
+# the top-level VERSION file, the release's single version source.
 #
 # When no `go` is on PATH and we run as root, the official toolchain is
 # installed to /usr/local/go after verifying Google's published sha256 — the
-# same "install the toolchain if missing" contract setup.sh has for rustup.
+# same "install the toolchain if missing" contract setup.sh once had for rustup.
 # An older go (>=1.21) on PATH is fine: GOTOOLCHAIN=auto fetches what go.mod
 # needs.
 
 set -euo pipefail
 
-GO_VERSION="1.27.0"
+GO_VERSION="1.27.2"
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="${1:?usage: build-go.sh <out-dir> [goarch]}"
 GOARCH_TARGET="${2:-}"
@@ -57,7 +57,7 @@ ensure_go() {
 }
 
 ensure_go
-VERSION="$(grep '^version' "$REPO_DIR/panel/backend/Cargo.toml" | head -1 | sed 's/.*"\(.*\)"/\1/')"
+VERSION="$(tr -d '[:space:]' < "$REPO_DIR/VERSION")"
 mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 

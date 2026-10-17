@@ -2,6 +2,8 @@ module github.com/ovexro/dockpanel/panel/go
 
 go 1.26.0
 
+toolchain go1.27.2
+
 require (
 	github.com/GehirnInc/crypt v0.0.0-20230320061759-8cc1b52080c5
 	github.com/coder/websocket v1.8.15

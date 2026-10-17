@@ -142,19 +142,15 @@ fi
 # Version consistency check — BLOCKING
 echo ""
 echo "=== Version consistency check ==="
-V_AGENT=$(grep '^version' panel/agent/Cargo.toml 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')
-V_BACKEND=$(grep '^version' panel/backend/Cargo.toml 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')
-V_CLI=$(grep '^version' panel/cli/Cargo.toml 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')
-V_MCP=$(grep '^version' panel/mcp/Cargo.toml 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')
+# VERSION is the single version source for every Go binary; the frontend
+# package.json must agree with it.
+V_AGENT=$(tr -d '[:space:]' < VERSION 2>/dev/null)
 V_FRONTEND=$(grep '"version"' panel/frontend/package.json 2>/dev/null | head -1 | sed 's/.*: *"\(.*\)".*/\1/')
 
-if [ -n "$V_AGENT" ] && [ -n "$V_BACKEND" ] && [ -n "$V_CLI" ] && [ -n "$V_MCP" ] && [ -n "$V_FRONTEND" ]; then
-  if [ "$V_AGENT" != "$V_BACKEND" ] || [ "$V_AGENT" != "$V_CLI" ] || [ "$V_AGENT" != "$V_MCP" ] || [ "$V_AGENT" != "$V_FRONTEND" ]; then
+if [ -n "$V_AGENT" ] && [ -n "$V_FRONTEND" ]; then
+  if [ "$V_AGENT" != "$V_FRONTEND" ]; then
     echo -e "${RED}BLOCKED: Version mismatch across packages:${NC}"
-    echo -e "  agent:    ${V_AGENT}"
-    echo -e "  backend:  ${V_BACKEND}"
-    echo -e "  cli:      ${V_CLI}"
-    echo -e "  mcp:      ${V_MCP}"
+    echo -e "  VERSION:  ${V_AGENT}"
     echo -e "  frontend: ${V_FRONTEND}"
     FOUND=1
   else
@@ -237,30 +233,25 @@ for DIR in panel/frontend website/client website/server; do
   esac
 done
 
-# cargo-audit lives in ~/.cargo/bin, which is not on a git hook's PATH.
-[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
-if command -v cargo-audit >/dev/null 2>&1; then
-  # The four crates have separate Cargo.lock files — none is redundant.
-  # `-n` uses the cached RustSec DB (fast + offline-safe); fall back to a
-  # fetching run when the DB has never been cloned.
-  NOFETCH="-n"
-  [ -d "$HOME/.cargo/advisory-db" ] || NOFETCH=""
-  for CRATE in panel/agent panel/backend panel/cli panel/mcp; do
-    [ -f "$CRATE/Cargo.lock" ] || continue
-    OUT=$( (cd "$CRATE" && cargo audit $NOFETCH) 2>&1 )
-    if [ $? -eq 0 ]; then
-      echo -e "${GREEN}cargo audit clean: ${CRATE}${NC}"
-    elif echo "$OUT" | grep -ciE "couldn't fetch|failed to fetch|network|could not resolve" >/dev/null; then
-      echo -e "${YELLOW}WARNING: cargo audit could not reach the advisory DB for ${CRATE} — not enforced${NC}"
-    else
-      echo -e "${RED}BLOCKED: cargo audit found vulnerabilities in ${CRATE}${NC}"
-      echo "$OUT" | grep -iE '^error|RUSTSEC|Vulnerability' | head -8
-      FOUND=1
-    fi
-  done
+# govulncheck reports known vulnerabilities on call paths the Go binaries
+# actually reach. A network failure is a warning, not a pass and not a block.
+if command -v go >/dev/null 2>&1; then
+  # Installed for the HOST, then run with GOOS=linux: the binaries only ship
+  # for linux, and `GOOS=linux go run` would build the tool itself for linux.
+  GV_BIN="${TMPDIR:-/tmp}/dockpanel-govulncheck"
+  OUT=$( GOBIN="$GV_BIN" go install golang.org/x/vuln/cmd/govulncheck@latest && \
+         cd panel/go && GOOS=linux "$GV_BIN/govulncheck" ./... 2>&1 )
+  if [ $? -eq 0 ]; then
+    echo -e "${GREEN}govulncheck clean${NC}"
+  elif echo "$OUT" | grep -ciE "dial tcp|no such host|i/o timeout|could not fetch" >/dev/null; then
+    echo -e "${YELLOW}WARNING: govulncheck could not reach the vulnerability DB — not enforced${NC}"
+  else
+    echo -e "${RED}BLOCKED: govulncheck found reachable vulnerabilities${NC}"
+    echo "$OUT" | grep -E '^Vulnerability|GO-[0-9]{4}' | head -8
+    FOUND=1
+  fi
 else
-  echo -e "${YELLOW}WARNING: cargo-audit not installed — Rust advisories NOT checked${NC}"
-  echo -e "${YELLOW}  → cargo install cargo-audit${NC}"
+  echo -e "${YELLOW}WARNING: go not installed — Go advisories NOT checked${NC}"
 fi
 
 if [ "$FOUND" -eq 1 ]; then
