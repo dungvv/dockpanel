@@ -70,10 +70,10 @@ func rtMetricsServerMetrics(st *AppState, w http.ResponseWriter, r *http.Request
 		return internalError("server metrics", err)
 	}
 
-	// Summary stats. (With no rows AVG is NULL, which does not decode into
-	// f64 — the Rust handler answered 500 there too; kept as-is.)
+	// Summary stats. With no rows the aggregates are NULL; report zeros
+	// instead of the 500 the Rust handler answered with.
 	stats, err := queryOpt[Tup3[float64, float64, float64]](r.Context(), st.DB,
-		"SELECT AVG(value), MIN(value), MAX(value) FROM metrics "+
+		"SELECT COALESCE(AVG(value), 0)::float8, COALESCE(MIN(value), 0)::float8, COALESCE(MAX(value), 0)::float8 FROM metrics "+
 			"WHERE server_id = $1 AND metric_type = $2 "+
 			"AND recorded_at > NOW() - ($3 || ' hours')::interval", serverID, metricType, hoursStr)
 	if err != nil {

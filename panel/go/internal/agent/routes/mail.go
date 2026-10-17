@@ -1246,7 +1246,11 @@ func mailParseQueue(stdout string) []mailQueueItem {
 			continue
 		}
 		first, _ := utf8.DecodeRuneInString(t)
-		if len(t) > 10 && (unicode.IsLetter(first) || unicode.IsNumber(first)) {
+		// An entry header starts in column 0; recipient and reason lines are
+		// indented. (The Rust parser keyed on length instead, so any recipient
+		// longer than 10 characters was taken for a queue ID and dropped.)
+		indented := line != "" && (line[0] == ' ' || line[0] == '\t')
+		if !indented && strings.ContainsAny(t, " \t") && (unicode.IsLetter(first) || unicode.IsNumber(first)) {
 			// "A1B2C3D4E5*    1234 Mon Mar 15 10:00:00  sender@example.com"
 			i := strings.IndexFunc(t, unicode.IsSpace)
 			if i < 0 {

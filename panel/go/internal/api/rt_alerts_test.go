@@ -168,9 +168,10 @@ func TestDBAlertsRoutes(t *testing.T) {
 	if p := e.want("GET", "/api/escalation-policies/"+polID, nil, 200); jsonGet(p, "used_by_rule_count") != 1.0 {
 		t.Fatal(p)
 	}
-	// Ported verbatim from Rust, bug included: inside the RETURNING subquery
-	// the bare `id` binds to alert_rules.id, so update answers 0 here.
-	if p := e.want("PUT", "/api/escalation-policies/"+polID, map[string]any{"name": "p2", "steps": steps}, 200); jsonGet(p, "used_by_rule_count") != 0.0 {
+	// The update must report the same count as the read (the Rust handler
+	// answered 0 here: a bare `id` in its RETURNING subquery bound to
+	// alert_rules.id).
+	if p := e.want("PUT", "/api/escalation-policies/"+polID, map[string]any{"name": "p2", "steps": steps}, 200); jsonGet(p, "used_by_rule_count") != 1.0 {
 		t.Fatal(p)
 	}
 	del := e.want("DELETE", "/api/on-call/schedules/"+schedID, nil, 200)

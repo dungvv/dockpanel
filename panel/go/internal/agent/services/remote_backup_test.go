@@ -147,3 +147,18 @@ func TestRemoteBackupCredConfigCannotInjectCurlOptions(t *testing.T) {
 		t.Fatalf("config %q", b)
 	}
 }
+
+func TestRemoteBackupS3EndpointRefusesMetadataAndOddSchemes(t *testing.T) {
+	for _, bad := range []string{"file:///etc/passwd", "gopher://x", "http://169.254.169.254", "http://[fe80::1]:9000",
+		"http://[fd00:ec2::254]", "http://metadata.google.internal", "not a url", "https://"} {
+		if remoteBackupCheckS3Endpoint(bad) == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+	// Private LAN MinIO and public endpoints stay allowed.
+	for _, ok := range []string{"http://192.168.1.10:9000", "https://s3.amazonaws.com", "http://10.0.0.5"} {
+		if err := remoteBackupCheckS3Endpoint(ok); err != nil {
+			t.Errorf("refused %q: %v", ok, err)
+		}
+	}
+}

@@ -216,9 +216,19 @@ func TestMailLocalPartAndHelpers(t *testing.T) {
 	q := mailParseQueue("-Queue ID-  --Size-- ----Arrival Time---- -Sender/Recipient-------\nA1B2C3D4E5*    1234 Mon Mar 15 10:00:00  sender@example.com\n                                         rcpt@example.org\n\n-- 1 Kbytes in 1 Request.\n")
 	if len(q) != 1 || q[0].ID != "A1B2C3D4E5" || q[0].Status != "active" || q[0].Size != "1234" ||
 		q[0].Sender != "sender@example.com" || q[0].ArrivalTime != "Mon Mar 15 10:00:00" ||
-		// Faithful to Rust: a recipient longer than 10 chars that starts with an
-		// alphanumeric hits the queue-ID branch first and is dropped.
-		q[0].Recipients != "" {
+		q[0].Recipients != "rcpt@example.org" {
 		t.Errorf("queue: %+v", q)
+	}
+	// Two entries, a deferral reason line, several recipients.
+	q = mailParseQueue("-Queue ID-  --Size-- ----Arrival Time---- -Sender/Recipient-------\n" +
+		"AAAA111111!    900 Tue Mar 16 09:00:00  a@example.com\n" +
+		"(connect to mx.example.net[1.2.3.4]:25: Connection timed out)\n" +
+		"                                         first.recipient@example.org\n" +
+		"                                         x@y.io\n\n" +
+		"BBBB222222     100 Tue Mar 16 09:01:00  b@example.com\n" +
+		"                                         z@example.org\n\n-- 2 Kbytes in 2 Requests.\n")
+	if len(q) != 2 || q[0].Status != "hold" || q[0].Recipients != "first.recipient@example.org, x@y.io" ||
+		q[1].ID != "BBBB222222" || q[1].Status != "deferred" || q[1].Recipients != "z@example.org" {
+		t.Errorf("multi-entry queue: %+v", q)
 	}
 }

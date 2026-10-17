@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,6 +58,38 @@ func remoteBackupCredConfig(label, accessKey, secretKey string) (string, error) 
 	return remoteBackupTempFile(label, fmt.Sprintf("user = \"%s:%s\"", esc(accessKey), esc(secretKey)))
 }
 
+// remoteBackupCheckS3Endpoint refuses an endpoint that is not http(s) or that
+// points at link-local space — the cloud metadata services (169.254.169.254,
+// fd00:ec2::254) hand out the instance's own credentials. Private ranges stay
+// allowed on purpose: a MinIO on the LAN is a normal destination, and only
+// admins can configure one.
+func remoteBackupCheckS3Endpoint(endpoint string) error {
+	u, err := url.Parse(endpoint)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return fmt.Errorf("S3 endpoint must be an http:// or https:// URL")
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if host == "metadata.google.internal" || host == "metadata" {
+		return fmt.Errorf("S3 endpoint %s points at a cloud metadata service", host)
+	}
+	ips := []net.IP{net.ParseIP(host)}
+	if ips[0] == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		addrs, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+		if err != nil {
+			return nil // unresolvable: curl will report it with the real error
+		}
+		ips = addrs
+	}
+	for _, ip := range ips {
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.Equal(net.ParseIP("fd00:ec2::254")) {
+			return fmt.Errorf("S3 endpoint %s resolves to link-local address %s (cloud metadata), refused", host, ip)
+		}
+	}
+	return nil
+}
+
 // remoteBackupS3Curl runs curl against the S3 endpoint and returns (status, body).
 //
 // These calls used --fail, which says nothing about 3xx; without -L curl
@@ -69,7 +103,9 @@ func remoteBackupCredConfig(label, accessKey, secretKey string) (string, error) 
 func remoteBackupS3Curl(args []string, timeout time.Duration, label string) (int, string, error) {
 	// --fail is deliberately absent: it suppresses the body, where S3 puts
 	// the reason. The status check replaces it.
-	full := append([]string{"--silent", "--show-error", "-w", "\n%{http_code}"}, args...)
+	// Only http(s), on the first request and on any redirect: curl would
+	// otherwise happily read file:// or speak gopher:// for a crafted endpoint.
+	full := append([]string{"--silent", "--show-error", "--proto", "=http,https", "--proto-redir", "=http,https", "-w", "\n%{http_code}"}, args...)
 	// The context kills curl on timeout (it must not keep running against the
 	// endpoint in the background).
 	out, timedOut, err := backupsRun(timeout, "curl", full...)
@@ -116,6 +152,9 @@ func remoteBackupS3Detail(code int, body string) string {
 // RemoteBackupUploadS3 uploads a backup file to S3-compatible storage using
 // curl --aws-sigv4.
 func RemoteBackupUploadS3(fpath, bucket, region, endpoint, accessKey, secretKey, remotePath string) (string, error) {
+	if err := remoteBackupCheckS3Endpoint(endpoint); err != nil {
+		return "", err
+	}
 	if _, err := os.Stat(fpath); err != nil {
 		return "", fmt.Errorf("Backup file not found: %s", fpath)
 	}
@@ -334,6 +373,9 @@ func RemoteBackupUploadSftp(fpath, host string, port uint16, username string, pa
 // test that connects differently from the upload tests nothing. A failed
 // delete is reported: such a destination cannot enforce retention either.
 func RemoteBackupTestS3(bucket, region, endpoint, accessKey, secretKey, pathPrefix string) error {
+	if err := remoteBackupCheckS3Endpoint(endpoint); err != nil {
+		return err
+	}
 	prefix := strings.Trim(pathPrefix, "/")
 	key := fmt.Sprintf(".dockpanel-write-probe-%016x", remoteBackupRandU64())
 	if prefix != "" {
@@ -409,6 +451,9 @@ func RemoteBackupTestSftp(host string, port uint16, username string, password, k
 
 // RemoteBackupListS3 lists object keys in a bucket under a prefix.
 func RemoteBackupListS3(bucket, region, endpoint, accessKey, secretKey, prefix string) ([]string, error) {
+	if err := remoteBackupCheckS3Endpoint(endpoint); err != nil {
+		return nil, err
+	}
 	clean := strings.Trim(prefix, "/")
 	url := fmt.Sprintf("%s/%s/?list-type=2", endpoint, bucket)
 	if clean != "" {
@@ -439,6 +484,9 @@ func RemoteBackupListS3(bucket, region, endpoint, accessKey, secretKey, prefix s
 // RemoteBackupDeleteS3 deletes an object. 204 and 404 both mean "it is not
 // there", which is what the caller asked for.
 func RemoteBackupDeleteS3(bucket, region, endpoint, accessKey, secretKey, key string) error {
+	if err := remoteBackupCheckS3Endpoint(endpoint); err != nil {
+		return err
+	}
 	url := fmt.Sprintf("%s/%s/%s", endpoint, bucket, key)
 	cfg, err := remoteBackupCredConfig("delete", accessKey, secretKey)
 	if err != nil {

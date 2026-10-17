@@ -332,7 +332,9 @@ func rtEscalationPoliciesUpdatePolicy(st *AppState, w http.ResponseWriter, r *ht
 			"SET name = $2, steps = $3, updated_at = NOW() "+
 			"WHERE id = $1 AND user_id = $4 "+
 			"RETURNING id, name, steps, created_at, updated_at, "+
-			"COALESCE((SELECT COUNT(*) FROM alert_rules WHERE escalation_policy_id = id), 0) AS used_by_rule_count",
+			// Qualified: a bare `id` here binds to alert_rules.id, which made the
+			// count always 0 after an update (inherited from the Rust handler).
+			"COALESCE((SELECT COUNT(*) FROM alert_rules WHERE escalation_policy_id = escalation_policies.id), 0) AS used_by_rule_count",
 		id, strings.TrimSpace(input.Name), stepsJSON, claims.Sub)
 	if err != nil {
 		return internalError("update policy", err)
