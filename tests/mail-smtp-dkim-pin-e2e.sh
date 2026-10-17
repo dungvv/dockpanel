@@ -32,40 +32,54 @@
 #
 # No running panel needed.
 #   run: bash tests/mail-smtp-dkim-pin-e2e.sh
+#
+# Subjects (Go): panel/go/internal/agent/routes/mail.go and the agent unit
+# panel/go/internal/agent/services/dockpanel-agent.service (go:embed). Arms
+# that assert behaviour a test can call directly live in
+# panel/go/internal/agent/routes/pin_mail_smtp_dkim_test.go.
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MAIL="$REPO/panel/agent/src/routes/mail.rs"
-AGENT_UNIT="$REPO/panel/agent/dockpanel-agent.service"
+MAIL="$REPO/panel/go/internal/agent/routes/mail.go"
+AGENT_UNIT="$REPO/panel/go/internal/agent/services/dockpanel-agent.service"
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
+for f in "$MAIL" "$AGENT_UNIT"; do
+  [ -f "$f" ] || { echo "missing source file: $f"; exit 1; }
+done
+
 # Strip comments per language. s261 shipped a stripper that removed `//` from
 # SHELL files and ate every http:// URL, reporting two false failures against
 # correct code — a comment-blind pin needs a comment model that matches the file.
-strip_rust()  { sed -E 's;[[:space:]]*//.*$;;' "$1"; }
+# Go: `/* … */` blocks, and `//` only at line start or after whitespace (so a
+# `http://` inside a string literal survives).
+strip_go()    { perl -0777 -pe 's{/\*.*?\*/}{}gs; s{(^|[ \t])//[^\n]*}{$1}gm' "$1"; }
 strip_shell() { sed -E 's/(^|[[:space:]])#.*$//' "$1"; }
 
-CODE="$(strip_rust "$MAIL")"
+CODE="$(strip_go "$MAIL")"
 # systemd units comment with '#', same as shell.
 UNIT="$(strip_shell "$AGENT_UNIT")"
 
 has()  { grep -qF -- "$2" <<<"$1"; }
 hasre(){ grep -qE -- "$2" <<<"$1"; }
+# Body of a top-level Go func: from `func NAME(` to the next top-level item.
+fnbody() { FN="$2" perl -0777 -ne 'my $n=$ENV{FN}; print $1 if /(\nfunc \Q$n\E\(.*?)(?=\n(?:func |const |var |type )|\z)/s' <<<"$1"; }
 
 echo "── A. the installer must not write a path the sandbox refuses ──"
-if has "$CODE" 'const OPENDKIM_CONF: &str = "/etc/dockpanel/opendkim.conf"'; then
+if hasre "$CODE" 'mailOpendkimConf[[:space:]]*=[[:space:]]*"/etc/dockpanel/opendkim\.conf"'; then
   ok "OpenDKIM config lives under /etc/dockpanel (inside ReadWritePaths)"
 else
-  bad "OPENDKIM_CONF is no longer the ReadWritePaths-safe path"
+  bad "mailOpendkimConf is no longer the ReadWritePaths-safe path"
 fi
-if hasre "$CODE" 'write_file_atomic\("/etc/opendkim\.conf"'; then
-  bad "installer writes /etc/opendkim.conf again — EROFS under ProtectSystem=strict"
+# Absence over the whole comment-stripped file; the arm above is its anchor.
+if has "$CODE" '"/etc/opendkim.conf"'; then
+  bad "installer names /etc/opendkim.conf again — EROFS under ProtectSystem=strict"
 else
   ok "nothing writes the distro /etc/opendkim.conf"
 fi
-if hasre "$CODE" 'ExecStart=/usr/sbin/opendkim (-f )?-x '; then
+if hasre "$CODE" 'ExecStart=/usr/sbin/opendkim (-f )?-x " \+ mailOpendkimConf'; then
   ok "systemd drop-in points opendkim at our config"
 else
   bad "drop-in missing — daemon would read the stock config"
@@ -89,87 +103,78 @@ else
 fi
 
 echo "── B. every domain must be bound to its key ──"
-if has "$CODE" 'async fn rebuild_dkim_tables()'; then
-  ok "rebuild_dkim_tables() exists"
+if has "$CODE" 'func mailRebuildDkimTables() error'; then
+  ok "mailRebuildDkimTables() exists"
 else
-  bad "rebuild_dkim_tables() gone — nothing populates the DKIM tables"
+  bad "mailRebuildDkimTables() gone — nothing populates the DKIM tables"
 fi
-for caller in 'DKIM keys generated for {domain} but tables not rebuilt' \
-              'DKIM keys removed for {domain} but tables not rebuilt'; do
+for caller in 'DKIM keys generated for %s but tables not rebuilt' \
+              'DKIM keys removed for %s but tables not rebuilt'; do
   if has "$CODE" "$caller"; then
     ok "table rebuild wired into: ${caller:5:24}…"
   else
     bad "a key-mutating path no longer rebuilds the tables"
   fi
 done
-# The whole point of the helper: derived from disk, so callers cannot drift.
-if hasre "$CODE" 'key_lines\.push\(format!\("\{selector\}\._domainkey'; then
-  ok "key.table entries are derived from the keys on disk"
+# B-keytable retired: covered by TestPinMailSmtpDkimTablesAreDerivedFromTheKeysOnDisk (panel/go/internal/agent/routes/pin_mail_smtp_dkim_test.go)
+# B-signingtable retired: covered by TestPinMailSmtpDkimTablesAreDerivedFromTheKeysOnDisk (panel/go/internal/agent/routes/pin_mail_smtp_dkim_test.go)
+# The rebuild must read the tables from that same derivation, not a copy.
+if has "$(fnbody "$CODE" mailRebuildDkimTables)" 'mailDkimTableLines(mailDkimKeysDir)'; then
+  ok "mailRebuildDkimTables writes what mailDkimTableLines derives from disk"
 else
-  bad "key.table no longer derived from disk"
-fi
-if hasre "$CODE" 'signing_lines\.push\(format!\("\*@\{domain\}'; then
-  ok "signing.table maps every address of the domain to its key"
-else
-  bad "signing.table entry shape changed"
+  bad "mailRebuildDkimTables no longer derives the tables from the keys on disk"
 fi
 
 echo "── C. the ports the mail stack listens on must be opened ──"
-if has "$CODE" 'async fn open_mail_ports()' && has "$CODE" 'open_mail_ports().await'; then
-  ok "open_mail_ports() exists and is called by the installer"
+if has "$CODE" 'func mailOpenMailPorts()' && has "$(fnbody "$CODE" mailInstall)" 'mailOpenMailPorts()'; then
+  ok "mailOpenMailPorts() exists and is called by the installer"
 else
   bad "mail ports are no longer opened — inbound mail cannot arrive"
 fi
-for p in '"25"' '"587"' '"993"' '"143"'; do
-  if has "$CODE" "$p"; then ok "port $p in MAIL_PORTS"; else bad "port $p missing from MAIL_PORTS"; fi
-done
+# C-ports (25/587/993/143) retired: covered by TestPinMailSmtpDkimMailPortsCoverEveryListener (panel/go/internal/agent/routes/pin_mail_smtp_dkim_test.go)
 
 echo "── D. HELO name, and the mydestination trap it opens ──"
-if has "$CODE" 'myhostname={host}'; then
+if has "$CODE" '"myhostname="+host'; then
   ok "myhostname set from the panel vhost"
 else
   bad "myhostname unset — HFILTER_HELO_5 costs 3 spam points"
 fi
-if has "$CODE" 'mydestination=localhost' && has "$CODE" 'mydestination = localhost'; then
+if has "$CODE" '"mydestination=localhost"' && hasre "$CODE" '^mydestination = localhost$'; then
   ok "mydestination narrowed to localhost in BOTH the postconf call and main.cf"
 else
   bad "mydestination not narrowed — a hosted domain becomes local and bounces"
 fi
 
 echo "── E. a re-run must never erase hosted mail ──"
-if hasre "$CODE" 'if !Path::new\(path\).exists\(\)'; then
+if hasre "$CODE" 'for _, p := range \[\]string\{mailPostfixVirtualDomains' && hasre "$CODE" 'if !mailExists\(p\) \{'; then
   ok "map files are created only when absent"
 else
   bad "map files truncated unconditionally — a re-run erases every mailbox"
 fi
-if hasre "$CODE" 'let has_active_submission'; then
+if has "$CODE" '!strings.HasPrefix(t, "#") && strings.HasPrefix(t, "submission")'; then
   ok "submission guard tests for an ACTIVE entry, not the commented stock line"
 else
   bad "submission guard back to substring match — re-runs duplicate the service"
 fi
 
 echo "── F. TLS the clients can actually verify ──"
-if has "$CODE" 'fn panel_tls_paths()'; then
-  ok "panel_tls_paths() exists"
+if has "$CODE" 'func mailPanelTlsPaths()'; then
+  ok "mailPanelTlsPaths() exists"
 else
-  bad "panel_tls_paths() gone — Dovecot falls back to snakeoil"
+  bad "mailPanelTlsPaths() gone — Dovecot falls back to snakeoil"
 fi
-if has "$CODE" 'ssl_cert = <{cert}'; then
+if has "$CODE" 'ssl_cert = <%s'; then
   ok "Dovecot is handed the real certificate when the box has one"
 else
   bad "Dovecot ssl_cert no longer wired — Roundcube gets 'unknown ca'"
 fi
-if has "$CODE" "frame-ancestors 'self'"; then
-  ok "webmail location allows same-origin framing"
-else
-  bad "webmail inherits frame-ancestors 'none' — the inbox renders empty"
-fi
+# F-frame-ancestors retired: covered by TestPinWebmailSpamFragmentRedeclaresSameOriginFraming (panel/go/internal/agent/routes/pin_webmail_spam_test.go)
 
 echo "── G. honest status ──"
-if has "$CODE" '"configured": configured'; then
-  ok "mail_status reports whether the install actually configured the box"
+if has "$(fnbody "$CODE" mailStatus)" '"configured": configured'; then
+  ok "mailStatus reports whether the install actually configured the box"
 else
-  bad "mail_status back to package-presence only — a failed install reads healthy"
+  bad "mailStatus back to package-presence only — a failed install reads healthy"
 fi
 
 echo "── H. invariants this fix must not break ──"
@@ -190,9 +195,9 @@ fi
 # loopback port needs neither — and is what s268 moved to, because the spool
 # socket is a Debian-chroot artifact that SELinux forbids on RHEL. Accept
 # either, reject a spool socket with no group grant.
-if hasre "$CODE" 'OPENDKIM_SOCKET: &str = "inet:[0-9]+@127\.0\.0\.1"'; then
+if hasre "$CODE" 'mailOpendkimSocket[[:space:]]*=[[:space:]]*"inet:[0-9]+@127\.0\.0\.1"'; then
   ok "milter is a loopback port — reachable from inside Postfix's chroot and out, no group needed"
-elif has "$CODE" 'safe_command_unsandboxed("gpasswd"'; then
+elif has "$CODE" 'mailUnsandboxed("gpasswd"'; then
   ok "group edit uses the documented unsandboxed escape (/etc/group is read-only)"
 else
   bad "milter socket is group-owned but nothing adds postfix to the group — Postfix cannot reach it"

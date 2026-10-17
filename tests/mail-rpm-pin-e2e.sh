@@ -41,9 +41,13 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-AGENT_MAIL=panel/agent/src/routes/mail.rs
-BACKEND_MAIL=panel/backend/src/routes/mail.rs
-PKG=panel/agent/src/services/pkg.rs
+AGENT_MAIL=panel/go/internal/agent/routes/mail.go
+BACKEND_MAIL=panel/go/internal/api/rt_mail.go
+PKG=panel/go/internal/agent/services/pkg.go
+
+for f in "$AGENT_MAIL" "$BACKEND_MAIL" "$PKG"; do
+  [ -f "$f" ] || { echo "FATAL: missing subject $f"; exit 1; }
+done
 SETUP=scripts/setup.sh
 
 # Production code only. These files carry long comments that NAME the very
@@ -59,11 +63,12 @@ SETUP=scripts/setup.sh
 # about pins is indistinguishable from pins failing, which is how you end up
 # "fixing" correct code.
 #
-# It also stops at `#[cfg(test)]`. The unit tests legitimately call the plain
-# hash function to assert what it produces, and counting those as production
-# call sites made this suite demand that its own tests be rewritten — the same
-# scoping s267 had to add for the `--pipe` pin (#94c).
-code()  { sed '/#\[cfg(test)\]/q' "$1" | grep -vE '^[[:space:]]*(///|//!|//|\*|/\*)'; }
+# Go keeps unit tests in separate _test.go files, so the subjects are already
+# production-only (the Rust-era `#[cfg(test)]` cut-off has no Go meaning: the
+# tests that call the plain hash function live in rt_mail_test.go).
+code()  { grep -vE '^[[:space:]]*(//|\*|/\*)' "$1"; }
+# Body of a top-level Go func, comment lines stripped.
+fnbody() { code "$1" | awk -v fn="$2" 'index($0, "func " fn "(") == 1 {i=1; next} i && /^}/ {exit} i {print}'; }
 has()   { [ -n "$(code "$1" | grep -F -- "$2")" ]; }
 hasre() { [ -n "$(code "$1" | grep -E -- "$2")" ]; }
 
@@ -98,7 +103,8 @@ fi
 
 # The durable half: whatever anchor is emitted must be existence-checked first.
 if has "$AGENT_MAIL" 'TrustAnchorFile'; then
-  if has "$AGENT_MAIL" 'root.key' && has "$AGENT_MAIL" 'Path::new(p).exists()'; then
+  if has "$AGENT_MAIL" 'root.key' \
+     && [ -n "$(fnbody "$AGENT_MAIL" mailWriteOpendkimConfig | grep -A1 -F 'if mailExists(p) {' | grep -F '"TrustAnchorFile " + p')" ]; then
     ok "the trust anchor is emitted only when the file exists"
   else
     bad "a TrustAnchorFile is emitted with no existence check — a missing anchor is FATAL to opendkim"
@@ -111,7 +117,12 @@ echo "── 3. R3+R4: the OpenDKIM arrangement does not depend on the distro's 
 
 # R4: the socket must not live under Postfix's spool. Assert on the emitted
 # CONFIG VALUE, not on a constant name a rename could dodge.
-if hasre "$AGENT_MAIL" 'Socket (local:)?/?var/spool/postfix'; then
+# In Go the Socket line is `"Socket " + mailOpendkimSocket`, so the value is the
+# constant's; both must be read, or the absence check below sees nothing.
+sockconst=$(code "$AGENT_MAIL" | grep -E '^[[:space:]]*mailOpendkimSocket[[:space:]]*=')
+if [ -z "$sockconst" ] || ! has "$AGENT_MAIL" '"Socket " + mailOpendkimSocket'; then
+  bad "could not read the emitted Socket value — the chroot arm would measure nothing"
+elif hasre "$AGENT_MAIL" 'Socket (local:)?/?var/spool/postfix' || grep -q 'var/spool/postfix' <<< "$sockconst"; then
   bad "the milter socket is back inside Postfix's chroot — SELinux denies dkim_milter_t search on postfix_spool_t"
 else
   ok "the milter socket is not inside Postfix's chroot"
@@ -153,15 +164,15 @@ fi
 
 # It must be CALLED, not merely defined — the exact mutation that slipped
 # through s265's pin review twice (#92c).
-if has "$AGENT_MAIL" 'label_vmail_for_selinux().await'; then
+if hasre "$AGENT_MAIL" '^[[:space:]]+mailLabelVmailForSelinux\(\)[[:space:]]*$'; then
   ok "the labelling helper is actually called from the installer"
 else
-  bad "label_vmail_for_selinux is defined but never called — the pin would sit green through the regression"
+  bad "mailLabelVmailForSelinux is defined but never called — the pin would sit green through the regression"
 fi
 
 echo "── 5. R6: mailbox passwords are hashed in a scheme the target box can verify ──"
 
-if has "$BACKEND_MAIL" 'dovecot_password_hash_for'; then
+if has "$BACKEND_MAIL" 'func rtMailDovecotPasswordHashFor('; then
   ok "a scheme-aware hash function exists"
 else
   bad "mailbox passwords are hashed with no regard for what the box's Dovecot supports"
@@ -170,11 +181,12 @@ fi
 # Count the CALL SITES: creation and password-change both mint hashes, and a
 # change that reverts to Argon2id locks a working mailbox out (#92b).
 # Exclude the definition line and the internal delegation inside
-# dovecot_password_hash_for, which legitimately calls the plain function.
-raw=$(code "$BACKEND_MAIL" | grep -nE 'dovecot_password_hash\(' \
-      | grep -vE 'fn dovecot_password_hash\(' \
-      | grep -vE 'return dovecot_password_hash\(password\)' | wc -l)
-aware=$(code "$BACKEND_MAIL" | grep -cE 'dovecot_password_hash_for\(' )
+# rtMailDovecotPasswordHashFor, which legitimately calls the plain function.
+# (Which scheme it picks is TestMail* in panel/go/internal/api/rt_mail_test.go.)
+raw=$(code "$BACKEND_MAIL" | grep -nE 'rtMailDovecotPasswordHash\(' \
+      | grep -vE 'func rtMailDovecotPasswordHash\(' \
+      | grep -vE 'return rtMailDovecotPasswordHash\(password\)' | wc -l)
+aware=$(code "$BACKEND_MAIL" | grep -cE 'rtMailDovecotPasswordHashFor\(' )
 aware=$((aware - 1))  # minus its own definition
 if [ "$raw" -eq 0 ] && [ "$aware" -ge 2 ]; then
   ok "every mailbox-password call site ($aware) goes through the scheme-aware path"
@@ -192,9 +204,12 @@ fi
 echo "── 6. The apt-only call sites the s266 conversion missed ──"
 
 # mail.rs had TWO raw apt-get call sites after s266 converted the installers.
+# Positive anchor: the installer goes through the family-aware PkgInstall.
 stray_apt=$(code "$AGENT_MAIL" | grep -n 'apt-get')
-if [ -n "$stray_apt" ]; then
-  bad "mail.rs still shells apt-get directly, so the path is Debian-only:${stray_apt}"
+if ! has "$AGENT_MAIL" 'services.PkgInstall('; then
+  bad "the mail routes no longer call services.PkgInstall — the apt-get absence check below would measure nothing"
+elif [ -n "$stray_apt" ]; then
+  bad "mail.go still shells apt-get directly, so the path is Debian-only:${stray_apt}"
 else
   ok "no raw apt-get call site left in the mail routes"
 fi
@@ -203,26 +218,31 @@ fi
 # enable/restart silently targets a unit that does not exist.
 if hasre "$AGENT_MAIL" 'systemctl.*"enable", "rspamd", "redis-server"'; then
   bad "rspamd's installer enables the literal unit redis-server — that unit does not exist on the RHEL family"
+elif ! has "$AGENT_MAIL" 'redisUnit := services.PkgServiceName("redis-server")' \
+     || ! has "$AGENT_MAIL" '"systemctl", "enable", "rspamd", redisUnit'; then
+  bad "the rspamd installer no longer enables a translated Redis unit"
 else
   ok "the Redis unit name is translated rather than hardcoded"
 fi
 
-echo "── 7. mail_status cannot call a crash-looping stack healthy ──"
+echo "── 7. mailStatus cannot call a crash-looping stack healthy ──"
 
 # `configured` was added at s262 for this class; s268 found opendkim excluded
 # from the summary entirely, so a milter in a restart loop read as running.
-if has "$AGENT_MAIL" 'let running = postfix && dovecot && opendkim && configured'; then
-  ok "mail_status's running verdict includes OpenDKIM"
+if has "$AGENT_MAIL" 'running := postfix && dovecot && opendkim && configured'; then
+  ok "mailStatus's running verdict includes OpenDKIM"
 else
-  bad "mail_status omits OpenDKIM from its running verdict — a DKIM milter in a restart loop reads as healthy"
+  bad "mailStatus omits OpenDKIM from its running verdict — a DKIM milter in a restart loop reads as healthy"
 fi
 
 echo "── 8. The mail log path is not a Debian hardcode ──"
 
 if has "$AGENT_MAIL" '"-n", "5000", "/var/log/mail.log"'; then
-  bad "mail_logs tails the Debian-only path — the RHEL family writes /var/log/maillog and the page reads all zeros"
+  bad "mailLogs tails the Debian-only path — the RHEL family writes /var/log/maillog and the page reads all zeros"
+elif ! has "$AGENT_MAIL" '"tail", "-n", "5000", mailLogPath()'; then
+  bad "mailLogs no longer tails the resolved mailLogPath()"
 else
-  ok "mail_logs resolves the log path instead of hardcoding Debian's"
+  ok "mailLogs resolves the log path instead of hardcoding Debian's"
 fi
 
 if has "$AGENT_MAIL" '/var/log/maillog'; then
@@ -233,7 +253,7 @@ fi
 
 echo "── 9. The refusal matches what was actually verified ──"
 
-# A refusal that stops being true is worse than no refusal (pkg.rs's own words).
+# A refusal that stops being true is worse than no refusal (pkg.go's own words).
 # The blanket family ban is gone; what remains must be a real precondition.
 if has "$PKG" 'not supported on RHEL-family distributions yet'; then
   bad "the blanket RHEL mail refusal is back, but the vertical has been driven end to end there"
@@ -251,13 +271,15 @@ if [ -n "$(code "$PKG" | grep -F 'nothing provides')" ] \
 else
   bad "nothing explains 'nothing provides' — the operator gets a raw dnf error with no action"
 fi
-if [ -n "$(code "$AGENT_MAIL" | grep -F 'explain_package_failure')" ]; then
+if [ -n "$(code "$AGENT_MAIL" | grep -F 'services.PkgExplainPackageFailure(')" ]; then
   ok "the mail installer routes its package failure through the explainer"
 else
   bad "the explainer exists but the mail installer does not call it"
 fi
-if [ -n "$(code "$PKG" | grep -A 4 'fn mail_refusal_reason' | grep -F 'available(')" ]; then
-  bad "mail_refusal_reason gates on an availability probe again — it cannot run reliably inside the agent sandbox and refuses good boxes"
+if ! has "$PKG" 'func PkgMailRefusalReason() string {'; then
+  bad "PkgMailRefusalReason is gone — the availability-probe check below would measure nothing"
+elif [ -n "$(fnbody "$PKG" PkgMailRefusalReason | grep -E 'Available\(|available\(')" ]; then
+  bad "PkgMailRefusalReason gates on an availability probe again — it cannot run reliably inside the agent sandbox and refuses good boxes"
 else
   ok "no availability-probe gate in front of the mail installer"
 fi

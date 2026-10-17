@@ -41,6 +41,11 @@
 # green at BOTH tags on purpose — they assert the fix did not weaken the webhook's
 # authentication while making it reachable.
 #
+# Go port: the handlers are rtWhmcsUpdateConfig / rtWhmcsWebhook in
+# panel/go/internal/api/rt_whmcs.go; migrations ship from
+# panel/go/internal/api/migrations. W4's Rust `.ok().flatten()` is, in Go, a
+# queryOpt whose err is ignored — so W4 now pins the propagation directly.
+#
 # Pure source analysis: no box, no network, no build.
 
 set -uo pipefail
@@ -58,9 +63,9 @@ bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 # than a broken arm. `grep -c` reads to EOF, and its exit status is still 0 on a
 # match, so this is the same boolean with no early exit.
 qgrep() { grep -c "$@" >/dev/null; }
-BE=panel/backend/src
+BE=panel/go/internal/api
 FE=panel/frontend/src
-MIG=panel/backend/migrations
+MIG=panel/go/internal/api/migrations
 
 for d in "$BE" "$FE" "$MIG"; do
   [ -d "$d" ] || { echo "missing dir: $d — refusing to report a clean sweep"; exit 1; }
@@ -72,13 +77,12 @@ done
 code() {
   [ -f "$1" ] || return 0
   perl -0777 -pe '
-    s{^[ \t]*/\*.*?\*/[ \t]*$}{}gms;
+    s{/\*.*?\*/}{}gs;
     s{^\s*//.*$}{}gm;
-    s{^\s*///.*$}{}gm;
   ' "$1"
 }
 
-WH="$BE/routes/whmcs.rs"
+WH="$BE/rt_whmcs.go"
 INT="$FE/pages/Integrations.tsx"
 [ -f "$WH" ]  || { echo "missing $WH — refusing to report a clean sweep";  exit 1; }
 [ -f "$INT" ] || { echo "missing $INT — refusing to report a clean sweep"; exit 1; }
@@ -102,9 +106,9 @@ else
 fi
 
 # W2. The upsert's DO UPDATE SET must assign the webhook secret column. Scoped to
-# the statement, bounded on its closing quote, so a mention elsewhere in the file
-# cannot satisfy it.
-UPSERT=$(code "$WH" | perl -0777 -ne 'print $1 if /(INSERT INTO whmcs_config.*?DO UPDATE SET.*?)"\s*\)/s')
+# the statement, bounded on its closing quote (the first concatenated literal
+# that ends `",` rather than `"+`), so a mention elsewhere cannot satisfy it.
+UPSERT=$(code "$WH" | perl -0777 -ne 'print $1 if /(INSERT INTO whmcs_config.*?DO UPDATE SET.*?)",[ \t]*$/ms')
 if [ -z "$UPSERT" ]; then
   bad "W2 could not extract the whmcs_config upsert — the arm has no subject, not a passing result"
 elif printf '%s' "$UPSERT" | qgrep -E 'webhook_secret *='; then
@@ -114,28 +118,32 @@ else
 fi
 
 # W3. Minting must be conditional on there being no stored secret. Keyed on the
-# operation (a fallback), not on the mint call, which exists in both versions.
-if code "$WH" | qgrep -E 'unwrap_or_else\(\|\| *uuid::Uuid::new_v4'; then
+# operation (a fallback), not on the mint call, which exists in both versions:
+# the stored secret is used when present, and the mint is the else branch.
+if code "$WH" | perl -0777 -ne 'exit(/if (\w+) != nil \{\s*webhookSecret = [^\n]*\*\1\b[^\n]*\n\s*\} else \{\s*webhookSecret = [^\n]*uuid\.NewString\(\)/ ? 0 : 1)'; then
   ok "W3 a webhook secret is minted only when none is stored, so a save cannot invalidate the configured hook"
 else
   bad "W3 the webhook secret is minted unconditionally — every save rotates it out from under WHMCS"
 fi
 
 # W4. The current-config read must propagate rather than substitute defaults.
-CUR=$(code "$WH" | perl -0777 -ne 'print $1 if /(SELECT auto_provision.*?;)/s')
+# Go: the read is `x, err := queryOpt(... "SELECT auto_provision ...")`; the
+# swallow would be an err that is dropped or does not return.
+CUR=$(code "$WH" | perl -0777 -ne 'print $1 if /(\w+, err :?= queryOpt\[[^\n]*\n\s*"SELECT auto_provision[^\n]*\n[^\n]*\)[ \t]*\n\s*if err != nil \{\s*return [^\n]*)/s')
 if [ -z "$CUR" ]; then
-  bad "W4 could not extract the current-config read — the arm has no subject"
-elif printf '%s' "$CUR" | qgrep 'ok()'; then
-  bad "W4 the current-config read still swallows a database error, so a blip resets the operator's flags"
-else
+  bad "W4 the current-config read (SELECT auto_provision ...) is not followed by an err check that returns — a blip resets the operator's flags"
+elif printf '%s' "$CUR" | qgrep -E 'return (internalError|apiErr)\('; then
   ok "W4 a failed current-config read is an error, not a silent reset to defaults"
+else
+  bad "W4 the current-config read's err branch does not return an error, so a blip resets the operator's flags"
 fi
 
 # W5. The webhook must accept the secret from the query string, because that is
 # the shape the panel prints. Two halves: the handler takes a Query extractor, and
 # the verification actually consults it.
-if code "$WH" | qgrep -E 'Query\([a-z_]+\): *Query<' \
-   && code "$WH" | qgrep -E '\.or\([a-z_]+\.secret\.as_deref\(\)\)'; then
+WEBHOOK=$(code "$WH" | perl -0777 -ne 'print $1 if /(^func rtWhmcsWebhook\(.*?^\})/ms')
+if printf '%s' "$WEBHOOK" | qgrep -E 'decodeQuery\(r, &([a-z]+)\)' \
+   && printf '%s' "$WEBHOOK" | qgrep -E 'provided = \*q\.Secret'; then
   ok "W5 the webhook reads the secret from the query string as well as the body, so the printed URL works"
 else
   bad "W5 the webhook still ignores a query-string secret, so the address the panel prints answers 401"
@@ -144,7 +152,7 @@ fi
 # W6. CONTROL — green at both tags. The comparison must stay constant-time; a fix
 # that made the hook reachable while weakening its authentication would be worse
 # than the defect.
-if code "$WH" | qgrep 'ct_eq'; then
+if code "$WH" | qgrep -E 'subtle\.ConstantTimeCompare\(\[\]byte\(provided\), \[\]byte\(expected\)\) != 1'; then
   ok "W6 CONTROL the webhook secret is still compared in constant time"
 else
   bad "W6 CONTROL the constant-time comparison is gone — the fix weakened authentication"

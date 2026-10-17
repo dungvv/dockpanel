@@ -5,7 +5,8 @@
 #
 # WHY THIS SUITE EXISTS, measured rather than asserted: before it, the mail
 # authorisation predicate had NO test coverage of any kind. Stripping the
-# administrator role term out of `MAIL_DOMAIN_CALLER_PREDICATE` — the single term
+# administrator role term out of the mail-domain caller predicate (now
+# `rtMailMailDomainCallerPredicate`, panel/go/internal/api/rt_mail.go) — the single term
 # that stood between any authenticated caller and every mailbox in the fleet —
 # was run against the whole corpus at s348 and produced **0 red across 59 pin
 # suites and 338 unit tests**. 397 checks, none of which noticed. A SQL string
@@ -18,11 +19,11 @@
 #       the distinct-owner quantifier are the two clauses that make it safe, and
 #       both are one deletion away from a silent cross-tenant grant.
 #   §C  the DOORS — which handlers a site owner reaches, and which must stay shut.
-#       `update_domain` writes `catch_all`, a mail-interception primitive; the
+#       `rtMailUpdateDomain` writes `catch_all`, a mail-interception primitive; the
 #       arm below is what stops a future session opening it "for symmetry".
 #   §D  the ADDRESS SHAPE — the local part is a filesystem path component and a
 #       Postfix map key, on both sides of the panel/agent seam.
-#   §E  create_domain NAMES the account it grants mailboxes to.
+#   §E  rtMailCreateDomain NAMES the account it grants mailboxes to.
 #
 # Pure source analysis: no box, no network, no build.
 
@@ -35,8 +36,8 @@ FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-MAIL="$REPO/panel/backend/src/routes/mail.rs"
-AGENT="$REPO/panel/agent/src/routes/mail.rs"
+MAIL="$REPO/panel/go/internal/api/rt_mail.go"
+AGENT="$REPO/panel/go/internal/agent/routes/mail.go"
 
 for f in "$MAIL" "$AGENT"; do
   [ -f "$f" ] || { echo "FATAL: missing subject $f"; exit 1; }
@@ -45,63 +46,57 @@ done
 # Strip comments before measuring. A pin greps RAW SOURCE, so without this every
 # arm below would match the sentence that DESCRIBES the check rather than the
 # check — and this file's subjects are unusually heavily commented, precisely
-# because the reasoning is the load-bearing part.
+# because the reasoning is the load-bearing part. Go comments: whole-line `//`
+# and `/* */` blocks, plus trailing `//` not inside a URL or string.
 code() {
   perl -0777 -pe '
-    s{^[ \t]*/\*.*?\*/[ \t]*$}{}gms;
-    s{^\s*///.*$}{}gm;
+    s{/\*.*?\*/}{}gs;
     s{^\s*//.*$}{}gm;
+    s{(\s)//[^"\n]*$}{$1}gm;
   ' "$1"
 }
 
 has()         { grep -qE -- "$2" <<< "$1"; }
 occurrences() { grep -oE -- "$2" <<< "$1" | wc -l; }
 
-# PRODUCTION code only. A `#[cfg(test)]` module is not a call site, and an arm
-# that counted both would pass on the strength of the tests written beside it —
-# the same false-green shape as an arm that only tests for presence. Both test
-# modules in these files sit at the end, and the guard below refuses to run if
-# that ever stops being true and this stripper starts eating real code.
-prod() { perl -0777 -pe 's/#\[cfg\(test\)\]\s*mod\s+\w+\s*\{.*//s' <<< "$1"; }
+# Go keeps tests in separate _test.go files, so the subjects above ARE production
+# code; the Rust-era `#[cfg(test)]` stripper has no Go meaning.
 
-# The VALUE of a `const NAME: &str = "...";`, with Rust's line continuations
-# resolved, so the arms below measure the string the database actually receives
+# The concatenation of every Go string literal in a text: a SQL string built as
+# "a " + "b" + ... is measured as the string the database actually receives,
 # rather than however it happens to be wrapped in the source.
+golits() { perl -0777 -ne 'my $o=""; while (/"((?:[^"\\\n]|\\.)*)"/g) { $o .= $1 } print $o' <<< "$1"; }
+
+# The VALUE of a `const NAME = "..." + "..."` (up to the first line that does
+# not end in `+`), concatenated.
 const_value() {
-  perl -0777 -ne '
-    if (/const \Q'"$2"'\E: &str = "(.*?)";/s) { my $v = $1; $v =~ s/\\\n\s*/ /g; print $v }
-  ' <<< "$1"
+  golits "$(awk -v n="$2" 'index($0, "const " n " =") == 1 {i=1} i {print} i && !/\+[[:space:]]*$/ {exit}' <<< "$1")"
 }
 
-# The body of one top-level fn, bounded by the NEXT top-level fn — never a fixed
-# `-A n` window, which is not a function and has printed confident greens from
-# the following function's text (lesson #131).
+# The body of one top-level func (or method), bounded by its closing `}` at
+# column 0 — never a fixed `-A n` window, which is not a function and has
+# printed confident greens from the following function's text (lesson #131).
 fnbody() {
-  awk -v name="$2" '
-    /^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn / {
-      if ($0 ~ "(pub |pub\\(crate\\) )?(async )?fn " name "\\(") { inside=1; next }
-      inside=0
-    }
-    inside { print }
+  awk -v fn="$2" '
+    !inb && (index($0, "func " fn "(") == 1 || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) {inb=1; next}
+    inb && /^}/ {exit}
+    inb {print}
   ' <<< "$1"
 }
 
-# The extractor an async handler declares, read from its SIGNATURE only. The
-# signature ends at the first line that is exactly `) -> ...`, so a mention of
-# either type in the body cannot answer this question.
+# The extractor a Go handler applies: its FIRST auth call. st.authUser is
+# AuthUser; st.adminUser and rtMailAdminScope (AdminUser + ServerScope) are
+# AdminUser. A later mention in the body cannot answer this question.
 extractor_of() {
-  awk -v name="$2" '
-    $0 ~ "^pub async fn " name "\\(" { inside=1; next }
-    inside && /^\)/                  { exit }
-    inside                           { print }
-  ' <<< "$1" | grep -oE 'AdminUser|AuthUser' | head -1
+  fnbody "$1" "$2" | grep -oE 'st\.authUser\(|st\.adminUser\(|rtMailAdminScope\(' | head -1 \
+    | sed -e 's/st\.authUser(/AuthUser/' -e 's/st\.adminUser(/AdminUser/' -e 's/rtMailAdminScope(/AdminUser/'
 }
 
 M=$(code "$MAIL")
 A=$(code "$AGENT")
 [ -n "$M" ] && [ -n "$A" ] || { echo "FATAL: comment stripper emptied a subject"; exit 1; }
 
-PRED=$(const_value "$M" MAIL_DOMAIN_CALLER_PREDICATE)
+PRED=$(const_value "$M" rtMailMailDomainCallerPredicate)
 
 echo
 echo "§A  the administrator arm"
@@ -139,8 +134,8 @@ else
   fi
 
   # ⚠ THE ARM FOR THE REGRESSION THAT LOOKS LIKE A TIDY-UP. A row naming no
-  # server must stay reachable (agent_for_site_server answers 409 by name, and
-  # sync_mail_config's precondition counts exactly these rows) — but it must be
+  # server must stay reachable (agentForSiteServer answers 409 by name, and
+  # rtMailSyncMailConfig's precondition counts exactly these rows) — but it must be
   # reachable only to an ADMINISTRATOR. As a free-standing first disjunct it
   # carried no caller term at all, which was harmless while every door was
   # admin-only and is a grant to every site owner in the installation now that
@@ -204,8 +199,8 @@ echo "§C  the doors"
 # and the DNS read the page fires on every domain click (without it a client's
 # DNS tab paints blank and silently, which is the one screen they need to publish
 # DKIM and SPF).
-for h in list_domains domain_dns list_accounts create_account update_account \
-         delete_account list_aliases create_alias delete_alias; do
+for h in rtMailListDomains rtMailDomainDns rtMailListAccounts rtMailCreateAccount rtMailUpdateAccount \
+         rtMailDeleteAccount rtMailListAliases rtMailCreateAlias rtMailDeleteAlias; do
   e=$(extractor_of "$M" "$h")
   case "$e" in
     AuthUser) ok "$h is reachable by a site owner" ;;
@@ -215,11 +210,11 @@ for h in list_domains domain_dns list_accounts create_account update_account \
 done
 
 # ⚠ These must STAY shut, and the reasons are not symmetric with the list above.
-# `update_domain` is the only writer of `catch_all`, which redirects a whole
-# domain's mail; `create_domain` mints the entitlement itself; `delete_domain`
+# `rtMailUpdateDomain` is the only writer of `catch_all`, which redirects a whole
+# domain's mail; `rtMailCreateDomain` mints the entitlement itself; `rtMailDeleteDomain`
 # destroys mailboxes; the two DNS-verification endpoints reach the network on the
 # caller's behalf. Each is one word away from being opened "for consistency".
-for h in create_domain update_domain delete_domain dns_check preflight; do
+for h in rtMailCreateDomain rtMailUpdateDomain rtMailDeleteDomain rtMailDnsCheck rtMailPreflight; do
   e=$(extractor_of "$M" "$h")
   case "$e" in
     AdminUser) ok "$h remains administrator-only" ;;
@@ -242,11 +237,11 @@ done
 # So the two are compared to each other, normalised. Drift in either direction
 # fails, and neither can be widened without the other noticing.
 norm()         { tr -s ' \n\\' ' ' <<< "$1" | sed 's/^ *//; s/ *$//'; }
-owner_clause() { grep -oE 'EXISTS \( SELECT 1 FROM sites s WHERE.*s2\.user_id <> \$2\)' <<< "$(norm "$1")"; }
+owner_clause() { grep -oE 'EXISTS \( ?SELECT 1 FROM sites s WHERE.*s2\.user_id <> \$2\)' <<< "$(norm "$1")"; }
 
-LD=$(fnbody "$M" list_domains)
+LD=$(golits "$(fnbody "$M" rtMailListDomains)")
 if [ -z "$LD" ]; then
-  bad "§C: could not extract list_domains"
+  bad "§C: could not extract rtMailListDomains"
 else
   # The list has an ADMINISTRATOR branch of its own — it is the only place the
   # `ServerScope`-scoped fleet-wide read still happens — and that branch has its
@@ -279,11 +274,11 @@ echo "§D  the address shape, on both sides of the seam"
 # local part. Every call site must go through the structural check instead, or
 # `@example.com` collides with the domain's catch-all key in virtual_mailbox_maps
 # and `..@example.com` resolves one level above the domain's maildir.
-MP=$(prod "$M")
-if [ -z "$MP" ] || ! has "$MP" 'const MAIL_DOMAIN_CALLER_PREDICATE'; then
-  bad "§D: stripping the test modules removed production code — every count below would be measured against a truncated subject"
+MP="$M"
+if [ -z "$MP" ] || ! has "$MP" 'const rtMailMailDomainCallerPredicate'; then
+  bad "§D: the comment stripper removed production code — every count below would be measured against a truncated subject"
 else
-  n=$(occurrences "$MP" 'is_wellformed_address\(|is_wellformed_address_list\(')
+  n=$(occurrences "$MP" 'rtMailIsWellformedAddress\(|rtMailIsWellformedAddressList\(')
   if [ "$n" -ge 8 ]; then
     ok "every mail address door goes through the structural check ($n uses in production code)"
   else
@@ -293,23 +288,21 @@ else
   # The bare character-set check must not be reachable from a door any more. It
   # is kept only as the inner half of the structural check, so more than one
   # production use means a door skipped the structure.
-  b=$(occurrences "$MP" 'is_valid_mail_address\(')
-  if [ "$b" -le 2 ]; then
+  b=$(occurrences "$MP" 'rtMailIsValidMailAddress\(')
+  if [ "$b" -le 2 ] && [ "$b" -ge 1 ]; then
     ok "the bare character-set check is no longer used as a door's validator ($b production uses)"
   else
-    bad "$b production uses of the character-set-only check — a door is validating an address without checking it has a local part"
+    bad "$b production uses of the character-set-only check — a door is validating an address without checking it has a local part (or the check vanished and this count measured nothing)"
   fi
 fi
 
-if has "$M" '!local\.is_empty\(\)' && has "$M" "local\.chars\(\)\.any"; then
-  ok "the panel refuses an empty or all-dots local part"
-else
-  bad "the panel stopped checking the local part — an empty one silently replaces the domain's catch-all, and a dotted one escapes the maildir"
-fi
+# §D panel-local-part retired: covered by TestMailTheDegenerateLocalPartsAreRefused (panel/go/internal/api/rt_mail_test.go)
 
 # The agent builds the path, so the agent checks independently. A panel-side
-# guard alone is one direct agent call away from irrelevant.
-if has "$A" 'fn local_part_is_safe' && [ "$(occurrences "$A" 'local_part_is_safe\(&')" -ge 2 ]; then
+# guard alone is one direct agent call away from irrelevant. (Its verdicts are
+# TestMailLocalPartAndHelpers in panel/go/internal/agent/routes/mail_test.go;
+# this arm pins that the sync actually calls it at both doors.)
+if has "$A" 'func mailLocalPartIsSafe\(' && [ "$(occurrences "$A" 'mailLocalPartIsSafe\((acc\.Email|a\.Source)\)')" -ge 2 ]; then
   ok "the agent independently refuses the same local parts, on accounts and alias sources"
 else
   bad "the agent no longer checks the local part it joins into /var/vmail and writes as a Postfix map key"
@@ -317,9 +310,9 @@ fi
 
 echo
 echo "§E  the grant is disclosed"
-CD=$(fnbody "$M" create_domain)
+CD=$(golits "$(fnbody "$M" rtMailCreateDomain)")
 if [ -z "$CD" ]; then
-  bad "§E: could not extract create_domain"
+  bad "§E: could not extract rtMailCreateDomain"
 elif has "$CD" 'FROM sites s JOIN users u' && has "$CD" "u\.role <> 'admin'"; then
   ok "creating a mail domain names the non-administrator it hands the mailboxes to"
 else
