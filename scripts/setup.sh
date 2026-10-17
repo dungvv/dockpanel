@@ -572,17 +572,15 @@ install_dependencies() {
         warn "by PASSWORD will not work. Install it manually, or use an SSH key instead."
     fi
 
-    # Build tools required for Rust compilation (cmake for aws-lc-sys, gcc for ring)
-    if [ "$INSTALL_FROM_RELEASE" != "1" ]; then
-        if [ "$PKG_MGR" = "apt" ]; then
-            run "Installing build tools (build-essential, cmake, pkg-config, libssl-dev)" \
-                pkg_install build-essential cmake pkg-config libssl-dev
-        else
-            run "Installing build tools (gcc, cmake, make, pkg-config, openssl-devel)" \
-                pkg_install gcc gcc-c++ cmake make pkg-config openssl-devel
-        fi
-        log "Build tools installed"
+    # The cron daemon and crontab(1): the agent manages site crons and the
+    # panel's own DB-backup job through them. Minimal images (containers,
+    # some cloud "minimal" templates) ship without it.
+    if [ "$PKG_MGR" = "apt" ]; then
+        run "Installing cron" pkg_install cron || true
+    else
+        run "Installing cronie" pkg_install cronie || true
     fi
+    command -v systemctl >/dev/null 2>&1 && { systemctl enable --now cron 2>/dev/null || systemctl enable --now crond 2>/dev/null || true; }
 
     log "Base packages installed"
 }
