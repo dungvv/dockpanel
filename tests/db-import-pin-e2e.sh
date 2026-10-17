@@ -8,7 +8,7 @@
 # migration wizard, so what shipped is a door, not an importer:
 #
 #   * THE INTAKE PATTERN IS THE WIZARD'S, NOT THE FILE MANAGER'S. A dump travels
-#     base64-in-JSON through two axum services capped at 2 MiB each, so uploads
+#     base64-in-JSON through two HTTP services capped at 2 MiB each, so uploads
 #     top out near 1.5 MB and no real dump fits. The operator places the file and
 #     the panel takes a NAME — never a free-text path, so there is no
 #     arbitrary-file-to-DB-exec surface to guard: every name the operator can
@@ -18,7 +18,7 @@
 #     300s. A handler that waited 600 would be killed by its own server and
 #     answer a bodyless 504. §C pins the constant BELOW the server's ceiling by
 #     deriving BOTH numbers from source, and §D pins that the timeout arm exists
-#     at all — without it `agent_error` maps the timeout to an incident id, which
+#     at all — without it `agentError` maps the timeout to an incident id, which
 #     is #121's defect wearing a different hat.
 #   * THE LISTING NOW REPORTS WHAT IT CANNOT USE. It used to `continue` past any
 #     file that was not .sql.gz, so an operator who copied `dump.sql` into the
@@ -31,6 +31,12 @@
 # warning and the "this device" marker on the session-revocation screen rendered
 # with no colour at all. Both sides of that arm are derived from source — the
 # palette from index.css, the usage from the SPA — so mutating either goes red.
+#
+# Go port: panel side is panel/go/internal/api (rt_databases.go,
+# rt_backup_orchestrator.go, svc_agent.go, core_router.go), agent side is
+# panel/go/internal/agent/{services,routes}/database_backup.go, CLI is
+# panel/go/internal/cli/backup.go. Arms over the pure importability rule moved
+# to TestPinDbImportBlockedReason (panel/go/internal/api/pin_db_import_test.go).
 #
 # Every arm is static analysis over source text: offline and deterministic, so it
 # judges a MUTATED tree the same way on an air-gapped runner (lesson #641).
@@ -45,30 +51,42 @@ eq()  { [ "$2" = "$3" ] && ok "$1" || bad "$1" "expected '$3', got '$2'"; }
 # ugrep's --ignore-files shim honours .gitignore, so every count below uses the
 # real binary explicitly (dockpanel-ops-p2, s357).
 G=/usr/bin/grep
-flat() { tr -d ' \n' < "$1"; }
+flat() { tr -d ' \t\n' < "$1"; }
+# One Go function by brace balance (`func Name(` or a method `func (x *T) Name(`).
+fnbody() {
+  awk -v fn="$2" '
+    (index($0, "func " fn "(") || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) && !started { started=1 }
+    started {
+      n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
+      if (opened || n>0) opened=1
+      if (opened && depth<=0) exit
+    }
+  ' "$1"
+}
 
-DBS=panel/backend/src/routes/databases.rs
-ROUTER=panel/backend/src/routes/mod.rs
-ORCH=panel/backend/src/routes/backup_orchestrator.rs
-AGENTSVC=panel/backend/src/services/agent.rs
-MAIN=panel/backend/src/main.rs
-ABACKUP=panel/agent/src/services/database_backup.rs
-AROUTES=panel/agent/src/routes/database_backup.rs
-ADBROUTE=panel/agent/src/routes/database.rs
+DBS=panel/go/internal/api/rt_databases.go
+ROUTER=$DBS   # Go registers the routes in rtDatabasesRegister, in the same file
+ORCH=panel/go/internal/api/rt_backup_orchestrator.go
+AGENTSVC=panel/go/internal/api/svc_agent.go
+MAIN=panel/go/internal/api/core_router.go
+ABACKUP=panel/go/internal/agent/services/database_backup.go
+AROUTES=panel/go/internal/agent/routes/database_backup.go
+ADBROUTE=panel/go/internal/agent/routes/database.go
+BACKUPS=panel/go/internal/agent/services/backups.go
 PAGE=panel/frontend/src/pages/Databases.tsx
-CLI=panel/cli/src/commands/backup.rs
+CLI=panel/go/internal/cli/backup.go
 CSS=panel/frontend/src/index.css
 SPA=panel/frontend/src
 
 for f in "$DBS" "$ROUTER" "$ORCH" "$AGENTSVC" "$MAIN" "$ABACKUP" "$AROUTES" \
-         "$ADBROUTE" "$PAGE" "$CLI" "$CSS"; do
+         "$ADBROUTE" "$BACKUPS" "$PAGE" "$CLI" "$CSS"; do
   [ -f "$f" ] || { bad "SETUP" "$f missing"; exit 1; }
 done
 [ -d "$SPA" ] || { bad "SETUP" "$SPA missing"; exit 1; }
 
 # An arm that measures an empty subject prints green for every absence below, so
 # each subject is asserted before it is measured (lesson #143).
-for pair in "$DBS:1000" "$ROUTER:1000" "$ABACKUP:600" "$PAGE:1000" "$CSS:100"; do
+for pair in "$DBS:1000" "$ABACKUP:500" "$PAGE:1000" "$CSS:100"; do
   f=${pair%:*}; min=${pair##*:}
   n=$(wc -l < "$f")
   [ "$n" -ge "$min" ] || { bad "SETUP" "$f has $n lines, expected >= $min"; exit 1; }
@@ -77,9 +95,9 @@ done
 echo "── A. The door exists, on both halves ────────────────────────────────────────"
 
 eq "A1 the dump listing is registered" \
-   "$(flat "$ROUTER" | $G -c '"/api/databases/{id}/dumps",get(databases::dumps)')" "1"
+   "$(flat "$ROUTER" | $G -c '"GET/api/databases/{id}/dumps",h(rtDatabasesDumps))')" "1"
 eq "A2 the import door is registered" \
-   "$(flat "$ROUTER" | $G -c '"/api/databases/{id}/import",post(databases::import)')" "1"
+   "$(flat "$ROUTER" | $G -c '"POST/api/databases/{id}/import",h(rtDatabasesImport))')" "1"
 
 # A door nothing reaches is not a door. Keyed on the SPA's call, not on a button
 # label, because labels get reworded and a reworded label is not a regression.
@@ -94,25 +112,26 @@ echo "── B. It reuses the hardened path instead of opening a new one ──�
 # database, validates every identifier it puts on an argv, passes the password by
 # environment and reads the child's exit status. Composing that route is the
 # feature. Writing a second importer would re-open all of it.
-if flat "$DBS" | $G -q '"/db-backups/{name}/restore/{filename}"'; then
+if flat "$DBS" | $G -q '"/db-backups/%s/restore/%s",info.Name,filename'; then
   ok "B1 the panel composes the agent's existing restore route"
 else
   bad "B1 the panel composes the agent's existing restore route" \
       "no /db-backups/{name}/restore/{filename} — a second import path would need its own review"
 fi
 
-# ⛔ The security arm. `is_safe_filename` is what `get_backup_path` opens a file
+# ⛔ The security arm. `databaseBackupIsSafeFilename` (whose extension list is
+# databaseBackupHasDumpExt) is what `DatabaseBackupGetBackupPath` opens a file
 # through; widening it to admit a plain .sql would send an ungzipped dump into
 # `gunzip -c` on the restore path AND make traversal charset changes cheap. The
 # listing was taught to EXPLAIN the rejection precisely so nobody is tempted to
 # relax the gate instead.
-GATE=$(perl -0777 -ne 'print $1 if /fn is_safe_filename\(name: &str\) -> bool \{(.*?)\n\}/s' "$ABACKUP")
-GATE_EXTS=$(printf '%s' "$GATE" | $G -oP 'ends_with\("\K[^"]+' || true)
+GATE=$(fnbody "$ABACKUP" databaseBackupHasDumpExt)
+GATE_EXTS=$(printf '%s' "$GATE" | $G -oP 'range \[\]string\{\K[^}]+' | $G -oP '"\K\.[^"]+' || true)
 GATE_N=$(printf '%s\n' "$GATE_EXTS" | $G -c . || true)
 [ "$GATE_N" -ge 4 ] && ok "B2a the filename gate was located and lists $GATE_N accepted forms" \
   || bad "B2a the filename gate was located and lists $GATE_N accepted forms" \
          "extraction failed — B2b below would pass against nothing"
-# Every accepted form must be a gzipped one, because `restore_mysql` pipes the
+# Every accepted form must be a gzipped one, because `DatabaseBackupRestoreMysql` pipes the
 # file through `gunzip -c` unconditionally and never captures gunzip's stderr.
 # Admitting a plain .sql here would fail at the far end of a pipe with the
 # message "truncated/corrupt archive", which is the wrong diagnosis.
@@ -121,44 +140,34 @@ eq "B2b the filename gate admits only gzipped forms" \
 
 # No new agent route: the count is what keeps the published route figure honest,
 # and a fresh importer on the agent is exactly the thing this design avoided.
+# Control first: the router is located (its reset-password route is visible),
+# so a zero below is about the importer, not about reading an empty file.
+eq "B3a the agent's database router is read (control)" \
+   "$(flat "$ADBROUTE" | $G -c '"POST/databases/reset-password",databaseResetPassword)')" "1"
 eq "B3 no second importer was added to the agent's database router" \
-   "$(flat "$ADBROUTE" | $G -c '"/databases/import"')" "0"
+   "$(flat "$ADBROUTE" | $G -c '/databases/import"')" "0"
 
 # ⛔ THE LAYERING, and it is load-bearing in both directions. The AGENT answers only
 # "is this a backup file at all" — if it also decided importability, every encrypted
 # backup would be labelled broken in `dockpanel backup db-list`, which is a BACKUP
 # listing. Whether a backup can enter a given database depends on the engine and on
 # encryption, which only the PANEL knows. Both halves pinned so neither drifts back.
-eq "B4a the agent's listing gate is is_safe_filename itself, not a second opinion" \
-   "$(flat "$ABACKUP" | $G -c 'letunsupported=ifis_safe_filename(&name){None}')" "1"
+eq "B4a the agent's listing gate is databaseBackupIsSafeFilename itself, not a second opinion" \
+   "$(flat "$ABACKUP" | $G -c 'if!databaseBackupIsSafeFilename(e.Name()){reason:=databaseBackupUnusableReason(dbName,e.Name())')" "1"
 eq "B4b the agent does not decide importability (that would mislabel every .enc backup)" \
-   "$($G -c 'fn is_importable_dump' "$ABACKUP")" "0"
-eq "B4c the panel decides importability, as a pure function" \
-   "$($G -c 'fn import_blocked_reason(filename: &str, engine: &str) -> Option<String>' "$DBS")" "1"
+   "$($G -ciE 'func [a-z]*importable' "$ABACKUP")" "0"
+# B4c retired: covered by TestPinDbImportBlockedReason (panel/go/internal/api/pin_db_import_test.go)
 
 # ⛔ ANNOTATING WITHOUT ENFORCING IS A UI THAT ASKS NICELY. The listing greys a file out;
 # the import door must refuse the identical set, from the identical call, or a direct
 # POST walks past the greyed-out state into a decompression pipe.
-LISTED=$(perl -0777 -ne '$c++ while /import_blocked_reason\(&?filename,\s*&?engine\)/gs; END{print $c+0}' "$DBS")
+LISTED=$(perl -0777 -ne '$c++ while /rtDatabasesImportBlockedReason\(filename,\s*info\.Engine\)/gs; END{print $c+0}' "$DBS")
 [ "$LISTED" -ge 2 ] && ok "B4d the same rule is used by BOTH the listing and the door ($LISTED call sites)" \
   || bad "B4d the same rule is used by BOTH the listing and the door ($LISTED call sites)" \
          "fewer than 2 call sites — annotate-only leaves the door open to a direct POST"
 
-# An encrypted panel backup is refused by the agent for want of a key every single time,
-# so offering it would be a control that cannot succeed.
-if flat "$DBS" | $G -q 'filename.ends_with(".enc")'; then
-  ok "B4e encrypted panel backups are refused at the door"
-else
-  bad "B4e encrypted panel backups are refused at the door" \
-      "no .enc branch — the agent answers 400 'Encryption key required' for every one"
-fi
-# .archive.gz is MongoDB's format; fed to psql it fails deep inside the pipe.
-if flat "$DBS" | $G -q 'filename.ends_with(".archive.gz")&&!is_mongo'; then
-  ok "B4f a MongoDB archive is refused for a SQL engine"
-else
-  bad "B4f a MongoDB archive is refused for a SQL engine" \
-      "no engine check — a BSON stream would be piped into psql and fail on content"
-fi
+# B4e retired: covered by TestPinDbImportBlockedReason (panel/go/internal/api/pin_db_import_test.go)
+# B4f retired: covered by TestPinDbImportBlockedReason (panel/go/internal/api/pin_db_import_test.go)
 
 echo "── C. The wait is bounded BELOW the server's own ceiling ─────────────────────"
 
@@ -166,10 +175,10 @@ echo "── C. The wait is bounded BELOW the server's own ceiling ────�
 # An arm that reads the same literal the code reads cannot fail; this one goes
 # red if either side moves, which is the only version worth having.
 eq "C1 the restore budget is declared exactly once" \
-   "$($G -c 'pub const DB_RESTORE_TIMEOUT_SECS: u64 =' "$AGENTSVC")" "1"
+   "$($G -cE '^const AgentDBRestoreTimeoutSecs = ' "$AGENTSVC")" "1"
 
-BUDGET=$($G -oP 'pub const DB_RESTORE_TIMEOUT_SECS: u64 = \K[0-9_]+' "$AGENTSVC" | tr -d _)
-CEILING=$($G -oP 'TimeoutLayer::with_status_code\([^)]*Duration::from_secs\(\K[0-9_]+' "$MAIN" | tr -d _)
+BUDGET=$($G -oP '^const AgentDBRestoreTimeoutSecs = \K[0-9_]+' "$AGENTSVC" | tr -d _)
+CEILING=$($G -oP 'return traceTimeout\(\K[0-9_]+(?=\*time\.Second)' "$MAIN" | tr -d _)
 if [ -n "$BUDGET" ] && [ -n "$CEILING" ]; then
   ok "C2 both budgets were derived from source (agent wait ${BUDGET}s, server ceiling ${CEILING}s)"
 else
@@ -180,44 +189,45 @@ if [ -n "$BUDGET" ] && [ -n "$CEILING" ] && [ "$BUDGET" -lt "$CEILING" ]; then
   ok "C3 the panel stops waiting before its own server kills the request"
 else
   bad "C3 the panel stops waiting before its own server kills the request" \
-      "wait ${BUDGET}s is not below the ${CEILING}s TimeoutLayer — the handler's own message can never reach the operator"
+      "wait ${BUDGET}s is not below the ${CEILING}s traceTimeout — the handler's own message can never reach the operator"
 fi
 
 # Both database-restore call sites, including the one that was already wrong: a 60s
 # `post` against an operation the agent gives 600s reported "timed out" while the restore
-# went on succeeding. Slurped, because rustfmt is free to wrap a call this long and a
+# went on succeeding. Slurped, because gofmt'd code is free to wrap a call this long and a
 # line-anchored arm would not see it (#645).
-n=$(perl -0777 -ne '$c++ while /\.post_long\(&agent_path, Some\(agent_body\), budget \+ 60\)/gs; END{print $c+0}' "$DBS")
-[ "$n" -ge 1 ] && ok "C4 databases.rs (import) dispatches on the shared restore budget" \
-  || bad "C4 databases.rs (import) dispatches on the shared restore budget" \
-         "no post_long(..., budget + 60) — a bare .post caps this at 60s on both transports"
-n=$(perl -0777 -ne '$c++ while /\.post_long\(&agent_path, Some\(body\), crate::services::agent::DB_RESTORE_TIMEOUT_SECS\)/gs; END{print $c+0}' "$ORCH")
-[ "$n" -ge 1 ] && ok "C4b backup_orchestrator.rs (restore_db_backup) waits on the shared restore budget" \
-  || bad "C4b backup_orchestrator.rs (restore_db_backup) waits on the shared restore budget" \
-         "no post_long(... DB_RESTORE_TIMEOUT_SECS)"
+n=$(perl -0777 -ne '$c++ while /const budget = AgentDBRestoreTimeoutSecs\b.*?\.PostLong\(tctx,\s*fmt\.Sprintf\("\/db-backups\/%s\/restore\/%s",[^)]*\),\s*agentBody,\s*budget\s*\+\s*60\)/gs; END{print $c+0}' "$DBS")
+[ "$n" -ge 1 ] && ok "C4 rt_databases.go (import) dispatches on the shared restore budget" \
+  || bad "C4 rt_databases.go (import) dispatches on the shared restore budget" \
+         "no PostLong(..., budget+60) — a bare .Post caps this at 60s on both transports"
+n=$(perl -0777 -ne '$c++ while /\.PostLong\(ctx,\s*fmt\.Sprintf\("\/db-backups\/%s\/restore\/%s",[^)]*\),\s*body,\s*AgentDBRestoreTimeoutSecs\)/gs; END{print $c+0}' "$ORCH")
+[ "$n" -ge 1 ] && ok "C4b rt_backup_orchestrator.go (restore_db_backup) waits on the shared restore budget" \
+  || bad "C4b rt_backup_orchestrator.go (restore_db_backup) waits on the shared restore budget" \
+         "no PostLong(... AgentDBRestoreTimeoutSecs)"
 
 # The literal must not creep back in beside the constant it replaced.
 eq "C5 neither restore site hard-codes a second budget" \
-   "$(cat "$DBS" "$ORCH" | $G -cE 'post_long\([^)]*, *[0-9]+ *\)')" "0"
+   "$(cat "$DBS" "$ORCH" | $G -cE 'PostLong\(.*, *[0-9_]+ *\)')" "0"
 
 echo "── D. A timeout is reported as a timeout, not as a failure ───────────────────"
 
 # ⛔ THE CLASS ARM OF THIS SHIP, and the first version of it was WRONG in a way only
-# an adversarial read caught. It matched `Err(AgentError::Request(_))` and called that
+# an adversarial read caught. It matched `Err(AgentError::Request(_))` (Go: an
+# AgentError of Kind AgentErrRequest) and called that
 # "the timeout". It is not: the local client also mints Request for a URI that would not
 # build and for a connection dropped mid-flight, and the REMOTE client never mints it for
 # a timeout at all — it maps every failure, timeouts included, to Connection. So the arm
 # was dead code on every fleet install, and locally it announced "still running" about
 # work that had never been sent. Taking the timeout HERE makes Elapsed unambiguous on
 # both transports.
-n=$(perl -0777 -ne '$c++ while /tokio::time::timeout\(std::time::Duration::from_secs\(budget\),\s*call\)/gs; END{print $c+0}' "$DBS")
+n=$(perl -0777 -ne '$c++ while /tctx, cancel := context\.WithTimeout\(ctx, budget\*time\.Second\).*?errors\.Is\(tctx\.Err\(\), context\.DeadlineExceeded\)/gs; END{print $c+0}' "$DBS")
 [ "$n" -ge 1 ] && ok "D1 the import times itself, so a timeout is unambiguous on both transports" \
   || bad "D1 the import times itself, so a timeout is unambiguous on both transports" \
-         "no tokio::time::timeout around the agent call — the verdict would be read off an ambiguous error variant"
+         "no context.WithTimeout(budget) deadline judged by tctx.Err() around the agent call — the verdict would be read off an ambiguous error variant"
 
 # The inner budget must be LARGER, or the inner clock fires first and we are back to
 # reading someone else's error variant.
-if flat "$DBS" | $G -q 'Some(agent_body),budget+60'; then
+if flat "$DBS" | $G -q 'agentBody,budget+60)'; then
   ok "D1b the agent's own clock is set beyond ours, so ours is the one that fires"
 else
   bad "D1b the agent's own clock is set beyond ours, so ours is the one that fires" \
@@ -226,7 +236,7 @@ fi
 
 # The refuted shape must not come back.
 eq "D1c the verdict is never read off the error variant again" \
-   "$(flat "$DBS" | $G -c 'Err(AgentError::Request(_))')" "0"
+   "$(flat "$DBS" | $G -c 'AgentErrRequest')" "0"
 
 if flat "$DBS" | $G -q 'NOTcancelled'; then
   ok "D2 the timeout sentence says the import was not cancelled"
@@ -236,7 +246,7 @@ else
 fi
 
 eq "D3 the timeout answers 504, not a generic failure" \
-   "$(flat "$DBS" | $G -c 'err(StatusCode::GATEWAY_TIMEOUT,')" "1"
+   "$(flat "$DBS" | $G -c 'apiErr(http.StatusGatewayTimeout,')" "1"
 
 # The SPA must not paint it red either — "still running" and "did not happen" are
 # different facts and the operator acts differently on each. 524 is Cloudflare's cut at
@@ -253,45 +263,39 @@ fi
 # the panel preserves an agent's sentence only for 4xx. Answering 5xx turned psql's
 # "relation already exists" into an incident id on BOTH callers of that route.
 eq "D5 a failed restore answers 4xx so its reason survives the panel" \
-   "$(flat "$AROUTES" | $G -c 'result.map_err(|e|err(StatusCode::UNPROCESSABLE_ENTITY,&e))')" "1"
+   "$(fnbody "$AROUTES" databaseBackupRestore | $G -v '^\s*//' | tr -d ' \t\n' | $G -c 'os.Remove(restorePath)}iferr!=nil{writeErr(w,http.StatusUnprocessableEntity,err.Error())')" "1"
 eq "D5b the reason-destroying 5xx does not come back" \
-   "$(flat "$AROUTES" | $G -c 'result.map_err(|e|err(StatusCode::INTERNAL_SERVER_ERROR,&e))')" "0"
+   "$(fnbody "$AROUTES" databaseBackupRestore | $G -v '^\s*//' | tr -d ' \t\n' | $G -c 'os.Remove(restorePath)}iferr!=nil{writeErr(w,http.StatusInternalServerError')" "0"
 
 echo "── E. The listing explains what it will not import (lesson #647) ─────────────"
 
 # The old shape was a bare `continue` on the extension test, which is why a file
 # could sit in the directory, be invisible, and have no explanation anywhere.
-# Slurp-mode and brace-aware: the defect is a shape, not a line.
-n=$(perl -0777 -ne '$c++ while /ends_with\("\.sql\.gz"\)(?:[^{}]|\{[^{}]*\})*?\{\s*continue\s*;\s*\}/gs; END{print $c+0}' "$ABACKUP")
-eq "E1 no file is dropped from the listing without a reason" "$n" "0"
+# Go: the listing is a backupsListDir callback where `return false` DROPS an
+# entry. Exactly one drop is legitimate — the stray-subdirectory one — so the
+# body is pinned to that single drop, anchored on the IsDir test.
+LISTING=$(fnbody "$ABACKUP" DatabaseBackupListDbBackups | tr -d ' \t\n')
+case "$LISTING" in
+  *'ife.IsDir(){returnfalse}'*) ok "E1a the listing body was located (its one legitimate drop is the subdirectory one)" ;;
+  *) bad "E1a the listing body was located" "no IsDir drop in DatabaseBackupListDbBackups — E1 would measure nothing" ;;
+esac
+eq "E1 no file is dropped from the listing without a reason" \
+   "$($G -o 'returnfalse' <<< "$LISTING" | $G -c . || true)" "1"
 
 eq "E2 the rejection is carried on the listing itself" \
-   "$(flat panel/agent/src/services/backups.rs | $G -c 'pubunsupported:Option<String>')" "1"
+   "$(flat "$BACKUPS" | $G -c 'Unsupported\*string`json:"unsupported')" "1"
 
 # Omitted when absent, or the site- and volume-backup responses change shape for
 # every consumer that never asked about dumps.
-if perl -0777 -ne 'exit(/skip_serializing_if\s*=\s*"Option::is_none"\s*\)\]\s*pub unsupported/s ? 0 : 1)' panel/agent/src/services/backups.rs; then
+if flat "$BACKUPS" | $G -q 'Unsupported\*string`json:"unsupported,omitempty"`'; then
   ok "E3 the new field is omitted when absent, so sibling responses are unchanged"
 else
   bad "E3 the new field is omitted when absent, so sibling responses are unchanged" \
-      "no skip_serializing_if on `unsupported` — site and volume backup JSON changes for everyone"
+      "no omitempty on `unsupported` — site and volume backup JSON changes for everyone"
 fi
 
-if flat "$ABACKUP" | $G -q 'gzip{full}'; then
-  ok "E4 an uncompressed dump is told the exact command that fixes it"
-else
-  bad "E4 an uncompressed dump is told the exact command that fixes it" \
-      "the reason does not carry a pasteable gzip command naming the file"
-fi
-
-# An excluded file is only honestly excluded if the operator is told where to go
-# instead. "Cannot be imported" on a file the product CAN restore is a dead end.
-if flat "$DBS" | $G -q 'RestoreitfromBackupManager'; then
-  ok "E4b an encrypted backup names the door that can restore it"
-else
-  bad "E4b an encrypted backup names the door that can restore it" \
-      "the .enc reason does not point at Backup Manager, so the file reads as a dead end"
-fi
+# E4 retired: covered by TestUnusableReasonNamesTheFileAndTheFix (panel/go/internal/agent/services/database_backup_test.go)
+# E4b retired: covered by TestPinDbImportBlockedReason (panel/go/internal/api/pin_db_import_test.go)
 
 # The agent's fallback sentence must not advertise a form the panel refuses — two
 # sentences on one screen contradicting each other is worse than either alone.
@@ -318,7 +322,7 @@ else
   bad "E5b the empty state stays silent when the listing could not be read" \
       "'Nothing here to import' renders under the error banner, asserting something nobody measured"
 fi
-if flat "$CLI" | $G -q 'b\["unsupported"\].as_str()'; then
+if flat "$CLI" | $G -q 'ifreason,ok:=str(get(b,"unsupported"));ok{'; then
   ok "E6 the CLI renders the reason"
 else
   bad "E6 the CLI renders the reason" "dockpanel backup db-list still hides the rejected file's reason"
@@ -327,20 +331,20 @@ fi
 echo "── F. Ownership and traversal ────────────────────────────────────────────────"
 
 # Both are required for the credential-auth census to score this handler, and
-# both are load-bearing: get_db_info scopes to the caller's own databases, and
+# both are load-bearing: rtDatabasesGetDbInfo scopes to the caller's own databases, and
 # the host must come from the site's row because `dockpanel-db-{name}` is unique
 # only per machine and this call hands over the tenant's decrypted password.
-IMPORT_BODY=$(perl -0777 -ne 'print $1 if /pub async fn import\((.*?)\n\}\n/s' "$DBS")
+IMPORT_BODY=$(fnbody "$DBS" rtDatabasesImport)
 case "$IMPORT_BODY" in
-  *get_db_info*) ok "F1 the import scopes to the caller's own database" ;;
-  *) bad "F1 the import scopes to the caller's own database" "no get_db_info in the handler body" ;;
+  *'rtDatabasesGetDbInfo(ctx, st, id, claims.Sub)'*) ok "F1 the import scopes to the caller's own database" ;;
+  *) bad "F1 the import scopes to the caller's own database" "no rtDatabasesGetDbInfo in the handler body" ;;
 esac
 case "$IMPORT_BODY" in
-  *agent_for_site_server*) ok "F2 the import resolves the host from the site's row" ;;
-  *) bad "F2 the import resolves the host from the site's row" "no agent_for_site_server in the handler body" ;;
+  *'agentForSiteServer(ctx, st, info.SiteServerID'*) ok "F2 the import resolves the host from the site's row" ;;
+  *) bad "F2 the import resolves the host from the site's row" "no agentForSiteServer in the handler body" ;;
 esac
 case "$IMPORT_BODY" in
-  *'filename.contains("..")'*) ok "F3 the filename is refused traversal before it becomes a URL path" ;;
+  *'!strings.Contains(filename, "..")'*) ok "F3 the filename is refused traversal before it becomes a URL path" ;;
   *) bad "F3 the filename is refused traversal before it becomes a URL path" "no '..' guard in the handler body" ;;
 esac
 
@@ -359,20 +363,20 @@ echo "── H. The tenancy boundary this door would otherwise cross ───�
 #   4. An ad-hoc DB backup is written UNENCRYPTED.
 #
 # Row-scoping cannot close that, because files with no row are exactly what this door is
-# for. `require_admin` closes it and costs nothing real: placing a file in that directory
+# for. `requireAdmin` closes it and costs nothing real: placing a file in that directory
 # needs root, there is no per-site SFTP, and an admin can already read /var/backups.
-for fn in dumps import; do
-  BODY=$(perl -0777 -ne "print \$1 if /pub async fn $fn\\((.*?)\\n\\}\\n/s" "$DBS")
+for fn in rtDatabasesDumps rtDatabasesImport; do
+  BODY=$(fnbody "$DBS" "$fn")
   if [ -z "$BODY" ]; then
     bad "H1 the $fn handler body was located" "extraction failed — H2 would pass vacuously"
   else
     ok "H1 the $fn handler body was located"
     case "$BODY" in
-      *"require_admin(&claims.role)?"*)
+      *"if err := requireAdmin(claims.Role); err != nil {"*)
         ok "H2 $fn is admin-gated, so a reused database name cannot expose a former tenant's dumps" ;;
       *)
         bad "H2 $fn is admin-gated" \
-            "no require_admin — a tenant taking a freed database name would list and import its previous holder's unencrypted dumps" ;;
+            "no requireAdmin — a tenant taking a freed database name would list and import its previous holder's unencrypted dumps" ;;
     esac
   fi
 done
@@ -389,9 +393,9 @@ fi
 # ⛔ A filename with a space has the right extension and passes every obvious check, then
 # breaks while the HTTP request line is BUILT — a failure the panel could describe only
 # as a transport error. Refused here, where the answer can still be about the file.
-IMPORT_BODY=$(perl -0777 -ne 'print $1 if /pub async fn import\((.*?)\n\}\n/s' "$DBS")
+IMPORT_BODY=$(fnbody "$DBS" rtDatabasesImport)
 case "$IMPORT_BODY" in
-  *"c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'"*)
+  *"!rtDatabasesIsASCIIAlnum(c) && c != '-' && c != '_' && c != '.'"*)
     ok "H4 the filename charset is checked where a sentence can still explain it" ;;
   *) bad "H4 the filename charset is checked where a sentence can still explain it" \
          "only traversal is refused, so 'my dump.sql.gz' fails inside the transport" ;;
@@ -406,9 +410,9 @@ eq "H5 the import event is subscribable through the Extensions UI" \
 # On a fleet, two databases can share a name on different machines. An audit row that
 # does not say WHICH machine cannot answer the only question asked after a bad import.
 case "$IMPORT_BODY" in
-  *log_activity_on_server*) ok "H6 the audit row records the machine the import ran on" ;;
+  *'ActivityLogActivityOnServer('*'info.SiteServerID'*) ok "H6 the audit row records the machine the import ran on" ;;
   *) bad "H6 the audit row records the machine the import ran on" \
-         "log_activity leaves server_id NULL — two same-named databases on a fleet are indistinguishable" ;;
+         "ActivityLogActivity leaves server_id NULL — two same-named databases on a fleet are indistinguishable" ;;
 esac
 
 echo "── G. Every colour the SPA asks for is a colour the theme defines ────────────"

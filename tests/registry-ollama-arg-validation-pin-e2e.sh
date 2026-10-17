@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # registry-ollama-arg-validation-pin-e2e.sh — s439
 #
-# Pins the docker_apps.rs registry_login/ollama_pull/ollama_delete finding
+# Pins the agent docker_apps registry_login/ollama_pull/ollama_delete finding
+# (now panel/go/internal/agent/routes/docker_apps.go: dockerAppsRegistryLogin,
+# dockerAppsRegistryLogout, dockerAppsOllamaPull/Delete via dockerAppsOllamaModel)
 # named in [[project_dockpanel_tech_debt_p4]] (long-standing INFO carry: "exec
 # denylist substring theater... registry_login/ollama_pull accept an
 # arbitrary host") and confirmed still open at HEAD (v2.194.0, ab9a205)
@@ -40,7 +42,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 echo
 echo "=============================================="
-echo "  docker_apps.rs registry/ollama arg validation — source pins (s439)"
+echo "  agent docker_apps registry/ollama arg validation — source pins (s439)"
 echo "=============================================="
 echo
 
@@ -49,51 +51,50 @@ ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
 # Strip comments before matching (per [[feedback_source_pin_prose_trap]] —
-# this file's own header spells the tokens the arms grep for).
+# this file's own header spells the tokens the arms grep for). Go comments:
+# `/* */` blocks on their own lines, whole-line `//`, and trailing `//`
+# (only when preceded by whitespace, so `https://` in a literal survives).
 code() {
   perl -0777 -pe '
     s{^[ \t]*/\*.*?\*/[ \t]*$}{}gms;
-    s{^\s*///.*$}{}gm;
-    s{^\s*//.*$}{}gm;
+    s{^[ \t]*//.*$}{}gm;
+    s{[ \t]+//[^"`\n]*$}{}gm;
   ' "$1"
 }
 
 has()  { grep -qE -- "$2" <<< "$1"; }
 flat() { tr '\n' ' ' <<< "$1" | tr -s ' '; }
 
-# A function body, bounded on ITS OWN braces (s323 fix — a window ending at
-# the successor's match position swallows the next function's declaration).
+# One Go func (or method) body, bounded by its own closing `}` at column 0 —
+# a window ending at the successor's match position swallows the next
+# function's declaration (s323).
 fnbody() {
   awk -v fn="$2" '
-    index($0, "fn " fn) && !started { started=1 }
-    started {
-      n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
-      if (opened || n>0) opened=1
-      if (opened && depth<=0) exit
+    !started && (index($0, "func " fn "(") == 1 || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) {
+      started=1; print
+      o=gsub(/\{/,"{"); c=gsub(/\}/,"}"); if (o>0 && o==c) exit
+      next
     }
+    started { print; if ($0 == "}") exit }
   ' <<< "$1"
 }
 
-APPS=panel/agent/src/routes/docker_apps.rs
+APPS=panel/go/internal/agent/routes/docker_apps.go
 [ -f "$APPS" ] || { bad "SETUP subject missing: $APPS"; exit 1; }
 APPS_SRC=$(code "$APPS")
 
-# ── §A  registry_login validates body.server before `docker login` ──────────
+# ── §A  registry_login validates body.Server before `docker login` ──────────
 
-LOGIN=$(flat "$(fnbody "$APPS_SRC" "registry_login")")
+LOGIN=$(flat "$(fnbody "$APPS_SRC" "dockerAppsRegistryLogin")")
 if [ -z "$LOGIN" ]; then
-  bad "A0 could not extract docker_apps::registry_login"
+  bad "A0 could not extract dockerAppsRegistryLogin"
 else
-  ok "A0 docker_apps::registry_login extracted"
-  if has "$LOGIN" 'is_valid_image_ref\(&body\.server\)'; then
-    ok "A1 registry_login validates body.server with is_valid_image_ref"
-  else
-    bad "A1 registry_login has no format validation on body.server — a leading '-' is parsed as a docker login flag, not a registry host"
-  fi
-  CHK_AT=$(grep -bo 'is_valid_image_ref(&body.server)' <<< "$LOGIN" | head -1 | cut -d: -f1)
+  ok "A0 dockerAppsRegistryLogin extracted"
+  # A1 retired: covered by TestDockerAppsRoutesValidateBeforeActing (panel/go/internal/agent/routes/docker_apps_test.go)
+  CHK_AT=$(grep -bo 'dockerAppsIsValidImageRef(body.Server)' <<< "$LOGIN" | head -1 | cut -d: -f1)
   SPAWN_AT=$(grep -bo '"login"' <<< "$LOGIN" | head -1 | cut -d: -f1)
   if [ -n "$CHK_AT" ] && [ -n "$SPAWN_AT" ] && [ "$CHK_AT" -lt "$SPAWN_AT" ]; then
-    ok "A2 the validation precedes the docker login spawn"
+    ok "A2 the dockerAppsIsValidImageRef(body.Server) validation precedes the docker login spawn"
   else
     bad "A2 the validation does not precede the docker login spawn (check@${CHK_AT:-none} spawn@${SPAWN_AT:-none})"
   fi
@@ -101,52 +102,43 @@ fi
 
 # ── §B  registry_logout validates server before `docker logout` ─────────────
 
-LOGOUT=$(flat "$(fnbody "$APPS_SRC" "registry_logout")")
+LOGOUT=$(flat "$(fnbody "$APPS_SRC" "dockerAppsRegistryLogout")")
 if [ -z "$LOGOUT" ]; then
-  bad "B0 could not extract docker_apps::registry_logout"
+  bad "B0 could not extract dockerAppsRegistryLogout"
 else
-  ok "B0 docker_apps::registry_logout extracted"
-  if has "$LOGOUT" 'is_valid_image_ref\(server\)'; then
-    ok "B1 registry_logout validates server with is_valid_image_ref"
-  else
-    bad "B1 registry_logout has no format validation on server — a leading '-' is parsed as a docker logout flag, not a registry host"
-  fi
-  CHK_AT=$(grep -bo 'is_valid_image_ref(server)' <<< "$LOGOUT" | head -1 | cut -d: -f1)
+  ok "B0 dockerAppsRegistryLogout extracted"
+  # B1 retired: covered by TestPinRegistryOllamaArgValidationLogoutRefusesALeadingDash (panel/go/internal/agent/routes/pin_registry_ollama_arg_validation_test.go)
+  CHK_AT=$(grep -bo 'dockerAppsIsValidImageRef(server)' <<< "$LOGOUT" | head -1 | cut -d: -f1)
   SPAWN_AT=$(grep -bo '"logout"' <<< "$LOGOUT" | head -1 | cut -d: -f1)
   if [ -n "$CHK_AT" ] && [ -n "$SPAWN_AT" ] && [ "$CHK_AT" -lt "$SPAWN_AT" ]; then
-    ok "B2 the validation precedes the docker logout spawn"
+    ok "B2 the dockerAppsIsValidImageRef(server) validation precedes the docker logout spawn"
   else
     bad "B2 the validation does not precede the docker logout spawn (check@${CHK_AT:-none} spawn@${SPAWN_AT:-none})"
   fi
 fi
 
-# ── §C  ollama_pull_model rejects a leading '-' in the model name ───────────
+# ── §C/§D  both ollama handlers route the model through the shared guard ────
+# In Go the leading-'-' refusal lives in ONE helper (dockerAppsOllamaModel)
+# both handlers call; what the arms pin is that each handler reaches it before
+# its spawn. The refusal itself is a test: C1/D1 behaviour retired: covered by
+# TestPinRegistryOllamaArgValidationModelRefusesALeadingDash (panel/go/internal/agent/routes/pin_registry_ollama_arg_validation_test.go)
 
-PULL=$(flat "$(fnbody "$APPS_SRC" "ollama_pull_model")")
-if [ -z "$PULL" ]; then
-  bad "C0 could not extract docker_apps::ollama_pull_model"
-else
-  ok "C0 docker_apps::ollama_pull_model extracted"
-  if has "$PULL" 'model\.starts_with\(.-.\)'; then
-    ok "C1 ollama_pull_model rejects a model name starting with '-'"
-  else
-    bad "C1 ollama_pull_model has no leading-hyphen guard — a model name starting with '-' is parsed as an ollama pull flag"
+for pair in "C:dockerAppsOllamaPull:pull" "D:dockerAppsOllamaDelete:rm"; do
+  id=${pair%%:*}; rest=${pair#*:}; fn=${rest%%:*}; verb=${rest#*:}
+  BODY=$(flat "$(fnbody "$APPS_SRC" "$fn")")
+  if [ -z "$BODY" ]; then
+    bad "${id}0 could not extract $fn"
+    continue
   fi
-fi
-
-# ── §D  ollama_delete_model rejects a leading '-' in the model name ─────────
-
-DELETE=$(flat "$(fnbody "$APPS_SRC" "ollama_delete_model")")
-if [ -z "$DELETE" ]; then
-  bad "D0 could not extract docker_apps::ollama_delete_model"
-else
-  ok "D0 docker_apps::ollama_delete_model extracted"
-  if has "$DELETE" 'model\.starts_with\(.-.\)'; then
-    ok "D1 ollama_delete_model rejects a model name starting with '-'"
+  ok "${id}0 $fn extracted"
+  CHK_AT=$(grep -bo 'dockerAppsOllamaModel(w, r)' <<< "$BODY" | head -1 | cut -d: -f1)
+  SPAWN_AT=$(grep -bo "\"ollama\", \"$verb\"" <<< "$BODY" | head -1 | cut -d: -f1)
+  if [ -n "$CHK_AT" ] && [ -n "$SPAWN_AT" ] && [ "$CHK_AT" -lt "$SPAWN_AT" ]; then
+    ok "${id}1 $fn validates the model through dockerAppsOllamaModel before the ollama $verb spawn"
   else
-    bad "D1 ollama_delete_model has no leading-hyphen guard — a model name starting with '-' is parsed as an ollama rm flag"
+    bad "${id}1 $fn does not route the model through dockerAppsOllamaModel before 'ollama $verb' (check@${CHK_AT:-none} spawn@${SPAWN_AT:-none}) — a model starting with '-' is parsed as a flag"
   fi
-fi
+done
 
 # ── §E  remove_image rejects a leading '-' in the image id (s447) ──────────
 # Same threat class, same file, different call: the charset check at
@@ -155,20 +147,16 @@ fi
 # no guard at all — 0 hits for `rmi` in this suite before the fix.
 # [[project_dockpanel_tech_debt_p185]] §D.
 
-REMOVE_IMG=$(flat "$(fnbody "$APPS_SRC" "remove_image")")
+REMOVE_IMG=$(flat "$(fnbody "$APPS_SRC" "dockerAppsRemoveImage")")
 if [ -z "$REMOVE_IMG" ]; then
-  bad "E0 could not extract docker_apps::remove_image"
+  bad "E0 could not extract dockerAppsRemoveImage"
 else
-  ok "E0 docker_apps::remove_image extracted"
-  if has "$REMOVE_IMG" 'id\.starts_with\(.-.\)'; then
-    ok "E1 remove_image rejects an image id starting with '-'"
-  else
-    bad "E1 remove_image has no leading-hyphen guard — an id starting with '-' is parsed as a docker rmi flag"
-  fi
-  CHK_AT=$(grep -bo "id.starts_with('-')" <<< "$REMOVE_IMG" | head -1 | cut -d: -f1)
+  ok "E0 dockerAppsRemoveImage extracted"
+  # E1 retired: covered by TestDockerAppsRoutesValidateBeforeActing (panel/go/internal/agent/routes/docker_apps_test.go)
+  CHK_AT=$(grep -bo '!strings.HasPrefix(id, "-")' <<< "$REMOVE_IMG" | head -1 | cut -d: -f1)
   SPAWN_AT=$(grep -bo '"rmi"' <<< "$REMOVE_IMG" | head -1 | cut -d: -f1)
   if [ -n "$CHK_AT" ] && [ -n "$SPAWN_AT" ] && [ "$CHK_AT" -lt "$SPAWN_AT" ]; then
-    ok "E2 the validation precedes the docker rmi spawn"
+    ok "E2 the leading-'-' validation precedes the docker rmi spawn"
   else
     bad "E2 the validation does not precede the docker rmi spawn (check@${CHK_AT:-none} spawn@${SPAWN_AT:-none})"
   fi
@@ -185,20 +173,27 @@ fi
 # already forbids this; this handler is the MANUAL button and had no such
 # guard. [[project_dockpanel_tech_debt_p185]] §E.
 
-PRUNE=$(flat "$(fnbody "$APPS_SRC" "prune_images_all")")
+PRUNE=$(flat "$(fnbody "$APPS_SRC" "dockerAppsPruneImages")")
 if [ -z "$PRUNE" ]; then
-  bad "F0 could not extract docker_apps::prune_images_all"
+  bad "F0 could not extract dockerAppsPruneImages"
 else
-  ok "F0 docker_apps::prune_images_all extracted"
-  if has "$PRUNE" '"image", *"prune", *"-af"|"image", *"prune", *"-a"'; then
-    bad "F1 prune_images_all passes -a — it can remove a locally built image with no registry to restore from"
+  ok "F0 dockerAppsPruneImages extracted"
+  # Positive anchor first: the absence below is only meaningful if the spawn
+  # this arm reads is really there.
+  if has "$PRUNE" '"image", *"prune", *"-f"'; then
+    ok "F0b the docker image prune spawn is present in the handler"
   else
-    ok "F1 prune_images_all never passes -a"
+    bad "F0b no 'docker image prune' spawn found — F1's absence check reads nothing"
+  fi
+  if has "$PRUNE" '"image", *"prune", *"-af"|"image", *"prune", *"-a"|"--all"'; then
+    bad "F1 dockerAppsPruneImages passes -a — it can remove a locally built image with no registry to restore from"
+  else
+    ok "F1 dockerAppsPruneImages never passes -a"
   fi
   if has "$PRUNE" 'label!=dockpanel\.managed=true'; then
-    ok "F2 prune_images_all filters on the same dockpanel.managed label as the scoped reclaim"
+    ok "F2 dockerAppsPruneImages filters on the same dockpanel.managed label as the scoped reclaim"
   else
-    bad "F2 prune_images_all has no label filter — diverges from the scoped reclaim's own C4 precedent"
+    bad "F2 dockerAppsPruneImages has no label filter — diverges from the scoped reclaim's own C4 precedent"
   fi
 fi
 

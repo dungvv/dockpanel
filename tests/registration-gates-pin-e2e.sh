@@ -35,26 +35,26 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-AUTH=panel/backend/src/routes/auth.rs
-OAUTH=panel/backend/src/routes/oauth.rs
-SETTINGS=panel/backend/src/routes/settings.rs
+AUTH=panel/go/internal/api/rt_auth.go
+OAUTH=panel/go/internal/api/rt_oauth.go
 SETTINGS_TSX=panel/frontend/src/pages/Settings.tsx
 
-for f in "$AUTH" "$OAUTH" "$SETTINGS" "$SETTINGS_TSX"; do
+for f in "$AUTH" "$OAUTH" "$SETTINGS_TSX"; do
   [ -f "$f" ] || { echo "missing file: $f"; exit 1; }
 done
 
 echo "── 1. the password door defaults CLOSED ──"
 
-# An absent row must mean disabled. `unwrap_or(true)` here would open every
-# panel that has never touched the setting, which is most of them.
+# An absent row must mean disabled. Refusing only on an explicit "false" here
+# would open every panel that has never touched the setting, which is most of them.
+# Go shape: queryScalarOpt returns *string; nil (absent) must refuse.
 if grep -q "key = 'self_registration_enabled'" "$AUTH"; then
   ok "register reads self_registration_enabled"
 else
   bad "$AUTH no longer consults self_registration_enabled — the toggle in Settings governs nothing"
 fi
 
-if grep -A 6 "key = 'self_registration_enabled'" "$AUTH" | grep -cF 'unwrap_or(false)' >/dev/null; then
+if grep -A 6 "key = 'self_registration_enabled'" "$AUTH" | grep -cF 'if reg == nil || *reg != "true" {' >/dev/null; then
   ok "an absent self_registration_enabled row means DISABLED"
 else
   bad "$AUTH no longer defaults self-registration closed — a fresh panel would accept public signups with nothing configured"
@@ -64,14 +64,14 @@ fi
 # under lockdown that still accepts registrations is worse than one that never
 # had the toggle.
 #
-# Scoped to the REGISTER FUNCTION, not to the file. auth.rs calls
-# is_locked_down in three places; the first is in a different function entirely,
+# Scoped to the REGISTER FUNCTION, not to the file. rt_auth.go calls
+# SecurityHardeningIsLockedDown in several places; the first is in a different function entirely,
 # ~300 lines above register. Comparing first-in-file against the registration
 # line was true for reasons that had nothing to do with register, and stayed
 # green when register's own lockdown check was deleted. A line-ordering
 # assertion is only as good as the region it reads.
-REGISTER_BODY=$(awk '/^pub async fn register\(/,/^}/' "$AUTH")
-LOCK=$(printf '%s\n' "$REGISTER_BODY" | grep -n 'is_locked_down' | head -1 | cut -d: -f1)
+REGISTER_BODY=$(awk '/^func rtAuthRegisterUser\(/,/^}/' "$AUTH")
+LOCK=$(printf '%s\n' "$REGISTER_BODY" | grep -n 'SecurityHardeningIsLockedDown' | head -1 | cut -d: -f1)
 SREG=$(printf '%s\n' "$REGISTER_BODY" | grep -n "key = 'self_registration_enabled'" | head -1 | cut -d: -f1)
 if [ -z "$REGISTER_BODY" ]; then
   bad "could not isolate the register function in $AUTH — this section is reading nothing"
@@ -139,21 +139,7 @@ done
 # them into one const (the two had already drifted); settings-controls-pin-e2e.sh
 # §5 now fails if a second inline list ever reappears.
 #
-# Comment lines are stripped before matching: the const carries prose about which
-# keys it holds, and a pin that greps raw source is satisfied by the explanation
-# of a key rather than the key itself.
-UPDATE_FN=$(sed -n '/pub const ALLOWED_KEYS/,/^\];/p' "$SETTINGS" | grep -v '^\s*//')
-if [ -z "$UPDATE_FN" ]; then
-  bad "could not isolate ALLOWED_KEYS in $SETTINGS — the allowlist arms below are reading nothing"
-else
-  for key in self_registration_enabled oauth_auto_create; do
-    if printf '%s\n' "$UPDATE_FN" | grep -cF "\"$key\"" >/dev/null; then
-      ok "$key is in the PUT /api/settings write allowlist"
-    else
-      bad "$key is not writable through PUT /api/settings — its toggle would fail with 'Unknown setting'"
-    fi
-  done
-fi
+# 3-allowlist retired: covered by TestPinRegistrationGatesAllowlist (panel/go/internal/api/pin_registration_gates_test.go)
 
 echo
 echo "── 4. the control tells the truth about the default it reflects ──"
@@ -167,13 +153,13 @@ echo "── 4. the control tells the truth about the default it reflects ──
 # accounts — a control that lies in the reassuring direction, which is worse
 # than no control at all because it ends the operator's investigation.
 if grep -qF 'settings.oauth_auto_create !== "false"' "$SETTINGS_TSX"; then
-  ok "the OAuth toggle renders absent-as-ON, matching the backend's unwrap_or(true)"
+  ok "the OAuth toggle renders absent-as-ON, matching the backend's absent-means-allowed default"
 else
   bad "the OAuth auto-registration toggle does not render an absent row as ON — it disagrees with the server's own default and would show OFF while signups succeed"
 fi
 
 if grep -qF 'settings.self_registration_enabled === "true"' "$SETTINGS_TSX"; then
-  ok "the self-registration toggle renders absent-as-OFF, matching its unwrap_or(false)"
+  ok "the self-registration toggle renders absent-as-OFF, matching its absent-means-disabled default"
 else
   bad "the self-registration toggle no longer renders an absent row as OFF — it disagrees with the server's own default"
 fi
@@ -184,13 +170,13 @@ echo "── 5. the first-admin door closes behind itself ──"
 # POST /api/auth/setup creates the initial admin and must refuse once ANY user
 # exists, or a stranger who finds the panel before its owner finishes installing
 # owns the box. Checked by the count, before the password is hashed.
-if grep -A 12 'pub async fn setup' "$AUTH" | grep -c 'SELECT COUNT(\*) FROM users' >/dev/null; then
+if grep -A 12 '^func rtAuthSetup(' "$AUTH" | grep -c 'SELECT COUNT(\*) FROM users' >/dev/null; then
   ok "setup counts existing users before doing anything"
 else
   bad "$AUTH's setup route no longer counts users first — the initial-admin endpoint may be re-callable"
 fi
 
-if grep -A 16 'pub async fn setup' "$AUTH" | grep -c 'Setup already completed' >/dev/null; then
+if grep -A 16 '^func rtAuthSetup(' "$AUTH" | grep -c 'Setup already completed' >/dev/null; then
   ok "setup refuses once a user exists"
 else
   bad "$AUTH's setup route no longer refuses after the first user — anyone reaching it could create another admin"

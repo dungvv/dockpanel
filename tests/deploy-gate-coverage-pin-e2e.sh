@@ -19,13 +19,20 @@
 # key arm named `users` and could not see the two bare keys pointing at
 # `servers`). It DERIVES the door set:
 #
-#   A = agent service functions that call `docker.create_container(`
+#   A = agent service files that call `docker.ContainerCreate(`
 #   B = agent route handlers that call something in A
 #   C = the agent route PATHS bound to the handlers in B
-#   D = backend handlers that post to a path in C
+#   D = backend functions that post to a path in C
 #
 # and asserts that every member of D consults the gate, or is a NAMED exemption
 # whose reason is written in the source. A new door joins D by existing.
+#
+# Go port (panel/go/internal/agent, panel/go/internal/api): the gate is
+# rt_image_scans.go::rtImageScansPreflightGate / rtImageScansPreflightGateImage.
+# The Go backend often posts to the agent from a helper or a spawned task
+# rather than the handler (rtDockerAppsDeployTask, rtGitDeploysComposeDeploy,
+# rtStacksRestorePrevious), so a door that does not itself reach the gate is
+# gated iff EVERY function that calls it does — one hop up the call graph.
 #
 # ⚠ Never put the row loop on the right-hand side of a pipe: the loop runs in a
 # subshell and `ok`/`bad` increment counters that die at the closing brace, so
@@ -46,12 +53,12 @@ bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
 G=/usr/bin/grep
 
-AGENT_SVC=panel/agent/src/services
-AGENT_ROUTES=panel/agent/src/routes/docker_apps.rs
-BE_ROUTES=panel/backend/src/routes
-SCANS=$BE_ROUTES/image_scans.rs
+AGENT_SVC=panel/go/internal/agent/services
+AGENT_ROUTES=panel/go/internal/agent/routes/docker_apps.go
+BE_ROUTES=panel/go/internal/api
+SCANS=$BE_ROUTES/rt_image_scans.go
 
-for f in "$AGENT_ROUTES" "$SCANS" "$BE_ROUTES/docker_apps.rs" "$BE_ROUTES/stacks.rs" "$BE_ROUTES/mod.rs"; do
+for f in "$AGENT_ROUTES" "$SCANS" "$BE_ROUTES/rt_docker_apps.go" "$BE_ROUTES/rt_stacks.go" "$BE_ROUTES/core_router.go"; do
   [ -f "$f" ] || { echo "  FATAL: $f missing — wrong tree?"; exit 1; }
 done
 
@@ -60,8 +67,8 @@ done
 # looking at zero subjects (lesson #143).
 echo "── §0 discovering the doors ──"
 
-# A: agent service functions that create a container.
-CREATORS=$($G -rl "create_container(" "$AGENT_SVC" --include=*.rs | sort -u)
+# A: agent service files that create a container.
+CREATORS=$($G -rl "\.ContainerCreate(" "$AGENT_SVC" --include=*.go --exclude=*_test.go | sort -u)
 CREATORS_N=$(printf '%s\n' "$CREATORS" | $G -c . || true)
 if [ "$CREATORS_N" -ge 2 ]; then
   ok "found $CREATORS_N agent service file(s) that create containers (>= 2 known to exist)"
@@ -74,7 +81,7 @@ fi
 # Anchored at the end: `/apps/update-check` and `/apps/{id}/update-limits` are
 # routes that never create a container, and a loose `update` match would drag
 # them in and then report them ungated for ever.
-AGENT_PATHS=$($G -oE '\.route\("(/apps[^"]*)"' "$AGENT_ROUTES" \
+AGENT_PATHS=$($G -oE 'r\.Handle\("[A-Z]+ /apps[^"]*"' "$AGENT_ROUTES" \
               | $G -oE '/apps[^"]*' \
               | $G -E '(deploy|change-image|/update)$' | sort -u)
 AGENT_PATHS_N=$(printf '%s\n' "$AGENT_PATHS" | $G -c . || true)
@@ -85,8 +92,8 @@ else
 fi
 printf '     %s\n' $AGENT_PATHS
 
-# D: backend handlers that post to one of those paths. Matched on the literal
-# prefix, because the backend builds them with format! holes.
+# D: backend functions that post to one of those paths. Matched on the SHAPE,
+# because the backend builds them with holes ("/apps/"+cid+"/update").
 DOORS=()
 PATHS_F=$(mktemp); DOORS_F=$(mktemp)
 trap 'rm -f "$PATHS_F" "$DOORS_F"' EXIT
@@ -99,20 +106,22 @@ printf '%s\n' $AGENT_PATHS > "$PATHS_F"
 python3 - "$PATHS_F" > "$DOORS_F" <<'PYEOF'
 import re, sys, glob
 paths = [l.strip() for l in open(sys.argv[1]) if l.strip()]
-
+# A {hole} is either inside one literal (fmt.Sprintf "%s") or a `"+x+"` splice.
+HOLE = '(?:[^"]*|"\\s*\\+[^+"]*\\+\\s*")'
 def to_pattern(p):
-    # A backend caller builds these with format! holes, so match the SHAPE.
-    # Anchored on the closing quote so ".../update" does not also match
+    # Anchored on both quotes so ".../update" does not also match
     # ".../update-limits", which creates no container.
-    body = re.sub(r"\{[^}]*\}", "\x00", p)
-    return re.compile(re.escape(body).replace("\x00", '[^"]*') + '"')
+    parts = re.split(r"\{[^}]*\}", p)
+    return re.compile('"' + HOLE.join(re.escape(x) for x in parts) + '"')
 
 pats = [to_pattern(p) for p in paths]
-for f in sorted(glob.glob("panel/backend/src/routes/*.rs")):
+for f in sorted(glob.glob("panel/go/internal/api/rt_*.go")):
+    if f.endswith("_test.go"):
+        continue
     src = re.sub(r"^\s*//.*$", "", open(f).read(), flags=re.M)  # prose is not a door (#149)
     fn = None
     for line in src.split("\n"):
-        m = re.match(r"pub async fn (\w+)\(", line)
+        m = re.match(r"func (?:\([^)]*\) )?(\w+)\(", line)
         if m:
             fn = m.group(1)
             continue
@@ -133,8 +142,10 @@ for d in "${DOORS[@]}"; do printf '     %s\n' "${d/|/ :: }"; done
 
 # The one door that must NOT gate, and why. An exemption is a product decision,
 # so it has to be written down in the source it exempts — this arm checks that
-# the reason is there, not merely that the name is on a list.
-EXEMPT_FN="update_app"
+# the reason is there, not merely that the name is on a list. (The gate's doc
+# names it by its route-level name, update_app.)
+EXEMPT_FN="rtDockerAppsUpdateApp"
+EXEMPT_DOC_NAME="update_app"
 EXEMPT_WHY="re-pulls the SAME reference"
 
 # ── §1 every door consults the gate ─────────────────────────────────────────
@@ -144,44 +155,65 @@ UNGATED=""
 GATED_N=0
 
 # A door may reach the gate through a wrapper — `git_deploys` does, because two
-# background tasks needed the same three checks. An arm that greps for the
-# gate's own name would call those doors ungated the moment someone extracts a
-# helper (lesson #150: extracting a helper moves the subject of every pin that
+# background tasks needed the same checks. An arm that greps for the gate's own
+# name would call those doors ungated the moment someone extracts a helper
+# (lesson #150: extracting a helper moves the subject of every pin that
 # measured it). So build the set of functions that REACH the gate, one hop.
-GATE_REACHING="preflight_gate|preflight_gate_image"
+GATE_REACHING="rtImageScansPreflightGate|rtImageScansPreflightGateImage"
 while IFS= read -r wrapper; do
   [ -n "$wrapper" ] && GATE_REACHING="$GATE_REACHING|$wrapper"
 done < <(
-  $G -rhB 40 -E 'preflight_gate(_image)?\(' $BE_ROUTES/*.rs \
-    | $G -oE '^(pub )?(async )?fn [a-z_]+' | $G -oE '[a-z_]+$' | sort -u \
-    | $G -vE '^(preflight_gate|preflight_gate_image)$'
+  cat $BE_ROUTES/rt_*.go | $G -vE '^[[:space:]]*//' | $G -hB 40 -E 'rtImageScansPreflightGate(Image)?\(' \
+    | $G -oE '^func (\([^)]*\) )?[A-Za-z_]+' | $G -oE '[A-Za-z_]+$' | sort -u \
+    | $G -vE '^(rtImageScansPreflightGate|rtImageScansPreflightGateImage)$'
 )
+
+ALL_SRC=$(cat $(ls $BE_ROUTES/*.go | $G -v '_test\.go$') | $G -vE '^[[:space:]]*//')
+fnbody_of() {
+  perl -0777 -ne 'print $1 if /\n(func (?:\([^)]*\) )?\Q'"$1"'\E\(.*?\n\})\n/s' <<< "$ALL_SRC"
+}
+callers_of() {
+  # Top-level funcs whose body calls $1 (excluding its own definition).
+  awk -v fn="$1" '
+    /^func / { cur = $0; sub(/^func (\([^)]*\) )?/, "", cur); sub(/\(.*/, "", cur) }
+    cur != fn && index($0, fn "(") && !/^func / { print cur }
+  ' <<< "$ALL_SRC" | sort -u
+}
+reaches_gate() { $G -qE "($GATE_REACHING)\(" <<< "$(fnbody_of "$1")"; }
 
 for d in "${DOORS[@]}"; do
   file=${d%%|*}; fn=${d##*|}
-  body=$(perl -0777 -ne '
-      if (/pub async fn \Q'"$fn"'\E\(.*?(?=\npub (?:async )?fn |\z)/s) { print $& }
-    ' "$file")
+  body=$(fnbody_of "$fn")
   if [ -z "$body" ]; then
     bad "could not extract $fn from $file — the extractor broke, not the code"
     continue
   fi
-  if $G -qE "($GATE_REACHING)\(" <<< "$body"; then
+  if reaches_gate "$fn"; then
     GATED_N=$((GATED_N+1))
   elif [ "$fn" = "$EXEMPT_FN" ]; then
     :
   else
-    UNGATED="$UNGATED ${file##*/}::$fn"
+    callers=$(callers_of "$fn")
+    all=1
+    [ -z "$callers" ] && all=0
+    for c in $callers; do reaches_gate "$c" || all=0; done
+    if [ "$all" -eq 1 ]; then
+      GATED_N=$((GATED_N+1))
+      printf '     %s gated via every caller: %s\n' "$fn" "$(echo $callers)"
+    else
+      UNGATED="$UNGATED ${file##*/}::$fn"
+    fi
   fi
 done
 if [ -z "$UNGATED" ]; then
-  ok "all $GATED_N non-exempt doors call preflight_gate/preflight_gate_image"
+  ok "all $GATED_N non-exempt doors call rtImageScansPreflightGate/…GateImage (directly, via a wrapper, or in every caller)"
 else
   bad "door(s) that run an operator-chosen image WITHOUT asking the gate —$UNGATED — the threshold an operator set does not apply there (#545)"
 fi
 
 # Exact, not >=: an arm that asks for "at least one" survives deleting one
-# (lesson #546).
+# (lesson #546). Go: deploy task, change-image, compose deploy, the git
+# deploys' shared compose helper, stacks create/update/restore-previous.
 EXPECTED_GATED=7
 if [ "$GATED_N" -eq "$EXPECTED_GATED" ]; then
   ok "exactly $EXPECTED_GATED doors call the gate, as expected"
@@ -192,40 +224,41 @@ fi
 # ── §2 the exemption is justified in the source it exempts ──────────────────
 echo
 echo "── §2 the one exemption states its reason where it applies ──"
-GATE_DOC=$(perl -0777 -ne 'print $& if /\/\/\/ The gate itself.*?pub async fn preflight_gate_image/s' "$SCANS")
+GATE_DOC=$(perl -0777 -ne 'print $& if /\/\/ rtImageScansPreflightGateImage is the gate itself.*?\nfunc rtImageScansPreflightGateImage\(/s' "$SCANS")
 if [ -z "$GATE_DOC" ]; then
-  bad "could not read preflight_gate_image's doc block — §2 is vacuous"
-elif $G -qF "$EXEMPT_WHY" <<< "$GATE_DOC" && $G -qF "$EXEMPT_FN" <<< "$GATE_DOC"; then
-  ok "the doc names $EXEMPT_FN and why it is exempt (it re-pulls the same reference)"
+  bad "could not read rtImageScansPreflightGateImage's doc block — §2 is vacuous"
+elif $G -qF "$EXEMPT_WHY" <<< "$GATE_DOC" && $G -qF "$EXEMPT_DOC_NAME" <<< "$GATE_DOC" \
+     && ! reaches_gate "$EXEMPT_FN" && [ -n "$(fnbody_of "$EXEMPT_FN")" ]; then
+  ok "the doc names $EXEMPT_DOC_NAME and why it is exempt (it re-pulls the same reference), and $EXEMPT_FN indeed does not gate"
 else
-  bad "preflight_gate_image no longer explains why $EXEMPT_FN is exempt — an undocumented exemption is indistinguishable from a missed door"
+  bad "rtImageScansPreflightGateImage no longer explains why $EXEMPT_DOC_NAME ($EXEMPT_FN) is exempt — an undocumented exemption is indistinguishable from a missed door"
 fi
 
 # ── §3 allowed_images is compared against an IMAGE, not a catalogue id ──────
 echo
 echo "── §3 the allowed-images policy judges an image ──"
-DEPLOY_BODY=$(perl -0777 -ne 'print $& if /pub async fn deploy\(.*?(?=\npub (?:async )?fn )/s' "$BE_ROUTES/docker_apps.rs")
+DEPLOY_BODY=$(fnbody_of rtDockerAppsDeploy)
 if [ -z "$DEPLOY_BODY" ]; then
-  bad "could not extract deploy() — §3 is vacuous"
+  bad "could not extract rtDockerAppsDeploy — §3 is vacuous"
 else
-  if $G -qE 'body\.template_id\.contains\(' <<< "$DEPLOY_BODY"; then
-    bad "allowed_images is matched with template_id.contains() again — the field says images and a substring test admits evil/nginx-backdoor"
+  if $G -qE 'strings\.Contains\([^)]*TemplateID' <<< "$DEPLOY_BODY"; then
+    bad "allowed_images is matched with a substring test over TemplateID again — the field says images and a substring test admits evil/nginx-backdoor"
   else
     ok "allowed_images is no longer a substring test over the catalogue id"
   fi
-  if $G -qE 'image_allowed_by\(' <<< "$DEPLOY_BODY"; then
-    ok "deploy() judges the resolved image through image_allowed_by"
+  if $G -qE 'rtDockerAppsImageAllowedBy\(' <<< "$DEPLOY_BODY"; then
+    ok "rtDockerAppsDeploy judges the resolved image through rtDockerAppsImageAllowedBy"
   else
-    bad "deploy() no longer calls image_allowed_by — the policy stopped reading the image"
+    bad "rtDockerAppsDeploy no longer calls rtDockerAppsImageAllowedBy — the policy stopped reading the image"
   fi
 fi
 
-POLICY_N=$($G -c "enforce_allowed_images(" $BE_ROUTES/docker_apps.rs $BE_ROUTES/stacks.rs 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
+POLICY_N=$($G -vhE '^[[:space:]]*//' $BE_ROUTES/rt_docker_apps.go $BE_ROUTES/rt_stacks.go | $G -c "rtDockerAppsEnforceAllowedImages(")
 # 1 definition + 4 call sites.
 if [ "$POLICY_N" -eq 5 ]; then
-  ok "enforce_allowed_images is defined once and called at all 4 image-taking doors"
+  ok "rtDockerAppsEnforceAllowedImages is defined once and called at all 4 image-taking doors"
 else
-  bad "expected 5 enforce_allowed_images occurrences (1 def + 4 doors), found $POLICY_N"
+  bad "expected 5 rtDockerAppsEnforceAllowedImages occurrences (1 def + 4 doors), found $POLICY_N"
 fi
 
 # ── §4 the published claim does not outrun the code ─────────────────────────
@@ -253,13 +286,15 @@ fi
 # ── §5 compose images are parsed, not grepped ───────────────────────────────
 echo
 echo "── §5 the gate's input comes from a parse ──"
-CI=$(perl -0777 -ne 'print $& if /pub fn compose_images\(.*?\n\}/s' "$BE_ROUTES/mod.rs")
+CORE_SRC=$($G -vE '^[[:space:]]*//' "$BE_ROUTES/core_router.go")
+CI=$(perl -0777 -ne 'print $1 if /\n(func composeImages\(.*?\n\})\n/s' <<< "$CORE_SRC")
+CD=$(perl -0777 -ne 'print $1 if /\n(func composeDoc\(.*?\n\})\n/s' <<< "$CORE_SRC")
 if [ -z "$CI" ]; then
-  bad "compose_images is gone — the compose doors have nothing to gate on"
-elif $G -qF 'serde_yaml_ng::from_str' <<< "$CI"; then
-  ok "compose_images deserialises the document (a string scan is bypassable with anchors)"
+  bad "composeImages is gone — the compose doors have nothing to gate on"
+elif $G -qF 'composeDoc(src)' <<< "$CI" && $G -qF 'yaml.NewDecoder(' <<< "$CD"; then
+  ok "composeImages deserialises the document via composeDoc/yaml.NewDecoder (a string scan is bypassable with anchors)"
 else
-  bad "compose_images no longer parses the YAML — anchors and aliases would hide an image from the gate"
+  bad "composeImages no longer parses the YAML — anchors and aliases would hide an image from the gate"
 fi
 
 # ── §6 the buttons that PRODUCE the scans pass a name, not a container id ───

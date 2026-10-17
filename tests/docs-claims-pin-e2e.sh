@@ -9,7 +9,8 @@
 # It drifted, exactly as you would expect. s263 found the Docker-app template
 # count published as 152 on all three surfaces while the catalogue in source
 # held 153 — one template added, ten claim sites not updated, nobody able to
-# notice because checking meant counting a Rust array by hand.
+# notice because checking meant counting a Rust array by hand. (The catalogue
+# is now a Go slice; the sources below are the Go tree, panel/go.)
 #
 # So the rule this suite enforces is: a number on a public surface must have a
 # derivation from source, and that derivation runs in CI. The suite LOCATES the
@@ -35,14 +36,14 @@ while IFS= read -r f; do WEB_SURFACES+=("$f"); done < <(find website/client/src 
 
 echo "── 1. Docker app template count is derived from the catalogue, not typed ──"
 
-# The catalogue is a single static slice; each entry opens with `id:`. Counting
-# `AppTemplateDef` would be one too many — the slice's own type annotation
-# names it as well.
-CATALOGUE=panel/agent/src/services/docker_apps.rs
+# The catalogue is a single slice literal; each entry opens with an `ID:` field
+# at two tabs of indent. Counting `dockerAppsTemplateDef` would be one too
+# many — the slice's own type names it as well.
+CATALOGUE=panel/go/internal/agent/services/docker_apps.go
 N_TEMPLATES=$(awk '
-  /static TEMPLATES/ { inside = 1; next }
-  inside && /^\];/   { exit }
-  inside && /^        id: "/ { n++ }
+  /^var dockerAppsTemplates = / { inside = 1; next }
+  inside && /^}/   { exit }
+  inside && /^\t\tID: +"/ { n++ }
   END { print n + 0 }
 ' "$CATALOGUE")
 
@@ -78,13 +79,15 @@ done
 echo
 echo "── 2. FEATURES.md's version stamp tracks the shipped version ──"
 
-VERSION=$(grep -m1 '^version = ' panel/backend/Cargo.toml | sed -e 's/.*"\(.*\)".*/\1/')
+# The shipped version: the top-level VERSION file, which every build stamps.
+VERSION_SRC=VERSION
+VERSION=$(tr -d '[:space:]' < "$VERSION_SRC" 2>/dev/null)
 STAMP=$(grep -m1 -oE '\*\*Version\*\*: v?[0-9]+\.[0-9]+\.[0-9]+' FEATURES.md | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
 
 if [ -z "$STAMP" ]; then
   bad "FEATURES.md has no '**Version**: vX.Y.Z' stamp to check"
 elif [ "$STAMP" = "$VERSION" ]; then
-  ok "FEATURES.md stamped v$STAMP, matching panel/backend/Cargo.toml"
+  ok "FEATURES.md stamped v$STAMP, matching $VERSION_SRC"
 else
   bad "FEATURES.md stamped v$STAMP but the shipped version is v$VERSION — the manifest is describing an older product"
 fi
@@ -253,8 +256,10 @@ echo "── 4. Claims the behavioural drills disproved must not reappear ──
 # database while `create_backup` was tar-over-the-webroot and nothing else
 # (s259). The claim is TRUE now, since v2.34.0 — this pin exists so that if the
 # database half is ever reverted, the documentation cannot go back to lying
-# about it silently.
-if grep -q 'site_database_specs' panel/backend/src/routes/backups.rs 2>/dev/null; then
+# about it silently. Go: rtBackupsCreate resolves the site's databases via
+# rtBackupsSiteDatabasesFor and sends their specs to the agent.
+BK_CREATE=$(awk '/^func rtBackupsCreate\(/,/^}/' panel/go/internal/api/rt_backups.go 2>/dev/null)
+if grep -q 'rtBackupsSiteDatabasesFor(' <<< "$BK_CREATE" && grep -q '"databases": siteDBs.Specs' <<< "$BK_CREATE"; then
   ok "site backups still collect database specs — the backups guide's claim remains true"
 else
   bad "site backups no longer collect database specs, but docs/guides/backups.md still promises databases are included"
@@ -263,8 +268,12 @@ fi
 # The mail sandbox fix (s262): OpenDKIM's config was RELOCATED into a permitted
 # path. "Fixing" it by widening ReadWritePaths would pass every functional test
 # while removing the reason the bug was survivable.
-UNIT=$(find . -name 'dockpanel-agent.service' -not -path './panel/*/target/*' | head -1)
-if [ -n "$UNIT" ] && grep -qE '^ReadWritePaths=.*/etc/opendkim\.conf' "$UNIT"; then
+# The unit the Go agent ships (go:embed) — required to exist, so the absence
+# check below cannot pass by reading nothing.
+UNIT=panel/go/internal/agent/services/dockpanel-agent.service
+if [ ! -f "$UNIT" ] || ! grep -q '^ReadWritePaths=' "$UNIT"; then
+  bad "cannot read ReadWritePaths= from $UNIT — the sandbox check below would be vacuous"
+elif grep -qE '^ReadWritePaths=.*/etc/opendkim\.conf' "$UNIT"; then
   bad "the agent unit was widened to /etc/opendkim.conf instead of relocating the config (see docs/testing.md)"
 else
   ok "agent sandbox still not widened for opendkim — as docs/testing.md tells readers"
@@ -462,13 +471,23 @@ fi
 # Slurped per file with `perl -0777` so the newline between `.route(` and its
 # path stops mattering. Per FILE, never a concatenated stream: on one stream a
 # file ending in `.route(` could match the next file's opening string literal.
+#
+# Go port: a route is a distinct registered PATH (the axum `.route(path, ...)`
+# unit; ServeMux takes one Handle per method, so methods are de-duplicated),
+# from every r.Handle/HandlePublic("[METHOD ]/path") literal in the router's
+# non-test files, slurped per file for the same wrapping reason. The api's one
+# table-driven registrar (POST /api/services/<row> per rtSystemServices entry)
+# is expanded from its table.
 route_count() {
-  local total=0 n f
-  while IFS= read -r f; do
-    n=$(perl -0777 -ne '$c++ while /\.route\(\s*"[^"]+"/gs; END{print $c+0}' "$f")
-    total=$((total + n))
-  done < <(find "$1" -name '*.rs')
-  echo "$total"
+  local f
+  for f in "$1"/*.go; do
+    case "$f" in *_test.go) continue ;; esac
+    perl -0777 -ne '
+      while (/\.Handle(?:Public)?\(\s*"(?:(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) )?(\/[^"]*)"\s*,/gs) { print "$1\n" }
+      if (/r\.Handle\("POST \/api\/services\/"\+s\.path,/ && /var rtSystemServices = \[\]struct\{[^}]*\}\{(.*?)\n\}/s) {
+        my $t = $1; print "/api/services/$1\n" while $t =~ /\{"([^"]+)", "/g;
+      }' "$f"
+  done | sort -u | wc -l | tr -d ' '
 }
 
 derive() {
@@ -479,16 +498,16 @@ derive() {
       # Routes registered on the two axum routers. The published figure used to
       # be "776 API endpoints (496 backend + 280 agent)" — a decomposition that
       # summed correctly and matched source on neither side.
-      echo $(( $(route_count panel/backend/src) + $(route_count panel/agent/src) )) ;;
+      echo $(( $(route_count panel/go/internal/api) + $(route_count panel/go/internal/agent/routes) )) ;;
     "Regression-pin assertions")
       # Re-summed from docs/testing.md's own table, independently of §3.
       awk -F'|' '/^\| *`[a-z0-9-]+\.sh` *\|/ { gsub(/ /,"",$3); s+=$3 } END { print s+0 }' docs/testing.md ;;
     "Frontend pages")
       find panel/frontend/src/pages -maxdepth 1 -name '*.tsx' 2>/dev/null | wc -l ;;
     "DB migrations")
-      find panel/backend/migrations -maxdepth 1 -name '*.sql' 2>/dev/null | wc -l ;;
+      find panel/go/internal/api/migrations -maxdepth 1 -name '*.sql' 2>/dev/null | wc -l ;;
     "Supervised background services")
-      grep -cE '^ *spawn_supervised\("' panel/backend/src/main.rs 2>/dev/null ;;
+      grep -cE '^[[:space:]]*spawnSupervised\(shutdown, "' panel/go/internal/api/core_state.go 2>/dev/null ;;
     *)
       return 1 ;;
   esac
@@ -772,7 +791,7 @@ fi
 echo
 echo "── s309: the disk-full forecast the guide promises must be reachable ──"
 
-DISK_Q=$(sed -n '/GAP 6: Disk-full forecast/,/fetch_all/p' panel/backend/src/services/alert_engine.rs)
+DISK_Q=$(sed -n '/GAP 6: Disk-full forecast/,/server\.ID)$/p' panel/go/internal/api/svc_alert_engine.go | grep -vE '^[[:space:]]*//')
 if [ -z "$DISK_Q" ]; then
   bad "could not extract the disk-forecast query — this arm is measuring nothing"
 else
@@ -809,10 +828,12 @@ fi
 # somebody adds a seventh manifest, which is the failure this arm exists for. And
 # the enumeration is asserted before it is trusted — an empty find would print a
 # clean green having examined nothing.
-mapfile -t MANIFESTS < <(find . -maxdepth 4 \( -name Cargo.toml -o -name package.json \) \
+# go.mod has no licence field, so the Go module is covered by LICENSE alone; the
+# manifests that CAN declare a licence are the package.json files.
+mapfile -t MANIFESTS < <(find . -maxdepth 4 -name package.json \
   -not -path '*/node_modules/*' -not -path '*/target/*' -not -path '*/dist/*' \
   -not -path './.git/*' | sort)
-if [ "${#MANIFESTS[@]}" -lt 6 ]; then
+if [ "${#MANIFESTS[@]}" -lt 3 ]; then
   bad "only ${#MANIFESTS[@]} first-party manifests enumerated — the sweep went blind"
 else
   ok "${#MANIFESTS[@]} first-party manifests enumerated"
@@ -849,7 +870,7 @@ fi
 # are reported in ONE assertion naming them, so the arm cannot pass by measuring
 # an empty set and cannot flood the log with one line per row.
 FEAT_PATHS=$(awk '/^\|/ {print}' FEATURES.md \
-  | grep -oE '`[a-z_]+(/[a-z_.]+)+\.(rs|tsx|ts)`' \
+  | grep -oE '`[a-z_]+(/[a-z_.]+)+\.(go|rs|tsx|ts)`' \
   | tr -d '`' | sort -u)
 feat_total=0; feat_missing=""
 for rel in $FEAT_PATHS; do
@@ -857,7 +878,9 @@ for rel in $FEAT_PATHS; do
   # The columns are relative to different crates (backend, agent, frontend), so
   # the path is resolved by SUFFIX anywhere under panel/ rather than by guessing
   # which column a token came from.
-  if [ -z "$(find panel -path "*/$rel" -print -quit 2>/dev/null)" ]; then
+  # A `.rs` citation names the retired Rust tree, which nothing ships from: it
+  # is stale even while a copy of that tree is still on disk.
+  if [[ "$rel" == *.rs ]] || [ -z "$(find panel -path "*/$rel" -print -quit 2>/dev/null)" ]; then
     feat_missing="$feat_missing $rel"
   fi
 done

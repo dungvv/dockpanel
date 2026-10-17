@@ -24,6 +24,12 @@
 # target URL, computed once up front from the SAME `deploy_url` helper every
 # other call site uses, so a preview link can never carry a hardcoded scheme.
 #
+# Go port: panel/go/internal/api/rt_git_deploys.go::rtGitDeploysHandlePreviewDeploy.
+# The Go port routes all six calls through ONE local `status(sha, state)`
+# closure that holds the token guard and the shared githubTarget, so the arms
+# below count closure call sites and pin the closure's single
+# rtGitDeploysSetGithubStatus call instead of six inline guarded calls.
+#
 # Pure source analysis: no box, no network, no build.
 
 set -uo pipefail
@@ -33,67 +39,67 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-ROUTE=panel/backend/src/routes/git_deploys.rs
+ROUTE=panel/go/internal/api/rt_git_deploys.go
 [ -f "$ROUTE" ] || { echo "missing $ROUTE"; exit 1; }
 
-strip() { sed 's://.*::' "$1"; }
+# Whole-line Go comments only (a trailing-// strip would eat "https://…").
+strip() { grep -vE '^[[:space:]]*//' "$1"; }
 SRC=$(strip "$ROUTE")
 
 has()  { grep -q  -- "$2" <<< "$1"; }
 hasE() { grep -qE -- "$2" <<< "$1"; }
-# Bounded to ONE fn body via brace balance, not a bare /pat/,/^}/ awk range —
-# `handle_preview_deploy` is followed by other top-level fns starting with `}`
-# at column 0 too (a nested `match`/`if` arm can also dedent to `}` at col 0
-# inside rustfmt's own style in this file), so a naive first-`^}` stop can
-# under-read the body. Balance-count braces instead.
+# Bounded to ONE func body via brace balance, not a bare /pat/,/^}/ range —
+# the body holds nested closures (`go func() {`) that a naive stop mis-reads.
 fnbody() {
   awk -v fn="$2" '
     BEGIN { depth = 0; found = 0 }
-    $0 ~ "fn " fn "\\(" { found = 1 }
+    !found && index($0, "func " fn "(") == 1 { found = 1 }
     found {
       print
       n = gsub(/\{/, "{"); depth += n
       n = gsub(/\}/, "}"); depth -= n
-      if (depth <= 0 && NR > 1 && found == 1 && depth_started) exit
+      if (depth <= 0 && depth_started) exit
       if (depth > 0) depth_started = 1
     }
   ' <<< "$1"
 }
 
-HPD=$(fnbody "$SRC" handle_preview_deploy)
+HPD=$(fnbody "$SRC" rtGitDeploysHandlePreviewDeploy)
+# Call sites of the local status closure (not its own `status := func(` line).
+CALLS=$(grep -oE '(^|[^A-Za-z0-9_.])status\((commitHash|"HEAD"), "[a-z]+"\)' <<< "$HPD")
 
 echo
 echo "§1 the preview path can even find the function"
 
 if [ -n "$HPD" ]; then
-  ok "handle_preview_deploy is present and readable"
+  ok "rtGitDeploysHandlePreviewDeploy is present and readable"
 else
-  bad "could not read handle_preview_deploy's body — every other arm means nothing"
+  bad "could not read rtGitDeploysHandlePreviewDeploy's body — every other arm means nothing"
 fi
 
 echo
 echo "§2 a status call exists at every outcome, not just one"
 
-status_calls=$(grep -c 'set_github_status(' <<< "$HPD")
+status_calls=$(grep -c . <<< "$CALLS")
 if [ "$status_calls" -ge 6 ]; then
-  ok "at least 6 set_github_status call sites inside the preview path (found $status_calls)"
+  ok "at least 6 status call sites inside the preview path (found $status_calls)"
 else
-  bad "expected >= 6 set_github_status calls inside handle_preview_deploy, found $status_calls"
+  bad "expected >= 6 status(…) calls inside rtGitDeploysHandlePreviewDeploy, found $status_calls"
 fi
 
-if hasE "$HPD" 'set_github_status\([^)]*"pending"'; then
+if hasE "$CALLS" '"pending"'; then
   ok "a pending status is posted before the clone starts"
 else
   bad "no pending status call — GitHub never learns a preview started"
 fi
 
-if hasE "$HPD" 'set_github_status\([^)]*"success"'; then
+if hasE "$CALLS" '"success"'; then
   ok "a success status is posted when the deploy succeeds"
 else
   bad "no success status call on the deploy-success path"
 fi
 
-failure_calls=$(grep -oE 'set_github_status\([^)]*"failure"' <<< "$HPD" | wc -l)
+failure_calls=$(grep -c '"failure"' <<< "$CALLS")
 if [ "$failure_calls" -ge 4 ]; then
   ok "a failure status is posted on at least 4 distinct failure paths (found $failure_calls)"
 else
@@ -103,33 +109,33 @@ fi
 echo
 echo "§3 every call carries a real link, built the one way this file allows"
 
-if hasE "$HPD" 'github_target[[:space:]]*=[[:space:]]*preview_domain\.as_deref\(\)\.map\(\|d\|[[:space:]]*deploy_url\('; then
-  ok "the target URL is computed once via deploy_url(), not re-derived per call site"
+if hasE "$HPD" 'githubTarget = rtGitDeploysPtr\(rtGitDeploysDeployURL\(\*previewDomain, mode\)\)'; then
+  ok "the target URL is computed once via rtGitDeploysDeployURL(), not re-derived per call site"
 else
-  bad "github_target is not built through deploy_url() — a hardcoded scheme could creep back in"
+  bad "githubTarget is not built through rtGitDeploysDeployURL() — a hardcoded scheme could creep back in"
 fi
 
-target_uses=$(grep -c 'github_target' <<< "$HPD")
-if [ "$target_uses" -ge 6 ]; then
-  ok "every status call references the shared github_target (found $target_uses uses)"
+set_calls=$(grep -c 'rtGitDeploysSetGithubStatus(' <<< "$HPD")
+if [ "$set_calls" -eq 1 ] && hasE "$HPD" 'rtGitDeploysSetGithubStatus\([^)]*, githubTarget\)'; then
+  ok "every status call goes through the one closure that passes the shared githubTarget"
 else
-  bad "expected >= 6 uses of github_target (one build + 6 call sites), found $target_uses"
+  bad "expected exactly 1 rtGitDeploysSetGithubStatus(…, githubTarget) (inside the status closure), found $set_calls — a call site may bypass the shared target/guard"
 fi
 
 echo
 echo "§4 the token is only ever read from config, and only sent when present"
 
-if hasE "$HPD" 'github_token[[:space:]]*=[[:space:]]*config\.github_token\.clone\(\)'; then
-  ok "the token is cloned from config once, matching every other call site's own source"
+if hasE "$HPD" 'hasToken := cfg\.GithubToken != nil && \*cfg\.GithubToken != ""'; then
+  ok "the token is read from config once, and its non-empty check is computed alongside"
 else
-  bad "github_token is not sourced from config.github_token — check for a different origin"
+  bad "the GitHub token is not sourced from cfg.GithubToken (with a non-empty check) — check for a different origin"
 fi
 
-empty_guards=$(grep -c '!gh_token.is_empty()' <<< "$HPD")
-if [ "$empty_guards" -ge 6 ]; then
-  ok "every call site guards on a non-empty token (found $empty_guards guards)"
+CLOSURE=$(awk '/status := func\(sha, state string\) \{/{p=1} p{print} p && /^\t\}/{exit}' <<< "$HPD")
+if grep -qF 'if hasToken {' <<< "$CLOSURE" && grep -qF 'rtGitDeploysSetGithubStatus(*cfg.GithubToken' <<< "$CLOSURE"; then
+  ok "the status closure (the only caller) guards on a non-empty token before sending"
 else
-  bad "expected >= 6 non-empty-token guards, found $empty_guards — a call could fire with no token"
+  bad "the status closure no longer guards on hasToken — a call could fire with no token"
 fi
 
 echo

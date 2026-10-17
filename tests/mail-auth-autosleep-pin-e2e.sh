@@ -29,69 +29,102 @@
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MAIL="$REPO/panel/agent/src/routes/mail.rs"
-NGINX="$REPO/panel/agent/src/routes/nginx.rs"
-HEALER="$REPO/panel/backend/src/services/auto_healer.rs"
-APPS_API="$REPO/panel/backend/src/routes/docker_apps.rs"
+MAIL="$REPO/panel/go/internal/agent/routes/mail.go"
+NGINX="$REPO/panel/go/internal/agent/routes/nginx.go"
+HEALER="$REPO/panel/go/internal/api/svc_auto_healer.go"
+APPS_API="$REPO/panel/go/internal/api/rt_docker_apps.go"
 APPS_UI="$REPO/panel/frontend/src/pages/Apps.tsx"
 BACKUPS_UI="$REPO/panel/frontend/src/pages/Backups.tsx"
 BACKUPS_DOC="$REPO/docs/guides/backups.md"
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
-has()  { if grep -q "$2" "$3"; then ok "$1"; else bad "$1"; fi; }
+has()  { if grep -qF -- "$2" "$3"; then ok "$1"; else bad "$1"; fi; }
 hasnt(){ if grep -q "$2" "$3"; then bad "$1"; else ok "$1"; fi; }
+# Go source with // and /* */ comments removed (strings left alone; good enough
+# for the identifiers these arms grep).
+strip() { perl -0pe 's{/\*.*?\*/}{}gs; s{(^|[^:"])//[^\n]*}{$1}g' "$1"; }
+# body of a top-level Go func or method NAME, comments stripped.
+fnbody() { strip "$1" | awk -v fn="$2" '
+  !inb && (index($0, "func " fn "(") == 1 || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) {inb=1}
+  inb {print} inb && /^}/ {exit}'; }
+inbody() { if fnbody "$3" "$4" | grep >/dev/null -cF -- "$2"; then ok "$1"; else bad "$1"; fi; }
+
+for f in "$MAIL" "$NGINX" "$HEALER" "$APPS_API"; do
+  [ -f "$f" ] || bad "source exists: ${f#$REPO/}"
+done
 
 echo
 echo "A. Dovecot can actually read its own password file"
 # The whole defect in one line: the mode must not be owner-only, because the
 # reader is not the owner.
-has  "the passwd-file is written 0640, not owner-only" \
-     'from_mode(0o640)' "$MAIL"
-hasnt "no caller writes the passwd-file owner-only any more" \
-     'DOVECOT_USERS, *"" *, *0o600\|DOVECOT_USERS, &dovecot_lines.join("\\\\n"), 0o600' "$MAIL"
-has  "the group is handed to dovecot" \
-     'args(\["root:dovecot"' "$MAIL"
+inbody "the passwd-file is written 0640, not owner-only" \
+     'os.WriteFile(tmp, []byte(content), 0o640)' "$MAIL" mailWriteDovecotUsers
+# Absence arm with a positive anchor: the helper body must exist (above) and
+# neither it nor any line naming the users path may use an owner-only mode.
+if [ -n "$(fnbody "$MAIL" mailWriteDovecotUsers)" ] \
+   && ! fnbody "$MAIL" mailWriteDovecotUsers | grep >/dev/null -c '0o600' \
+   && ! strip "$MAIL" | grep >/dev/null -c 'mailDovecotUsers.*0o600'; then
+  ok "no caller writes the passwd-file owner-only any more"
+else
+  bad "no caller writes the passwd-file owner-only any more"
+fi
+inbody "the group is handed to dovecot" \
+     '"chown", "root:dovecot", tmp' "$MAIL" mailWriteDovecotUsers
 # Ownership is set on the temp file, so the real path is never momentarily
 # published with permissions that lock auth out.
-if awk '/async fn write_dovecot_users/,/^}/' "$MAIL" \
-   | grep -n 'root:dovecot\|rename' | head -2 | paste -sd' ' - \
-   | grep -c 'root:dovecot.*rename' >/dev/null; then
+if fnbody "$MAIL" mailWriteDovecotUsers \
+   | grep -n 'root:dovecot\|os\.Rename' | head -2 | paste -sd' ' - \
+   | grep >/dev/null -c 'root:dovecot.*os\.Rename'; then
   ok "ownership is set BEFORE the atomic rename"
 else
   bad "ownership is set BEFORE the atomic rename"
 fi
 has  "both writers go through the one helper" \
-     'write_dovecot_users("")' "$MAIL"
+     'mailWriteDovecotUsers("")' "$MAIL"
 has  "…including the account-sync writer" \
-     'write_dovecot_users(&dovecot_lines' "$MAIL"
+     'mailWriteDovecotUsers(strings.Join(users' "$MAIL"
 
 echo
 echo "B. Auto-sleep observes real traffic"
 has  "the agent reports when a domain last served a request" \
      '/nginx/last-activity/{domain}' "$NGINX"
 has  "…and it is routed" \
-     'route("/nginx/last-activity/{domain}", get(last_activity))' "$NGINX"
-has  "…from the access log's mtime, not a parse" \
-     'metadata(&log_file)' "$NGINX"
+     'r.Handle("GET /nginx/last-activity/{domain}", n.lastActivity)' "$NGINX"
+if fnbody "$NGINX" lastActivity | grep >/dev/null -cF 'os.Stat(logFile)' \
+   && fnbody "$NGINX" lastActivity | grep >/dev/null -cF 'ModTime()'; then
+  ok "…from the access log's mtime, not a parse"
+else
+  bad "…from the access log's mtime, not a parse"
+fi
 # "No log" must not be reported as "no traffic": a silent zero is exactly what
-# would let the timer stop a container it knows nothing about.
-has  "a domain with no access log reports unknown, not idle" \
-     '"seconds_ago": seconds_ago' "$NGINX"
+# would let the timer stop a container it knows nothing about. secondsAgo stays
+# a nil `any` (JSON null) unless the stat succeeded.
+if fnbody "$NGINX" lastActivity | grep >/dev/null -cF 'var secondsAgo any' \
+   && fnbody "$NGINX" lastActivity | grep >/dev/null -cF '"seconds_ago": secondsAgo'; then
+  ok "a domain with no access log reports unknown, not idle"
+else
+  bad "a domain with no access log reports unknown, not idle"
+fi
 has  "the sleeper asks before deciding" \
-     'nginx/last-activity/' "$HEALER"
+     '"/nginx/last-activity/"+*c.Domain' "$HEALER"
 has  "…and only ever moves the timestamp forward" \
      'last_activity_at IS NULL OR last_activity_at < ' "$HEALER"
 has  "…and treats a null answer as unknown" \
-     'and_then(|v| v.as_u64())' "$HEALER"
-# The domain is now read, where the old code explicitly discarded it.
-hasnt "the sleeper no longer throws the domain away" \
-     'for (container_id, container_name, _domain, threshold_minutes)' "$HEALER"
+     'if secs, ok := jsonU64(jsonGet(res, "seconds_ago")); ok {' "$HEALER"
+# The domain is now read, where the old code explicitly discarded it: it is
+# selected from container_sleep_config and consulted per row.
+if strip "$HEALER" | grep >/dev/null -cF 'SELECT container_id, container_name, domain, sleep_after_minutes' \
+   && strip "$HEALER" | grep >/dev/null -cF 'if c.Domain != nil && *c.Domain != ""'; then
+  ok "the sleeper no longer throws the domain away"
+else
+  bad "the sleeper no longer throws the domain away"
+fi
 
 echo
 echo "C. A switch that will not be acted on does not report plain success"
 has  "the API reports whether the healer is running" \
-     '"auto_heal_enabled": auto_heal_enabled' "$APPS_API"
+     '"auto_heal_enabled": v != nil && *v == "true"' "$APPS_API"
 has  "…read from the setting the healer itself reads" \
      "key = 'auto_heal_enabled'" "$APPS_API"
 has  "the UI tells the user when the setting will not run" \

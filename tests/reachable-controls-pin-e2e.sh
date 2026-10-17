@@ -46,15 +46,15 @@ ge()  { [ "$2" -ge "$3" ] 2>/dev/null && ok "$1" || bad "$1" "expected at least 
 # real binary explicitly (dockpanel-ops-p2, s357).
 G=/usr/bin/grep
 
-MAIL=panel/backend/src/routes/mail.rs
+MAIL=panel/go/internal/api/rt_mail.go
 MAILUI=panel/frontend/src/pages/Mail.tsx
 WPUI=panel/frontend/src/pages/WordPressToolkit.tsx
-MONITORS=panel/backend/src/routes/monitors.rs
+MONITORS=panel/go/internal/api/rt_monitors.go
 SETTINGS=panel/frontend/src/pages/Settings.tsx
 TERMUI=panel/frontend/src/pages/Terminal.tsx
 EXTUI=panel/frontend/src/pages/Extensions.tsx
 VAULTUI=panel/frontend/src/pages/SecretsManager.tsx
-SECRETS=panel/backend/src/routes/secrets.rs
+SECRETS=panel/go/internal/api/rt_secrets.go
 DBUI=panel/frontend/src/pages/Databases.tsx
 
 for f in "$MAIL" "$MAILUI" "$WPUI" "$MONITORS" "$SETTINGS" "$TERMUI" "$EXTUI" "$VAULTUI" "$SECRETS" "$DBUI"; do
@@ -82,10 +82,10 @@ eq "B1 each zone is probed with an answer known in advance" \
 # B2: the verdict is not computed from the listing count alone. ABSENCE arm, so it
 # needs a positive control (B2-control) proving the file is really being read.
 eq "B2 the verdict is not decided by the listing count alone" \
-   "$($G -c '"clean": listed_count == 0' "$MAIL")" "0"
+   "$($G -c '"clean": *listedCount == 0' "$MAIL")" "0"
 
 eq "B2-control the handler still reports a listing count" \
-   "$($G -c 'let listed_count' "$MAIL")" "1"
+   "$($G -c 'listedCount, checkedCount := 0, 0' "$MAIL")" "1"
 
 # B3: a zone that did not answer is carried as unknown rather than folded into
 # either verdict.
@@ -98,7 +98,7 @@ ge "B3 the response distinguishes a zone that could not be reached" \
 # elsewhere in this file for unrelated reasons, and an arm on either would have been
 # measuring that other code instead of this decision.
 eq "B4 a clean verdict requires every zone to have answered" \
-   "$($G -c 'checked_count == results.len()' "$MAIL")" "1"
+   "$($G -c 'checkedCount == len(results)' "$MAIL")" "1"
 
 # B5: the card must render that third state rather than painting it as one of the
 # two it already had. THREE independent sites decide it — the status dot, the text
@@ -171,7 +171,7 @@ ge "D2-control the same method finds a long-standing caller" \
 # injector matches vaults to sites on the link ALONE. The write side must verify
 # the caller may reach that site.
 ge "D3 the vault site link is ownership-checked on the write side" \
-   "$($G -c 'assert_site_reachable' "$SECRETS")" "3"
+   "$($G -c 'rtSecretsAssertSiteReachable(' "$SECRETS")" "3"
 
 echo "── E. A delete that answers 'deleted' actually deleted something ──────"
 
@@ -180,11 +180,12 @@ ge "E1 the maintenance-window delete checks its own result" \
    "$($G -c 'delete maintenance window' "$MONITORS")" "1"
 
 # E2: and zero rows is reported as such rather than as success. Keyed on this
-# statement's own binding — two OTHER handlers in the same file already test
-# `result.rows_affected() == 0`, so an arm on the bare call survived its own
-# mutation by matching them instead.
+# statement's own result — OTHER handlers in the same file also test a rows-
+# affected count of zero, so an arm on the bare comparison survives its own
+# mutation by matching them instead. Go binds the count to `n`, so the arm reads
+# the lines that follow THIS statement.
 ge "E2 a delete that removed nothing is not reported as success" \
-   "$($G -c 'deleted.rows_affected() == 0' "$MONITORS")" "1"
+   "$($G -A5 'DELETE FROM maintenance_windows WHERE id = \$1 AND user_id = \$2' "$MONITORS" | $G -c 'if n == 0 {')" "1"
 
 echo "── F. A capability the product does not have is not advertised ────────"
 

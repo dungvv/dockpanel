@@ -34,6 +34,13 @@
 # handlers read it. These pins hold that shape, because the defect returns the
 # moment any handler refreshes CPU for itself again.
 #
+# Go port: services/cpu_sampler.go (CpuSampler: a goroutine reading the
+# aggregate /proc/stat line via gopsutil cpu.Times(false) every
+# CpuSamplerSampleInterval, publishing to an atomic). In Go terms the
+# forbidden per-request shapes are cpu.Percent/cpu.Times in a handler
+# (sysinfo's refresh_cpu/global_cpu_usage) and process.Processes() in
+# /system/info or phone_home (refresh_processes / System::new_all).
+#
 # Pure source analysis: no box, no network, no build.
 
 set -uo pipefail
@@ -43,42 +50,53 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-# Strip comments and the test module, so a pin can never be satisfied (or
-# tripped) by prose describing the very thing it forbids.
-code()  { sed '/#\[cfg(test)\]/q' "$1" | grep -vE '^[[:space:]]*(///|//!|//|\*|/\*)'; }
+# Strip whole-line Go comments, so a pin can never be satisfied (or tripped)
+# by prose describing the very thing it forbids.
+code()  { grep -vE '^[[:space:]]*(//|\*|/\*)' "$1"; }
 has()   { [ -n "$(code "$1" | grep -F -- "$2")" ]; }
 hasre() { [ -n "$(code "$1" | grep -E -- "$2")" ]; }
+# One Go func (plain or method) by name: from its `func` line to the first
+# closing brace in column 0.
+fnb()   { code "$1" | awk -v fn="$2" '!f && (index($0, "func " fn "(") == 1 || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) {f=1} f {print} f && /^\}/ {exit}'; }
 
-SAMPLER=panel/agent/src/services/cpu_sampler.rs
-SYSROUTE=panel/agent/src/routes/system.rs
-APPSTATE=panel/agent/src/routes/mod.rs
-MAIN=panel/agent/src/main.rs
-PHONE=panel/agent/src/services/phone_home.rs
-COLLECTOR=panel/backend/src/services/metrics_collector.rs
+AG=panel/go/internal/agent
+SAMPLER=$AG/services/cpu_sampler.go
+SYSROUTE=$AG/routes/system.go
+APPSTATE=$AG/routes/state.go
+MAIN=panel/go/cmd/dockpanel-agent/main.go
+PHONE=$AG/services/phone_home.go
+COLLECTOR=panel/go/internal/api/svc_metrics_collector.go
 
 for f in "$SAMPLER" "$SYSROUTE" "$APPSTATE" "$MAIN" "$PHONE" "$COLLECTOR"; do
   [ -f "$f" ] || { echo "missing source file: $f"; exit 1; }
 done
 
+# gopsutil's CPU-delta calls: the Go spelling of sysinfo's refresh_cpu /
+# global_cpu_usage.
+CPU_DELTA_RE='cpu\.(Percent|PercentWithContext|Times|TimesWithContext)\('
+
 echo "── 1. C1: no handler computes CPU from its own request timing ──"
 
 # The heart of it. A refresh inside the handler re-creates the defect exactly,
 # whatever else changes around it.
-if has "$SYSROUTE" "refresh_cpu"; then
-  bad "routes/system.rs refreshes CPU in the handler again — the window is back to 'time since some other caller'"
+if hasre "$SYSROUTE" "$CPU_DELTA_RE"; then
+  bad "routes/system.go computes a CPU delta in the handler again — the window is back to 'time since some other caller'"
 else
-  ok "routes/system.rs does not refresh CPU per request"
+  ok "routes/system.go does not refresh CPU per request"
 fi
 
-if hasre "$SYSROUTE" "state\.cpu\.usage\(\)"; then
-  ok "routes/system.rs reads the sampled value"
+if [ -n "$(fnb "$SYSROUTE" systemHandleInfo | grep -F 's.Cpu.Usage()')" ]; then
+  ok "routes/system.go reads the sampled value"
 else
-  bad "routes/system.rs no longer reads the sampler — where is cpu_usage coming from?"
+  bad "routes/system.go no longer reads the sampler — where is cpu_usage coming from?"
 fi
 
 # Any OTHER agent route computing CPU for itself is the same bug wearing a
 # different URL, so pin the whole routes tree rather than the one file.
-STRAY=$(grep -rln "global_cpu_usage\|refresh_cpu" panel/agent/src/routes/ 2>/dev/null | grep -v "^$SYSROUTE$" || true)
+STRAY=$(for f in "$AG"/routes/*.go; do
+  case "$f" in (*_test.go|"$SYSROUTE") continue ;; esac
+  hasre "$f" "$CPU_DELTA_RE" && echo "$f"
+done)
 if [ -z "$STRAY" ]; then
   ok "no other agent route computes CPU usage on its own"
 else
@@ -88,38 +106,41 @@ fi
 echo
 echo "── 2. C2: the endpoint is not the biggest consumer in its own measurement ──"
 
-# Scope this to the system_info HANDLER. The sibling /system/processes endpoint
-# must walk /proc — that is the data it returns — and it does so on its own
-# System instance. The defect is the *info* handler paying that cost to obtain a
-# count, inside the window the next caller measures.
-info_body() { code "$SYSROUTE" | sed -n '/async fn system_info/,/^}/p'; }
-if [ -n "$(info_body | grep -F 'refresh_processes')" ]; then
-  bad "system_info walks every process again (~70 ms of CPU per call) — that walk lands inside the next caller's window"
+# Scope this to the /system/info HANDLER. The sibling /system/processes
+# endpoint must walk /proc — that is the data it returns. The defect is the
+# *info* handler paying that cost to obtain a count, inside the window the next
+# caller measures.
+info_body() { fnb "$SYSROUTE" systemHandleInfo; }
+if [ -n "$(info_body | grep -E 'process\.(Processes|NewProcess|Pids)')" ]; then
+  bad "systemHandleInfo walks every process again (~70 ms of CPU per call) — that walk lands inside the next caller's window"
 else
-  ok "system_info does not walk every process"
+  ok "systemHandleInfo does not walk every process"
 fi
 # Guard the guard: if the handler is renamed the extraction silently matches
 # nothing and the pin above would pass vacuously.
-if [ -n "$(info_body)" ]; then
-  ok "the system_info handler was located for scoped inspection"
+if [ -n "$(info_body)" ] && [ -n "$(code "$SYSROUTE" | grep -F 'r.State.systemHandleInfo')" ]; then
+  ok "the /system/info handler (systemHandleInfo) was located for scoped inspection"
 else
-  bad "could not locate the system_info handler — the scoped pins above are vacuous"
+  bad "could not locate the systemHandleInfo handler — the scoped pins above are vacuous"
 fi
 
-if hasre "$SYSROUTE" "process_count\(\)"; then
+if [ -n "$(info_body | grep -F 'services.CpuSamplerProcessCount()')" ]; then
   ok "the process count comes from a cheap /proc listing"
 else
   bad "process_count is sourced some other way — check it does not refresh per-process stats"
 fi
 
-# The sampler must not reintroduce the cost it exists to remove: a CPU-only
-# System reads one line of /proc/stat and does not appear in its own numbers.
-if hasre "$SAMPLER" "RefreshKind::nothing\(\)"; then
-  ok "the sampler's System is scoped to CPU usage only"
+# The sampler must not reintroduce the cost it exists to remove: one sample is
+# the aggregate /proc/stat line and does not appear in its own numbers.
+SAMPLE_PATH="$(fnb "$SAMPLER" Spawn; fnb "$SAMPLER" cpuSamplerRead)"
+if grep -qF 'cpu.Times(false)' <<< "$SAMPLE_PATH" && ! grep -qE 'cpu\.Times\(true\)|cpu\.Percent' <<< "$SAMPLE_PATH"; then
+  ok "the sampler reads only the aggregate CPU line (cpu.Times(false))"
 else
-  bad "the sampler refreshes more than CPU — it will show up in its own measurement"
+  bad "the sampler reads more than the aggregate CPU line — it will show up in its own measurement"
 fi
-if has "$SAMPLER" "refresh_processes"; then
+if [ -z "$(fnb "$SAMPLER" Spawn)" ]; then
+  bad "could not locate CpuSampler.Spawn — the no-process-walk pin is vacuous"
+elif grep -qE 'process\.|ReadDir|CpuSamplerProcessCount' <<< "$SAMPLE_PATH"; then
   bad "the sampler walks processes — it now contaminates the window it owns"
 else
   ok "the sampler does not walk processes"
@@ -128,63 +149,60 @@ fi
 echo
 echo "── 3. C3: the window is fixed, and above the interval sysinfo silently skips ──"
 
-if has "$SAMPLER" "SAMPLE_INTERVAL"; then
+if has "$SAMPLER" "CpuSamplerSampleInterval"; then
   ok "the sampling window is a named constant, not an incidental gap"
 else
-  bad "no SAMPLE_INTERVAL — the window is implicit again"
+  bad "no CpuSamplerSampleInterval — the window is implicit again"
 fi
 
-# Pin the INVARIANT (window > sysinfo's skip threshold), not the literal value,
-# so tuning the cadence is allowed and breaking the guarantee is not. sysinfo's
-# MINIMUM_CPU_UPDATE_INTERVAL is 200 ms on Linux.
+# Pin the INVARIANT (window > the 200 ms floor the Rust sampler inherited
+# from sysinfo's MINIMUM_CPU_UPDATE_INTERVAL), not the literal value, so
+# tuning the cadence is allowed and breaking the guarantee is not.
 check_duration_above_200ms() {
   local name="$1" line ms
-  line=$(code "$SAMPLER" | grep -F "$name" | grep -F "Duration::from_" | head -1)
-  if [ -z "$line" ]; then bad "$name is not a Duration literal — cannot verify it clears sysinfo's 200 ms threshold"; return; fi
-  if printf '%s' "$line" | grep -cF "from_secs" >/dev/null; then
-    ms=$(printf '%s' "$line" | sed -n 's/.*from_secs(\([0-9]*\)).*/\1/p'); ms=$((ms * 1000))
-  else
-    ms=$(printf '%s' "$line" | sed -n 's/.*from_millis(\([0-9]*\)).*/\1/p')
-  fi
+  line=$(code "$SAMPLER" | grep -E "^const $name = [0-9]+ \* time\.(Second|Millisecond)" | head -1)
+  if [ -z "$line" ]; then bad "$name is not a Duration literal — cannot verify it clears the 200 ms threshold"; return; fi
+  ms=$(printf '%s' "$line" | sed -n 's/.*= \([0-9]*\) \* time\..*/\1/p')
+  case "$line" in *time.Second*) ms=$((ms * 1000)) ;; esac
   if [ -n "$ms" ] && [ "$ms" -gt 200 ]; then
-    ok "$name is ${ms}ms — above sysinfo's 200ms skip threshold"
+    ok "$name is ${ms}ms — above the 200ms threshold"
   else
-    bad "$name is '${ms:-unparsed}'ms — at or below 200ms sysinfo SKIPS the refresh and the published value silently goes stale"
+    bad "$name is '${ms:-unparsed}'ms — at or below 200ms the delta is noise / a stale window"
   fi
 }
-check_duration_above_200ms "SAMPLE_INTERVAL"
-check_duration_above_200ms "PRIME_DELAY"
+check_duration_above_200ms "CpuSamplerSampleInterval"
+check_duration_above_200ms "cpuSamplerPrimeDelay"
 
-if hasre "$MAIN" "cpu_sampler::CpuSampler::new\(\)" && has "$MAIN" ".spawn()"; then
-  ok "main.rs creates and spawns the sampler"
+if has "$MAIN" "services.NewCpuSampler()" && hasre "$MAIN" '^[[:space:]]*cpu\.Spawn\(\)'; then
+  ok "main.go creates and spawns the sampler"
 else
   bad "the sampler is never spawned — every reader gets 0.0 forever"
 fi
-if hasre "$APPSTATE" "pub cpu:"; then
-  ok "AppState carries the sampler so handlers can read it without refreshing"
+if hasre "$APPSTATE" '^[[:space:]]*Cpu[[:space:]]+\*services\.CpuSampler'; then
+  ok "State carries the sampler so handlers can read it without refreshing"
 else
-  bad "AppState has no sampler handle"
+  bad "State has no sampler handle"
 fi
 
 echo
 echo "── 4. C4: the fleet check-in reports a measurement, not its own /proc walk ──"
 
-if has "$PHONE" "global_cpu_usage"; then
-  bad "phone_home reads global_cpu_usage off a System it just built — that number is mostly its own /proc walk, and it drives the Servers page and CPU alerts"
+if hasre "$PHONE" "$CPU_DELTA_RE"; then
+  bad "phone_home computes its own CPU delta — that number is mostly its own work, and it drives the Servers page and CPU alerts"
 else
-  ok "phone_home does not compute CPU from a freshly-built System"
+  ok "phone_home does not compute CPU for itself"
 fi
-if hasre "$PHONE" "cpu\.usage\(\)"; then
+if [ -n "$(fnb "$PHONE" phoneHomeCollectSystemInfo | grep -F '"cpu_usage":' | grep -F 'c.Usage()')" ]; then
   ok "phone_home reports the sampled value"
 else
   bad "phone_home no longer reports the sampled value"
 fi
-# new_all()/refresh_all() is the specific pairing that produced 4.5%-22.1% on an
-# idle box: the constructor refreshes, the walk runs, refresh_all() diffs against it.
-if hasre "$PHONE" "System::new_all\(\)"; then
-  bad "phone_home builds System::new_all() again — a full /proc walk whose cost becomes the CPU reading"
+# System::new_all()/refresh_all() was the specific pairing that produced
+# 4.5%-22.1% on an idle box; the Go equivalent is a full process walk.
+if hasre "$PHONE" 'process\.(Processes|Pids)\('; then
+  bad "phone_home walks every process again — a full /proc walk whose cost becomes the CPU reading"
 else
-  ok "phone_home builds a narrowed System, not new_all()"
+  ok "phone_home does not walk every process"
 fi
 
 echo

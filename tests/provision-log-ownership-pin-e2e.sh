@@ -44,6 +44,12 @@
 # creates a log and its owner under one lock scope; `open_provision_log` is the
 # only way to read one and refuses an id whose owner is not recorded.
 #
+# Go port (panel/go/internal/api): the map and owner table are the unexported
+# `logs`/`owners` fields of *ProvisionLogs (core_state.go), with Register/Open/
+# Emit/Remove/Forget/Has methods and sweep() as the pruner. The api package is
+# flat, so unexported does NOT stop another file in it from reaching the fields
+# — §1 still has to check that nothing outside core_state.go does.
+#
 # ── WHY THE ARMS ARE SHAPED THE WAY THEY ARE ────────────────────────────────
 #
 # The first version of this suite was reviewed and found to be spelling-bound,
@@ -57,10 +63,11 @@
 # So the negative arms no longer look for statements. They look for the two
 # capabilities you cannot avoid naming:
 #
-#   * to touch the map at all you must name `state.provision_logs`
-#   * to serve its contents to a client you must call `.subscribe()`
+#   * to touch the map at all you must name `st.ProvisionLogs` (or its
+#     `.logs`/`.owners` fields)
+#   * to serve its contents to a client you must call `.Subscribe()`
 #
-# Both are checked across EVERY file in routes/, and both are checked by what a
+# Both are checked across EVERY non-test file in internal/api, and both are checked by what a
 # violation must contain rather than by how somebody happened to write it.
 #
 # Pure source analysis: no box, no network, no build.
@@ -72,15 +79,13 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-ROUTES=panel/backend/src/routes
-HELPERS=panel/backend/src/helpers.rs
-MAIN=panel/backend/src/main.rs
+API=panel/go/internal/api
+STATE=$API/core_state.go
 PROVLOG_TSX=panel/frontend/src/components/ProvisionLog.tsx
 
-for f in "$HELPERS" "$MAIN" "$PROVLOG_TSX"; do
+for f in "$STATE" "$PROVLOG_TSX"; do
   [ -f "$f" ] || { echo "missing $f"; exit 1; }
 done
-[ -d "$ROUTES" ] || { echo "missing $ROUTES"; exit 1; }
 
 # Strip comments from the SUBJECT FILES before matching.
 #
@@ -109,16 +114,15 @@ strip() {
   ' "$1"
 }
 
-# Every route file, comments stripped. ALL of them — the previous version read 8
-# of 63, so five plausible future homes for a provisioning stream (stacks.rs,
-# staging.rs, wordpress.rs, databases.rs, backup_orchestrator.rs) were unscanned.
-ROUTE_FILES=$(ls "$ROUTES"/*.rs)
+# Every api source file except the one that owns the map, comments stripped. ALL
+# of them — the previous (Rust) version read 8 of 63 route files, so plausible
+# future homes for a provisioning stream were unscanned.
+ROUTE_FILES=$(ls "$API"/*.go | grep -v '_test\.go$' | grep -v '/core_state\.go$')
 NROUTES=$(printf '%s\n' $ROUTE_FILES | wc -l)
 SRC_ROUTES=""
 for f in $ROUTE_FILES; do SRC_ROUTES+=$(strip "$f")$'\n'; done
 
-SRC_HELPERS=$(strip "$HELPERS")
-SRC_MAIN=$(strip "$MAIN")
+SRC_STATE=$(strip "$STATE")
 SRC_TSX=$(strip "$PROVLOG_TSX")
 
 # Here-strings, never pipelines: `grep -q` closing a pipe kills the upstream
@@ -127,7 +131,7 @@ has()  { grep -q  -- "$2" <<< "$1"; }
 hasE() { grep -qE -- "$2" <<< "$1"; }
 cnt()  { grep -c  -- "$2" <<< "$1" || true; }
 cntE() { grep -cE -- "$2" <<< "$1" || true; }
-fnbody() { awk "/pub async fn $2\(/,/^}/" <<< "$1"; }
+fnbody() { awk "/^func $2\\(/,/^}/" <<< "$1"; }
 
 # Every awk range extraction anchors on an incidental spelling. If one stops
 # matching, the variable is EMPTY and every arm reading it goes red blaming the
@@ -135,57 +139,59 @@ fnbody() { awk "/pub async fn $2\(/,/^}/" <<< "$1"; }
 readable() { [ -n "$2" ] || bad "could not extract $1 — the arms reading it mean nothing"; }
 
 if [ "$NROUTES" -ge 50 ]; then
-  ok "scanning all $NROUTES route files"
+  ok "scanning all $NROUTES api source files"
 else
-  bad "only $NROUTES route files found — the scan lost its subjects"
+  bad "only $NROUTES api source files found — the scan lost its subjects"
 fi
 
 echo
 echo "§1 the map cannot be touched except through the two helpers"
 
 # THE structural arm. You cannot reach the map without naming it, so enumerate
-# every occurrence and allow exactly two forms: an argument to a helper, and the
-# Arc clone the spawned emit closures capture. Anything else — notably
-# `state.provision_logs.lock()` — is direct access, whatever the local is called.
-forms=$(grep -ohE "state\.provision_logs[.a-zA-Z_()]*" <<< "$SRC_ROUTES" | sort -u)
-illegal=$(grep -vE "^state\.provision_logs(\.clone\(\))?$" <<< "$forms" || true)
-if [ -z "$illegal" ]; then
-  ok "every mention of the map in routes/ is a helper argument or an Arc clone"
+# every occurrence and allow exactly the method calls and the bare value (an
+# argument or alias handed to an emitter). Anything else — notably a field
+# reach `st.ProvisionLogs.logs` — is direct access.
+forms=$(grep -ohE "st\.ProvisionLogs[.a-zA-Z_]*" <<< "$SRC_ROUTES" | sort -u)
+illegal=$(grep -vE "^st\.ProvisionLogs(\.(Register|Emit|Remove|Forget|Has|Open))?$" <<< "$forms" || true)
+if [ -n "$forms" ] && [ -z "$illegal" ]; then
+  ok "every mention of the map outside core_state.go is a method call or the bare value ($(wc -l <<< "$forms") forms)"
 else
-  bad "routes/ reaches the map directly: $(tr '\n' ' ' <<< "$illegal")"
+  bad "the api package reaches the map directly: ${illegal:-<no mentions at all — the scan is vacuous>}"
 fi
 
-forms=$(grep -ohE "state\.deploy_owners[.a-zA-Z_()]*" <<< "$SRC_ROUTES" | sort -u)
-illegal=$(grep -vE "^state\.deploy_owners$" <<< "$forms" || true)
-if [ -z "$illegal" ]; then
-  ok "no route manipulates the owner table itself"
+# Aliases (`logs := st.ProvisionLogs`) evade the form check above, so the
+# unexported fields themselves must not be named outside core_state.go. The
+# positive control: core_state.go itself does name them.
+if hasE "$SRC_STATE" 'p\.owners\[id\]' && hasE "$SRC_STATE" 'p\.logs\[id\]'; then
+  if hasE "$SRC_ROUTES" '\.(logs|owners)\b'; then
+    bad "a file outside core_state.go touches the logs/owners fields: $(grep -ohE '[A-Za-z_.]*\.(logs|owners)\b' <<< "$SRC_ROUTES" | sort -u | tr '\n' ' ')"
+  else
+    ok "no file outside core_state.go manipulates the log map or the owner table itself"
+  fi
 else
-  bad "routes/ touches deploy_owners directly: $(tr '\n' ' ' <<< "$illegal")"
+  bad "CONTROL: core_state.go no longer names p.logs[id]/p.owners[id] — the absence arm cannot be trusted"
 fi
 
 echo
 echo "§2 no route can serve the map's contents to a client"
 
-# The capability arm. A provisioning stream is a broadcast Receiver, and the only
-# way to obtain one is `.subscribe()`. `open_provision_log` is the sole place
-# that may. Two legitimate exceptions exist, neither of which ever touches
-# provision_logs: the notifications SSE (state.notif_tx) and, since s466, the
-# panel-wide graceful-shutdown signal (state.shutdown_tx, broadcast::Sender<()>)
-# that ws_metrics.rs and notifications.rs subscribe to directly — it carries no
-# payload and is ownerless by construction (every subscriber gets the identical
-# "shutting down" signal), so there is no ownership question for it to bypass.
-subs=$(grep -ohE "[a-zA-Z_.]*\.subscribe\(\)" <<< "$SRC_ROUTES" | sort -u)
-rogue=$(grep -vE "^state\.(notif_tx|shutdown_tx)\.subscribe\(\)$" <<< "$subs" || true)
+# The capability arm. A provisioning stream is a Broadcast subscription, and the
+# only way to obtain one is `.Subscribe()`. ProvisionLogs.Open is the sole place
+# that may. The legitimate exception never touches provisioning logs: the
+# notifications SSE (st.Notif). (Go's graceful shutdown is a context, not a
+# subscribed channel, so the Rust shutdown_tx exemption has no counterpart.)
+subs=$(grep -ohE "[a-zA-Z_.]*\.Subscribe\(\)" <<< "$SRC_ROUTES" | sort -u)
+rogue=$(grep -vE "^st\.Notif\.Subscribe\(\)$" <<< "$subs" || true)
 if [ -z "$rogue" ]; then
-  ok "the only subscribe() in routes/ is the notifications channel"
+  ok "the only Subscribe() outside core_state.go is the notifications channel"
 else
   bad "a route subscribes to a provisioning channel itself: $(tr '\n' ' ' <<< "$rogue")"
 fi
 
-if has "$SRC_HELPERS" '.subscribe()'; then
-  ok "the helper is where subscription happens"
+if has "$(fnbody "$SRC_STATE" '\(p \*ProvisionLogs\) Open')" 'l.tx.Subscribe()'; then
+  ok "ProvisionLogs.Open is where subscription happens"
 else
-  bad "open_provision_log no longer subscribes — the readers cannot be going through it"
+  bad "ProvisionLogs.Open no longer subscribes — the readers cannot be going through it"
 fi
 
 echo
@@ -195,34 +201,37 @@ echo "§3 every creation site records an owner"
 # file, so git_deploys could lose 3 of its 4 and stay green — which is how the
 # pre-change ratio (3 of 16) could be re-established one site at a time. Adding a
 # provisioning log to a feature is expected to change the number here.
-census="backups:2 deploy:1 sites:1 migration:1 git_deploys:4 mail:2 system:4 docker_apps:2"
+# Go: mail install and uninstall share rtMailRunInstall, so mail's two Rust
+# registrations are one call site (17 → 16).
+census="backups:2 deploy:1 sites:1 migration:1 git_deploys:4 mail:1 system:4 docker_apps:2"
 total=0
 for e in $census; do
   f=${e%%:*}; want=${e##*:}
-  got=$(cntE "$(strip "$ROUTES/$f.rs")" 'register_provision_log\(')
+  got=$(cntE "$(strip "$API/rt_$f.go")" 'ProvisionLogs\.Register\(')
   total=$((total+got))
   if [ "$got" -eq "$want" ]; then
-    ok "$f.rs registers $got of $want"
+    ok "rt_$f.go registers $got of $want"
   else
-    bad "$f.rs registers $got owners, expected $want — a creation site lost its owner, or a new one needs adding here"
+    bad "rt_$f.go registers $got owners, expected $want — a creation site lost its owner, or a new one needs adding here"
   fi
 done
-if [ "$total" -eq 17 ]; then
-  ok "17 creation sites, all owned"
+all=$(cntE "$SRC_ROUTES" 'ProvisionLogs\.Register\(')
+if [ "$total" -eq 16 ] && [ "$all" -eq 16 ]; then
+  ok "16 creation sites, all owned"
 else
-  bad "$total registrations across the census, expected 17"
+  bad "$total registrations across the census ($all package-wide), expected 16"
 fi
 
 echo
 echo "§4 every reader proves ownership"
 
-READERS="sites:provision_log docker_apps:deploy_log git_deploys:deploy_log system:install_log migration:progress"
+READERS="sites:rtSitesProvisionLog docker_apps:rtDockerAppsDeployLog git_deploys:rtGitDeploysDeployLog system:rtSystemInstallLog migration:rtMigrationProgress"
 for pair in $READERS; do
   file=${pair%%:*}; fn=${pair##*:}
-  body=$(fnbody "$(strip "$ROUTES/$file.rs")" "$fn")
+  body=$(fnbody "$(strip "$API/rt_$file.go")" "$fn")
   readable "$file::$fn" "$body"
   [ -n "$body" ] || continue
-  if has "$body" 'open_provision_log('; then
+  if hasE "$body" 'st\.ProvisionLogs\.Open\([a-zA-Z]+, (claims|c)\.Sub,'; then
     ok "$file::$fn reads the map through the owner check"
   else
     bad "$file::$fn reaches the map without proving ownership"
@@ -230,8 +239,8 @@ for pair in $READERS; do
 done
 
 # Narrow claim, deliberately. This says only that no reader carries the
-# `claims.role != "admin"` COMPARISON that let both broken readers skip the
-# ownership test. `require_admin(&claims.role)` NARROWS a route and is fine —
+# `claims.role != "admin"` COMPARISON (Go: `.Role != "admin"`) that let both
+# broken readers skip the ownership test. `requireAdmin(claims.Role)` NARROWS a route and is fine —
 # migration::progress does exactly that and must keep it. Three of these five
 # were already green before the fix (sites and migration never had the
 # exemption; install_log's defect was a different shape, covered below), so
@@ -239,24 +248,24 @@ done
 # correct — §4's first loop is what establishes that.
 for pair in $READERS; do
   file=${pair%%:*}; fn=${pair##*:}
-  body=$(fnbody "$(strip "$ROUTES/$file.rs")" "$fn")
+  body=$(fnbody "$(strip "$API/rt_$file.go")" "$fn")
   [ -n "$body" ] || continue
-  if hasE "$body" 'claims\.role *[!=]= *"admin"'; then
+  if hasE "$body" '\.Role *[!=]= *"admin"'; then
     bad "$file::$fn exempts admins from the ownership test"
   else
     ok "$file::$fn carries no admin exemption"
   fi
 done
 
-SYS_LOG=$(fnbody "$(strip "$ROUTES/system.rs")" 'install_log')
-readable "system::install_log" "$SYS_LOG"
+SYS_LOG=$(fnbody "$(strip "$API/rt_system.go")" 'rtSystemInstallLog')
+readable "system::rtSystemInstallLog" "$SYS_LOG"
 if [ -n "$SYS_LOG" ]; then
-  if has "$SYS_LOG" 'AdminUser'; then
+  if hasE "$SYS_LOG" 'adminUser\(|rtSystemAdminScope\('; then
     bad "install_log is gated by role again — it must be owner-gated, per key"
   else
     ok "install_log no longer answers on the strength of the admin role alone"
   fi
-  if has "$SYS_LOG" 'AuthUser(claims)'; then
+  if hasE "$SYS_LOG" 'claims, err := st\.authUser\(r\)'; then
     ok "install_log binds the caller it has to compare against"
   else
     bad "install_log discards its claims — there is nothing to check ownership against"
@@ -266,70 +275,49 @@ fi
 echo
 echo "§5 the door itself fails closed"
 
-# Behaviour, not spelling. The previous arm forbade the literal `None => true`,
-# a spelling that never existed in this codebase in either state: it stayed
-# green against the genuinely broken tree, and the realistic reintroduction
-# `map_or(true, …)` did not trip it. What actually matters is that the owner
-# lookup is a total comparison, so enumerate the idioms that turn absence into
-# permission instead of guessing one.
-if has "$SRC_HELPERS" 'owners.get(&id).copied() == Some(caller)'; then
-  ok "the owner comparison treats absence as a mismatch"
-else
-  bad "the owner comparison changed shape — check that a missing owner cannot pass"
-fi
-
-# Scoped to the reader's own body. Against the whole file this matched a `None
-# =>` arm in the unrelated IP-allowlist parser — a red that named the wrong code
-# and would have been "fixed" by weakening the arm.
-OPEN_FN=$(awk '/pub fn open_provision_log\(/,/^}/' <<< "$SRC_HELPERS")
-readable "open_provision_log body" "$OPEN_FN"
-# Guarded, not merely reported. With no such function the extraction is empty and
-# every idiom arm below "passes" against nothing — five confident greens sitting
-# next to the one red that actually knows. Skip them instead.
+# Behaviour, not spelling. What matters is that the owner lookup is a total
+# comparison: absence of an owner row must be a refusal, not a pass.
+OPEN_FN=$(fnbody "$SRC_STATE" '\(p \*ProvisionLogs\) Open')
+readable "ProvisionLogs.Open body" "$OPEN_FN"
 if [ -n "$OPEN_FN" ]; then
-  for idiom in 'map_or(true' 'map_or_else' 'unwrap_or(true' 'is_none_or' 'None =>'; do
-    if has "$OPEN_FN" "$idiom"; then
-      bad "open_provision_log contains '$idiom' — absence may now mean permission"
-    else
-      ok "no '$idiom' fall-through in open_provision_log"
-    fi
-  done
+  if hasE "$OPEN_FN" 'owner, owned := p\.owners\[id\]' && hasE "$OPEN_FN" 'if !ok \|\| !owned \|\| owner != caller \{'; then
+    ok "the owner comparison treats absence as a mismatch"
+  else
+    bad "the owner comparison changed shape — check that a missing owner cannot pass"
+  fi
 fi
+# (Rust's map_or(true…)/unwrap_or(true…)/is_none_or/None => idiom arms retired
+# (obsolete in Go): those Option combinators have no Go spelling; the comma-ok
+# shape above is the one total form and the tests below execute it.)
 
 # The header delegates the door's behaviour to these unit tests, so the arm has
-# to prove they RUN. Grepping the function name alone left `#[test]` deletable
-# in silence — the review measured the suite dropping from 6 tests to 5 with
-# this arm still green.
-for t in an_ownerless_log_is_refused_not_served a_stranger_cannot_read_someone_elses_log; do
-  if grep -Pzoq "#\[test\]\s*\n\s*fn $t\(" "$HELPERS"; then
-    ok "$t is an executed test"
-  else
-    bad "$t is missing, or is no longer marked #[test] and therefore never runs"
-  fi
-done
+# to prove they RUN — so it runs them (Go ports of
+# an_ownerless_log_is_refused_not_served / a_stranger_cannot_read_someone_elses_log).
+if command -v go >/dev/null 2>&1; then
+  for t in TestOwnerlessLogIsRefused TestProvisionLogs; do
+    out=$(cd panel/go && go test ./internal/api/ -run "^$t\$" -count=1 -v 2>&1)
+    if grep -q -- "--- PASS: $t " <<< "$out"; then
+      ok "$t runs and passes"
+    else
+      bad "$t is missing or failing: $(tail -3 <<< "$out" | tr '\n' ' ')"
+    fi
+  done
+else
+  bad "go toolchain not found — cannot execute the owner-door tests"
+fi
 
 echo
 echo "§6 the owner map stays bounded"
 
-if hasE "$SRC_MAIN" 'if map\.len\(\) *< *before'; then
-  bad "owner pruning is conditional on a TTL eviction again — features self-remove in 30-60s, so that tick almost never fires and the map grows for the life of the process"
+# §6 arms retired: covered by TestProvisionSweepPrunesOwnersEveryTick (panel/go/internal/api/core_helpers_test.go)
+#   (owner pruning not gated on a TTL eviction; owners pruned against live logs).
+# poisoned-lock arm retired (obsolete in Go): sync.Mutex has no poisoning, so
+#   there is no `if let Ok(lock)` give-up path for the pruner to take.
+if hasE "$(strip panel/go/internal/api/core_helpers_test.go)" '^func TestProvisionSweepPrunesOwnersEveryTick\(' \
+   && hasE "$SRC_STATE" 'st\.ProvisionLogs\.sweep\(now, time\.Hour\)'; then
+  ok "the periodic cleanup calls ProvisionLogs.sweep, whose owner pruning TestProvisionSweepPrunesOwnersEveryTick pins"
 else
-  ok "owner pruning is not gated on the TTL sweep having evicted something"
-fi
-
-if has "$SRC_MAIN" 'owners.retain(|id, _| map.contains_key(id))'; then
-  ok "owners are pruned against live logs"
-else
-  bad "nothing prunes the owner map — it now gains an entry per provisioning job"
-fi
-
-# The pruner is the one component that must survive; every other accessor of
-# these maps recovers from poisoning with into_inner(). An `if let Ok` here
-# would let a single panic disable pruning permanently while writers carried on.
-if hasE "$SRC_MAIN" 'if let Ok\(mut map\) = provision\.lock\(\)'; then
-  bad "the cleanup task gives up on a poisoned lock — writers recover, so only the pruner would stop"
-else
-  ok "the cleanup task recovers from a poisoned lock like everything else"
+  bad "the cleanup tick no longer sweeps provisioning logs (or the pruning test is gone) — the owner map grows unbounded"
 fi
 
 echo

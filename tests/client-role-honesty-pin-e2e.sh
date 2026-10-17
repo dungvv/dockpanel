@@ -47,6 +47,10 @@
 #   §D  the terminal opens the shell the caller actually has
 #   §E  CONTEXT — the server shell is still admin-only and still signed
 #
+# Backend subjects are the Go ports: panel/go/internal/api/rt_dashboard.go
+# (rtDashboardIntelligence / rtDashboardDockerSummary), rt_terminal.go
+# (rtTerminalWsToken) and panel/go/internal/agent/routes/terminal.go.
+#
 # Pure source analysis: no box, no network, no build.
 #
 # NO PIPES INTO `grep -q`. Under `set -o pipefail` grep -q closes the pipe on its
@@ -66,9 +70,9 @@ TERM=panel/frontend/src/pages/Terminal.tsx
 PAL=panel/frontend/src/components/CommandPalette.tsx
 NAV=panel/frontend/src/data/navItems.ts
 LAY=panel/frontend/src/hooks/useLayoutState.ts
-API=panel/backend/src/routes/dashboard.rs
-BTERM=panel/backend/src/routes/terminal.rs
-ATERM=panel/agent/src/routes/terminal.rs
+API=panel/go/internal/api/rt_dashboard.go
+BTERM=panel/go/internal/api/rt_terminal.go
+ATERM=panel/go/internal/agent/routes/terminal.go
 
 for f in "$DASH" "$TERM" "$PAL" "$NAV" "$LAY" "$API" "$BTERM" "$ATERM"; do
   [ -f "$f" ] || bad "MISSING SUBJECT FILE: $f"
@@ -191,18 +195,12 @@ fi
 
 echo "§B  the dashboard endpoint answers per-tenant, not per-host"
 
-if need "$API_S" B1; then
-  if has "$API_S" 'use crate::error::\{.*require_admin.*\}'; then
-    ok "B1 dashboard.rs imports require_admin"
-  else
-    bad "B1 dashboard.rs no longer imports require_admin"
-  fi
-fi
+# B1 retired (obsolete in Go): it pinned a Rust `use crate::error::{require_admin}` import; Go's flat api package has no imports for it — B2 pins the call itself
 
 # B2 — the ungated door to the list next door: this makes the SAME agent call
 # `docker_apps::list_apps` guards with require_admin.
 if need "$API_S" B2; then
-  if within "$API_S" 'pub async fn docker_summary' 'require_admin' 400; then
+  if within "$API_S" 'func rtDashboardDockerSummary\(' 'requireAdmin\(c\.Role\)' 400; then
     ok "B2 docker_summary requires admin"
   else
     bad "B2 docker_summary is ungated — it proxies the agent /apps that list_apps guards"
@@ -212,7 +210,8 @@ fi
 # B3 — /diagnostics is AdminUser on its own route; forwarding it verbatim from
 # here was the way around that.
 if need "$API_S" B3; then
-  if within "$API_S" 'if host_scoped \{' 'agent\.get\("/diagnostics"\)' 200; then
+  if has "$API_S" 'hostScoped := c\.Role == "admin"' \
+     && within "$API_S" 'if hostScoped \{' 'agent\.Get\(ctx, "/diagnostics"\)' 200; then
     ok "B3 the agent /diagnostics call is admin-scoped"
   else
     bad "B3 the agent /diagnostics blob is fetched for every role again"
@@ -231,7 +230,7 @@ fi
 # B5 — security_scans has NO user column to filter by, so the only correct
 # tenant answer is not to answer.
 if need "$API_S" B5; then
-  if within "$API_S" 'let scan_findings.*=\s*if host_scoped' 'security_scans' 400; then
+  if within "$API_S" 'var scanCrits, scanWarns int32\s*if hostScoped \{' 'FROM security_scans' 400; then
     ok "B5 the host security-scan totals are admin-only"
   else
     bad "B5 the host security-scan totals reach every role again"
@@ -329,7 +328,7 @@ echo "     easier to REACH, and must not have loosened what it reaches)"
 # E1 — the gate v2.75.0 exists to enforce. This ship changed its MESSAGE; if it
 # ever changes its CONDITION, that is the root-shell escalation returning.
 if need "$BT_S" E1; then
-  if has "$BT_S" 'q\.site_id\.is_none\(\) && claims\.role != "admin"'; then
+  if has "$BT_S" 'q\.SiteID == nil && c\.Role != "admin"'; then
     ok "E1 a site-less ticket is still refused to a non-admin"
   else
     bad "E1 THE SERVER-SHELL GATE IS GONE — this is the v2.75.0 root-shell escalation"
@@ -339,18 +338,18 @@ fi
 # E2 — and the decision still travels INSIDE the signature, which was the actual
 # v2.75.0 fix: the gate above only ever guarded minting.
 if need "$BT_S" E2; then
-  # Spans lines: the binding is rustfmt'd across three. Assert the DECISION
-  # (scope derived from the ownership-resolved domain, falling back to the
-  # server marker) and that it reaches the signed struct.
-  if within "$BT_S" 'let scope = domain' 'SERVER_SHELL_SCOPE' 200 \
-     && within "$BT_S" 'let ticket = TerminalTicket' 'scope,' 400; then
+  # Spans lines. Assert the DECISION (scope defaults to the server marker and is
+  # replaced by the ownership-resolved domain) and that it reaches the signed
+  # claims literal.
+  if within "$BT_S" 'scope := rtTerminalServerShellScope' 'scope = \*domain' 100 \
+     && within "$BT_S" 'ticket := jwt\.MapClaims\{' '"scope": +scope,' 400; then
     ok "E2 the panel still binds the resolved scope into the signed ticket"
   else
     bad "E2 the scope is no longer bound into the signed ticket"
   fi
 fi
 if need "$AT_S" E3; then
-  if has "$AT_S" 'match ticket_scope\.as_deref\(\)'; then
+  if has "$AT_S" 'case ticketScope != nil && \*ticketScope == terminalServerShellScope:'; then
     ok "E3 the agent still takes the shell scope from the signed ticket"
   else
     bad "E3 the agent no longer reads the scope from the ticket — check for a query-param read"
@@ -360,7 +359,7 @@ fi
 # E4 — ownership, not role, is what grants a site shell. This is why a client has
 # a terminal at all, and the premise the whole §D section rests on.
 if need "$BT_S" E4; then
-  if has "$BT_S" 'SITE_CALLER_PREDICATE'; then
+  if has "$BT_S" 'SiteCallerPredicate'; then
     ok "E4 the site branch is still authorised by the ownership predicate"
   else
     bad "E4 the site branch no longer uses the shared ownership predicate"

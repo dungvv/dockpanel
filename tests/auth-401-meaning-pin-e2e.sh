@@ -28,7 +28,7 @@
 #   §C  THE LOGIN DOOR ANSWERED A CREDENTIAL QUESTION WITH A 500. An account
 #       created through an identity provider has an empty `password_hash`, which
 #       is not a PHC string, so `PasswordHash::new` failed and returned a 500 —
-#       above `record_login_attempt`, so the probe was neither rate-limited nor
+#       above `record_login_attempt` (Go: rtAuthRecordLoginAttempt), so the probe was neither rate-limited nor
 #       written to the activity log that `GET /api/security/login-audit` reads.
 #       A non-existent address answered 401 and a password account answered 401;
 #       the one class that answered anything else was "this address exists and
@@ -46,6 +46,12 @@
 # re-bootstraps through `/api/auth/me` and lands the user at `/login`.
 #
 # RUN AGAINST v2.86.0: every arm outside §D is RED there.
+#
+# GO PORT: subjects are now panel/go/internal/api/{core_auth,core_error,rt_auth}.go
+# (auth.rs/error.rs/routes/auth.rs). session_invalid -> sessionInvalid,
+# CODE_SESSION_INVALID -> CodeSessionInvalid, login -> rtAuthLogin,
+# reauth_required -> rtAuthReauthRequired, DUMMY_PASSWORD_HASH ->
+# rtAuthDummyPasswordHash, PasswordHash::new + verify -> verifyPassword.
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
@@ -92,7 +98,7 @@ lineofre(){ grep -nE -m1 -- "$2" <<< "$1" | cut -d: -f1 | grep -E '^[0-9]+$' || 
 # is green on every possible tree.
 fnbody() {
   awk -v fn="$2" '
-    index($0, "fn " fn "(") && !started { started=1 }
+    (index($0, "func " fn "(") == 1 || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) && !started { started=1 }
     started {
       n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
       if (opened || n>0) opened=1
@@ -101,18 +107,16 @@ fnbody() {
   ' <<< "$1"
 }
 
-# Production code only. The unit tests below `#[cfg(test)]` assert on the very
-# constants the containment arms count, and a scanner that cannot tell a guard
-# from a test convicts the test.
-prod() { sed '/#\[cfg(test)\]/q' <<< "$1"; }
-
-AUTH_RS=panel/backend/src/auth.rs
-ERR_RS=panel/backend/src/error.rs
-ROUTES_AUTH=panel/backend/src/routes/auth.rs
+# Production code only. In Go the unit tests that assert on the very constants
+# the containment arms count live in separate *_test.go files, which these
+# subjects never include — so no `#[cfg(test)]` cut is needed.
+AUTH_RS=panel/go/internal/api/core_auth.go
+ERR_RS=panel/go/internal/api/core_error.go
+ROUTES_AUTH=panel/go/internal/api/rt_auth.go
 API_TS=panel/frontend/src/api.ts
 
-AUTH_C=$(prod "$(code "$AUTH_RS")")
-ERR_C=$(prod "$(code "$ERR_RS")")
+AUTH_C=$(code "$AUTH_RS")
+ERR_C=$(code "$ERR_RS")
 ROUTES_C=$(code "$ROUTES_AUTH")
 API_C=$(code "$API_TS")
 
@@ -120,21 +124,21 @@ if [ -z "$AUTH_C" ] || [ -z "$ERR_C" ] || [ -z "$ROUTES_C" ] || [ -z "$API_C" ];
   bad "FATAL a subject read or stripped EMPTY — every arm below would be vacuous"
   echo; printf '  PASS %d   FAIL %d\n' "$PASS" "$FAIL"; exit 1
 fi
-ok "A0 all four subjects extracted (auth.rs $(wc -l <<< "$AUTH_C")L, error.rs $(wc -l <<< "$ERR_C")L, routes/auth.rs $(wc -l <<< "$ROUTES_C")L, api.ts $(wc -l <<< "$API_C")L)"
+ok "A0 all four subjects extracted (core_auth.go $(wc -l <<< "$AUTH_C")L, core_error.go $(wc -l <<< "$ERR_C")L, rt_auth.go $(wc -l <<< "$ROUTES_C")L, api.ts $(wc -l <<< "$API_C")L)"
 
 echo
 echo "§A session death is minted in ONE place, and named"
 
-if has "$ERR_C" 'pub const CODE_SESSION_INVALID'; then
+if has "$ERR_C" '^const CodeSessionInvalid = "session_invalid"'; then
   ok "A1 the backend has a stable marker for 'you have no usable session'"
 else
-  bad "A1 no CODE_SESSION_INVALID in error.rs — the client is back to inferring a cause from a bare status"
+  bad "A1 no CodeSessionInvalid in core_error.go — the client is back to inferring a cause from a bare status"
 fi
 
-if has "$AUTH_C" 'fn session_invalid\('; then
+if has "$AUTH_C" '^func sessionInvalid\(' && hasf "$AUTH_C" 'apiErrCoded(http.StatusUnauthorized, msg, CodeSessionInvalid)'; then
   ok "A2 every session-death refusal is minted through one named function"
 else
-  bad "A2 no session_invalid() in auth.rs — 'which 401s mean log in again' is a property to re-derive from call sites again"
+  bad "A2 no sessionInvalid() in core_auth.go — 'which 401s mean log in again' is a property to re-derive from call sites again"
 fi
 
 # MEMBERSHIP, not a count. A threshold equal to its subject's own count sits at
@@ -142,11 +146,11 @@ fi
 # Each of the five sentences the extractor can refuse with is named here, so
 # deleting any ONE of them is visible.
 SENTENCES=(
-  "session_invalid(\"Authentication required\")"
-  "session_invalid(\"Invalid or expired token\")"
-  "session_invalid(\"Token has been revoked\")"
-  "session_invalid(\"Session revoked. Please log in again.\")"
-  "session_invalid(\"Authentication required when X-Server-Id is provided\")"
+  "sessionInvalid(\"Authentication required\")"
+  "sessionInvalid(\"Invalid or expired token\")"
+  "sessionInvalid(\"Token has been revoked\")"
+  "sessionInvalid(\"Session revoked. Please log in again.\")"
+  "sessionInvalid(\"Authentication required when X-Server-Id is provided\")"
 )
 MISSING=""
 for s in "${SENTENCES[@]}"; do
@@ -159,21 +163,21 @@ else
 fi
 
 # CONTAINMENT. After the fix, and after s467's authenticate_api_key(), the only
-# literal UNAUTHORIZEDs left in auth.rs are the helper's own, the two
+# literal StatusUnauthorizeds left in core_auth.go are the helper's own, the two
 # agent-token refusals, and the three api_keys refusals — all five deliberately
 # unmarked: a `dp_` key is the same session-less credential class as an agent
 # token, presented fresh on every request, not a browser session that can be
 # "lost". A new one appearing here SHOULD fail this arm and be classified by
 # hand, same as it did for these three.
-N_UNAUTH=$(cnt "$AUTH_C" 'StatusCode::UNAUTHORIZED')
+N_UNAUTH=$(cnt "$AUTH_C" 'http.StatusUnauthorized')
 if [ "$N_UNAUTH" -eq 6 ]; then
-  ok "A4 auth.rs spells UNAUTHORIZED exactly 6 times (the helper + 2 agent-token + 3 api_keys refusals)"
+  ok "A4 core_auth.go spells StatusUnauthorized exactly 6 times (the helper + 2 agent-token + 3 api_keys refusals)"
 else
-  bad "A4 auth.rs spells UNAUTHORIZED $N_UNAUTH times, expected 6 — a new 401 here is either unmarked session death or a marked credential refusal; classify it"
+  bad "A4 core_auth.go spells StatusUnauthorized $N_UNAUTH times, expected 6 — a new 401 here is either unmarked session death or a marked credential refusal; classify it"
 fi
 
-if hasf "$AUTH_C" 'err(StatusCode::UNAUTHORIZED, "Missing authorization")' \
-   && hasf "$AUTH_C" 'err(StatusCode::UNAUTHORIZED, "Invalid token")'; then
+if hasf "$AUTH_C" 'apiErr(http.StatusUnauthorized, "Missing authorization")' \
+   && hasf "$AUTH_C" 'apiErr(http.StatusUnauthorized, "Invalid token")'; then
   ok "A5 (context) the two agent-token refusals stay UNMARKED — an agent cannot make the client log a human out"
 else
   bad "A5 the agent-token refusals changed shape — if they now carry the marker, a stale agent token logs every operator out"
@@ -183,8 +187,8 @@ fi
 # above for the marked ones — a threshold here could absorb one being deleted
 # while a different one was added by mistake.
 API_KEY_UNAUTH=(
-  'err(StatusCode::UNAUTHORIZED, "Invalid or expired token")'
-  'err(StatusCode::UNAUTHORIZED, "Key revoked. Mint a new one.")'
+  'apiErr(http.StatusUnauthorized, "Invalid or expired token")'
+  'apiErr(http.StatusUnauthorized, "Key revoked. Mint a new one.")'
 )
 MISSING=""
 for s in "${API_KEY_UNAUTH[@]}"; do
@@ -195,7 +199,7 @@ done
 # failure ALSO uses (marked, via session_invalid, elsewhere in this file). Two
 # different marking states behind one sentence is intentional, not a
 # collision: the frontend only branches on the marker, never on the text.
-N_INVALID_OR_EXPIRED=$(cnt "$AUTH_C" 'err(StatusCode::UNAUTHORIZED, "Invalid or expired token")')
+N_INVALID_OR_EXPIRED=$(cnt "$AUTH_C" 'apiErr(http.StatusUnauthorized, "Invalid or expired token")')
 if [ -z "$MISSING" ] && [ "$N_INVALID_OR_EXPIRED" -eq 2 ]; then
   ok "A5b the three api_keys refusals (2x invalid/expired + 1x revoked) are present and UNMARKED"
 else
@@ -205,12 +209,13 @@ fi
 # The invariant's teeth: a handler must never mint this. If a route module can
 # claim session death, "a 401 from a handler proves the session was accepted"
 # stops being true and the redirect is a guess again.
-MINTERS=$(grep -rlF 'CODE_SESSION_INVALID' panel/backend/src --include=*.rs 2>/dev/null | sort | tr '\n' ' ')
+# Production files only: *_test.go assert on the marker by design.
+MINTERS=$(grep -rlF 'CodeSessionInvalid' panel/go --include=*.go 2>/dev/null | grep -v '_test\.go$' | sort | tr '\n' ' ')
 MINTERS=$(echo $MINTERS)
 if [ "$MINTERS" = "$ERR_RS $AUTH_RS" ] || [ "$MINTERS" = "$AUTH_RS $ERR_RS" ]; then
   ok "A6 the marker exists in exactly two files — where it is defined and where it is minted ($MINTERS)"
 else
-  bad "A6 the marker appears in [$MINTERS], expected only error.rs + auth.rs — a handler minting it breaks the rule that a handler 401 proves the session was accepted"
+  bad "A6 the marker appears in [$MINTERS], expected only core_error.go + core_auth.go — a handler minting it breaks the rule that a handler 401 proves the session was accepted"
 fi
 
 echo
@@ -280,7 +285,7 @@ fi
 echo
 echo "§C the login door cannot answer a credential question with a 500"
 
-LOGIN_BODY=$(fnbody "$ROUTES_C" "login")
+LOGIN_BODY=$(fnbody "$ROUTES_C" "rtAuthLogin")
 if [ -z "$LOGIN_BODY" ]; then
   bad "C0 the login body extracted EMPTY — every arm in §C would be vacuous"
 else
@@ -288,8 +293,8 @@ else
 
   # ORDER: emptiness is tested BEFORE the parse. That order is the whole fix —
   # the 500 happened because the parse ran first on a string that cannot parse.
-  L_EMPTY=$(lineof "$LOGIN_BODY" 'password_hash.is_empty()')
-  L_PARSE2=$(lineof "$LOGIN_BODY" 'PasswordHash::new(&u.password_hash)')
+  L_EMPTY=$(lineof "$LOGIN_BODY" 'if user.PasswordHash == "" {')
+  L_PARSE2=$(lineof "$LOGIN_BODY" 'verifyPassword(body.Password, user.PasswordHash)')
   if [ "$L_EMPTY" -gt 0 ] && [ "$L_PARSE2" -gt 0 ] && [ "$L_EMPTY" -lt "$L_PARSE2" ]; then
     ok "C1 an absent password is detected before the hash is parsed (L$L_EMPTY < L$L_PARSE2)"
   else
@@ -298,7 +303,7 @@ else
 
   # Both no-hash branches must spend the same Argon2 the real path spends, or
   # the status oracle just becomes a timing oracle.
-  N_DUMMY=$(cnt "$LOGIN_BODY" 'PasswordHash::new(dummy_hash)')
+  N_DUMMY=$(cnt "$LOGIN_BODY" 'verifyPassword(body.Password, rtAuthDummyPasswordHash)')
   if [ "$N_DUMMY" -eq 2 ]; then
     ok "C2 both no-hash branches run the dummy verify (non-existent address, and identity-provider account)"
   else
@@ -314,14 +319,7 @@ else
     bad "C3 the empty-hash branch has its own exit — if it does not pass through record_login_attempt and log_activity, the probe stays unthrottled and invisible to the login-audit surface"
   fi
 
-  # The dummy hash is a module-level constant so a unit test can assert it
-  # parses: the empty-hash branch calls `.expect()` on it, and a dummy that did
-  # not parse would turn the enumeration fix into a panic on the same input.
-  if hasf "$ROUTES_C" 'const DUMMY_PASSWORD_HASH' && has "$ROUTES_C" 'Argon2::default\(\)'; then
-    ok "C4 the dummy hash is a named constant, so its validity is executable rather than assumed"
-  else
-    bad "C4 the dummy hash is inline again — nothing can assert it parses, and the branch that .expect()s it is the enumeration fix"
-  fi
+  # C4 retired: covered by TestRtAuthDummyHashIsVerifiableNotMerelyParseable (panel/go/internal/api/rt_auth_test.go)
 fi
 
 echo
@@ -337,12 +335,13 @@ echo "§D context — green at BOTH tags by design; each owes its own mutation"
 # so it could never match, the negation was trivially true, and the arm reduced
 # to "the constant is still declared somewhere". Its mutation SURVIVED, which is
 # how it was caught.
-REAUTH_BODY=$(fnbody "$ROUTES_C" "reauth_required")
+REAUTH_BODY=$(fnbody "$ROUTES_C" "rtAuthReauthRequired")
 if [ -z "$REAUTH_BODY" ]; then
-  bad "D1 reauth_required extracted EMPTY — this arm would be vacuous"
-elif has "$ERR_C" 'pub const CODE_REAUTH_REQUIRED' \
-   && hasf "$REAUTH_BODY" 'StatusCode::FORBIDDEN' \
-   && ! hasf "$REAUTH_BODY" 'StatusCode::UNAUTHORIZED'; then
+  bad "D1 rtAuthReauthRequired extracted EMPTY — this arm would be vacuous"
+elif has "$ERR_C" '^const CodeReauthRequired = ' \
+   && hasf "$REAUTH_BODY" 'http.StatusForbidden' \
+   && hasf "$REAUTH_BODY" 'CodeReauthRequired' \
+   && ! hasf "$REAUTH_BODY" 'http.StatusUnauthorized'; then
   ok "D1 (context) the re-auth challenge is still a 403, not a 401"
 else
   bad "D1 the re-auth challenge became a 401 — it refuses one ACTION, not the session, and 403 is what that means"

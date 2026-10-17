@@ -25,6 +25,11 @@
 #   §E  the two prose surfaces that promised admin visibility no longer do, and
 #       do describe the way back.
 #
+# Backend subjects are the Go API: panel/go/internal/api/rt_sites.go
+# (rtSitesListForAdmin, rtSitesList, route registration) and core_helpers.go
+# (SiteCallerPredicate, siteDomainForCaller), ported from the Rust
+# routes/sites.rs, routes/mod.rs and helpers.rs.
+#
 # Pure source analysis: no box, no network, no build.
 #
 # ⚠ §A and §C1/§C2 are arms over subjects that DID NOT EXIST at v2.70.0, so "red
@@ -35,7 +40,8 @@
 #
 # ⚠ Every arm whose subject is a STATEMENT reads the file WHOLE (lesson #230):
 # `grep -E` is line-based and this suite's subjects — a Rust fn signature, a SQL
-# string, a JSX attribute — are all routinely written across lines.
+# string, a JSX attribute — are all routinely written across lines. (Rust era:
+# a fn signature; Go: a concatenated SQL string.)
 #
 # NO PIPES INTO `grep -q` — under `set -o pipefail` grep -q closes the pipe on
 # its first match and the arm goes red on correct code. Every arm uses a
@@ -48,8 +54,9 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-SITES=panel/backend/src/routes/sites.rs
-MOD=panel/backend/src/routes/mod.rs
+API=panel/go/internal/api
+SITES=$API/rt_sites.go
+MOD=$API/rt_sites.go
 SITESTSX=panel/frontend/src/pages/Sites.tsx
 DETAIL=panel/frontend/src/pages/SiteDetail.tsx
 SRVCTX=panel/frontend/src/context/ServerContext.tsx
@@ -75,37 +82,24 @@ code() {
 
 subj() { local t; t=$(code "$1"); [ -n "$t" ] || return 1; printf '%s' "$t"; }
 
-# The body of one top-level fn, bounded by the NEXT top-level fn. A fixed
-# `grep -A n` window is not a function (lesson #131/#172).
+# The body of one top-level Go func (or method), bounded by its own column-0
+# closing brace. A fixed `grep -A n` window is not a function (lesson #131/#172).
+# In Go the auth gate is a call in the body (st.adminUser / st.authUser), not an
+# extractor in the signature, so the old Rust `fnsig` has no Go counterpart.
 fnbody() {
   awk -v name="$2" '
-    /^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn / {
-      if ($0 ~ "(pub |pub\\(crate\\) )?(async )?fn " name "\\(") { inside=1; next }
-      inside=0
-    }
+    !inside && (index($0, "func " name "(") == 1 || $0 ~ ("^func [(][^)]*[)] " name "[(]")) { inside=1 }
     inside { print }
+    inside && /^}/ { exit }
   ' <<< "$1"
 }
 
-# The DECLARATION of one top-level fn: its line plus the parameter list, which is
-# where the auth extractors live. Stops at the return arrow so it can never bleed
-# into the body and read a query as an extractor.
-fnsig() {
-  awk -v name="$2" '
-    /^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn / {
-      inside = ($0 ~ "(pub |pub\\(crate\\) )?(async )?fn " name "\\(")
-    }
-    inside { print }
-    inside && /\)[[:space:]]*->/ { inside=0 }
-  ' <<< "$1"
-}
-
-S=$(subj "$SITES") || bad "sites.rs stripped to nothing"
+S=$(subj "$SITES") || bad "rt_sites.go stripped to nothing"
 
 echo "== §A  the admin all-sites read: gated, scoped, and a projection =="
 
-A_SIG=$(fnsig "$S" list_for_admin)
-A_BODY=$(fnbody "$S" list_for_admin)
+A_BODY=$(fnbody "$S" rtSitesListForAdmin)
+A_SIG="$A_BODY"
 
 if [ -z "$A_SIG" ]; then
   bad "A1 sites::list_for_admin exists"
@@ -113,11 +107,11 @@ if [ -z "$A_SIG" ]; then
   bad "A3 list_for_admin is server-scoped and deliberately NOT user-scoped"
   bad "A4 list_for_admin returns a narrow projection, never Site"
 else
-  ok "A1 sites::list_for_admin exists"
+  ok "A1 sites::list_for_admin exists (Go: rtSitesListForAdmin)"
 
-  # AdminUser, and NOT AuthUser. An AuthUser signature here would hand every
+  # AdminUser, and NOT AuthUser. An AuthUser gate here would hand every
   # account every site on the box — the exact inversion this route must not be.
-  if grep -qE 'AdminUser\(' <<< "$A_SIG" && ! grep -qE 'AuthUser\(' <<< "$A_SIG"; then
+  if grep -qE 'st\.adminUser\(r\)' <<< "$A_SIG" && ! grep -qE 'st\.authUser\(' <<< "$A_SIG"; then
     ok "A2 list_for_admin is ADMIN-gated (AdminUser, not AuthUser)"
   else
     bad "A2 list_for_admin is ADMIN-gated (AdminUser, not AuthUser)"
@@ -126,7 +120,7 @@ else
   # Server-scoped yes; user-scoped no. Both halves matter: without the server
   # scope a fleet admin sees another box's rows, and WITH a user scope the route
   # is pointless because it returns exactly what `list` already did.
-  if grep -qE 'ServerScope\(' <<< "$A_SIG" \
+  if grep -qE 'st\.serverScope\(r\)' <<< "$A_SIG" \
   && grep -qE 's\.server_id = \$1' <<< "$A_BODY" \
   && ! grep -qE 'user_id = \$' <<< "$A_BODY"; then
     ok "A3 list_for_admin is server-scoped and deliberately NOT user-scoped"
@@ -134,13 +128,13 @@ else
     bad "A3 list_for_admin is server-scoped and deliberately NOT user-scoped"
   fi
 
-  # The projection is a SEPARATE struct. `Site` is FromRow over `SELECT *`; a
-  # field with no column breaks every `Site`-typed binding in the crate at
+  # The projection is a SEPARATE struct. `Site` is scanned from `SELECT *`; a
+  # field with no column breaks every `Site`-typed binding in the package at
   # runtime, and a Site carrying an owner would eventually be handed to a
   # handler whose whole job is to ask "is this yours?".
-  if grep -qE 'Vec<AdminSiteRow>' <<< "$A_SIG" \
-  && grep -qE 'pub struct AdminSiteRow' <<< "$S" \
-  && ! grep -qE 'Vec<Site>' <<< "$A_SIG"; then
+  if grep -qE 'queryAll\[rtSitesAdminSiteRow\]' <<< "$A_SIG" \
+  && grep -qE '^type rtSitesAdminSiteRow struct' <<< "$S" \
+  && ! grep -qE 'query(All|One|Opt)\[Site\]' <<< "$A_SIG"; then
     ok "A4 list_for_admin returns a narrow projection, never Site"
   else
     bad "A4 list_for_admin returns a narrow projection, never Site"
@@ -149,8 +143,8 @@ fi
 
 # Registered, and at an admin-namespaced path. Read whole: a .route(...) call
 # routinely wraps.
-M=$(subj "$MOD") || bad "mod.rs stripped to nothing"
-if grep -qE '\.route\("/api/admin/sites",[[:space:]]*get\(sites::list_for_admin\)\)' <<< "$M"; then
+M=$(subj "$MOD") || bad "rt_sites.go stripped to nothing"
+if grep -qE 'r\.Handle\("GET /api/admin/sites",[[:space:]]*h\(rtSitesListForAdmin\)\)' <<< "$M"; then
   ok "A5 GET /api/admin/sites is registered to sites::list_for_admin"
 else
   bad "A5 GET /api/admin/sites is registered to sites::list_for_admin"
@@ -181,17 +175,20 @@ echo "== §B  site access has ONE definition, and its admin arm is bounded =="
 # exactly ONE predicate, it lives in one place, its admin arm is bounded by the
 # machine, and it trusts the database rather than the token.
 
-HELPERS=panel/backend/src/helpers.rs
+HELPERS=$API/core_helpers.go
 [ -f "$HELPERS" ] || bad "MISSING SUBJECT FILE: $HELPERS"
-H=$(subj "$HELPERS") || bad "helpers.rs stripped to nothing"
+H=$(subj "$HELPERS") || bad "core_helpers.go stripped to nothing"
 HRAW=$(perl -0777 -pe 's/\s+/ /g' "$HELPERS")
 
-# B1  ONE definition of the predicate, and it is in helpers.rs.
-NDEF=$(grep -c 'pub const SITE_CALLER_PREDICATE' <<< "$H")
-if [ "$NDEF" -eq 1 ]; then
-  ok "B1 the site-access predicate is defined exactly once, in helpers.rs"
+# B1  ONE definition of the predicate, and it is in core_helpers.go (and
+# nowhere else in the package — Go's flat package would compile a second one
+# under a different name just as happily).
+NDEF=$(grep -c '^const SiteCallerPredicate = ' <<< "$H")
+NDEF_ALL=$(grep -lE '^const SiteCallerPredicate|SiteCallerPredicate *= *"' "$API"/*.go 2>/dev/null | grep -vc '_test\.go$')
+if [ "$NDEF" -eq 1 ] && [ "$NDEF_ALL" -eq 1 ]; then
+  ok "B1 the site-access predicate is defined exactly once, in core_helpers.go"
 else
-  bad "B1 the site-access predicate is defined exactly once, in helpers.rs (found $NDEF)"
+  bad "B1 the site-access predicate is defined exactly once, in core_helpers.go (found $NDEF there, $NDEF_ALL files)"
 fi
 
 # B2  NOBODY carries an owner-only site lookup any more. Eight private helpers
@@ -199,8 +196,9 @@ fi
 # the eight had drifted into being server-scoped while the others were not.
 # CONTROL first: the replacement must be present, or a zero below means the tree
 # moved rather than that the class is closed (lesson #143 / asserting a zero).
-NUSE=$(grep -rc 'SITE_CALLER_PREDICATE\|site_domain_for_caller' panel/backend/src/routes panel/backend/src/helpers.rs 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
-NOLD=$(grep -rc 'FROM sites WHERE id = \$1 AND user_id = \$2' panel/backend/src/routes 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
+API_SRC=$(ls "$API"/*.go | grep -v '_test\.go$')
+NUSE=$(grep -c 'SiteCallerPredicate\|siteDomainForCaller' $API_SRC 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
+NOLD=$(grep -c 'FROM sites WHERE id = \$1 AND user_id = \$2' $API_SRC 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
 if [ "$NUSE" -lt 12 ]; then
   bad "B2 CONTROL failed: only $NUSE references to the shared resolver — the arm below would be vacuous"
 elif [ "$NOLD" -eq 0 ]; then
@@ -226,25 +224,26 @@ if grep -qE "u\.role = 'admin'" <<< "$HRAW"; then
 else
   bad "B4 the admin arm reads users.role from the database"
 fi
-# FLATTENED (#383). rustfmt breaks a long field-access chain at the `.`, emitting
-# `claims` NEWLINE `    .role`, which a line-oriented pattern reads as absence —
-# silently, in the reassuring direction. Flatten $H (the COMMENT-STRIPPED text),
-# never $HRAW: HRAW still carries the `claims.role` doc comment at helpers.rs:129
-# and would pin this arm permanently red on correct code.
+# FLATTENED (#383). A formatter can break a long field-access chain at the `.`,
+# which a line-oriented pattern reads as absence — silently, in the reassuring
+# direction. Flatten $H (the COMMENT-STRIPPED text), never $HRAW: HRAW carries
+# the doc comment explaining why the token's claim is NOT read, and would pin
+# this arm permanently red on correct code. Go spells the claim c.Role /
+# claims.Role (Claims.Role in core_auth.go).
 # The failure message also used to be the SUCCESS sentence, so a red described the
 # state it was complaining about the absence of. A red that misnames its cause is
 # a red nobody can act on.
 HFLAT=$(tr '\n' ' ' <<< "$H" | tr -s ' ')
-if grep -qE 'claims *\. *role' <<< "$HFLAT"; then
-  bad "B5 helpers.rs still consults the token's role claim to decide site access — a demoted account keeps its old reach until the session expires"
+if grep -qE '(claims|\bc) *\. *[Rr]ole' <<< "$HFLAT"; then
+  bad "B5 core_helpers.go still consults the token's role claim to decide site access — a demoted account keeps its old reach until the session expires"
 else
-  ok "B5 helpers.rs decides site access without consulting the token's role claim"
+  ok "B5 core_helpers.go decides site access without consulting the token's role claim"
 fi
 
 # B6  The admin's OWN Sites page is not widened. The window onto other people's
 # sites is the all-sites toggle (§A); conflating the two would make an operator's
 # own list unreadable on a busy box, and it is not what was asked for.
-LIST_BODY=$(fnbody "$S" list)
+LIST_BODY=$(fnbody "$S" rtSitesList)
 if [ -z "$LIST_BODY" ]; then
   bad "B6 sites::list exists"
 elif grep -qE 'user_id = \$1 AND server_id = \$2' <<< "$LIST_BODY"; then
@@ -332,12 +331,13 @@ fi
 echo "== §E  the prose no longer promises what the code does not do =="
 
 # Read WHOLE: the retired claim was a sentence spanning two lines, which is
-# exactly what a line-wise grep cannot see (lesson #230).
+# exactly what a line-wise grep cannot see (lesson #230). SDOC is the Go
+# rt_sites.go, which carries the ported transfer doc comment.
 G=$(perl -0777 -pe 's/\s+/ /g' "$GUIDE")
 SDOC=$(perl -0777 -pe 's/\s+/ /g' "$SITES")
 
 # ⚠ These are ABSENCE arms, so they match COMMENTS as readily as code
-# (feedback_source_pin_prose_trap). Neither the guide nor sites.rs may spell the
+# (feedback_source_pin_prose_trap). Neither the guide nor rt_sites.go may spell the
 # retired sentence, even to say it was retired — both were reworded to describe
 # it instead.
 if ! grep -qE 'admins see everything' <<< "$G"; then

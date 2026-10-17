@@ -5,7 +5,7 @@
 # never emits, so `unwrap_or(default)` swallows the mismatch silently —
 # no error, no panic, just permanently wrong/blank output.
 #
-# Found by a dockpanel-fanout finder/skeptic pair (panel/cli/src, the
+# Found by a dockpanel-fanout finder/skeptic pair (the Rust CLI's src tree, the
 # never-fully-audited command files) plus a completeness-critic off-menu
 # find in a sibling file:
 #
@@ -34,10 +34,14 @@
 # low/medium/high one. Read-only display paths only — no mutating
 # command's request body or success-check changed.
 #
-# §A cmd_security_overview reads the real SecurityOverview field names.
-# §B cmd_firewall_list reads the real FirewallStatus/FirewallRule field names.
-# §C cmd_security_scan reads Finding's real fields and derives risk locally.
-# §D cmd_backup_list reads created_at, matching its own sibling functions.
+# Go port: panel/go/internal/cli/misc.go (cmdSecurityOverview,
+# cmdFirewallList, cmdSecurityScan) and backup.go (cmdBackupList and its
+# siblings, which now share printBackupTable).
+#
+# §A cmdSecurityOverview reads the real SecurityOverview field names.
+# §B cmdFirewallList reads the real FirewallStatus/FirewallRule field names.
+# §C cmdSecurityScan reads Finding's real fields and derives risk locally.
+# §D cmdBackupList reads created_at, matching its own sibling functions.
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
@@ -57,7 +61,6 @@ code() {
   perl -0777 -pe '
     s{^[ \t]*/\*.*?\*/[ \t]*$}{}gms;
     s{^\s*//.*$}{}gm;
-    s{^\s*///.*$}{}gm;
   ' "$1"
 }
 
@@ -66,7 +69,7 @@ lacks()  { ! grep -qE -- "$2" <<< "$1"; }
 
 fnbody() {
   awk -v fn="$2" '
-    index($0, "fn " fn "(") && !started { started=1 }
+    !started && (index($0, "func " fn "(") == 1 || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) { started=1 }
     started {
       n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
       if (opened || n>0) opened=1
@@ -75,25 +78,30 @@ fnbody() {
   ' <<< "$1"
 }
 
-SECURITY=panel/cli/src/commands/security.rs
+SECURITY=panel/go/internal/cli/misc.go
 SECURITY_C=$(code "$SECURITY")
-BACKUP=panel/cli/src/commands/backup.rs
+BACKUP=panel/go/internal/cli/backup.go
 BACKUP_C=$(code "$BACKUP")
 
-OVERVIEW_BODY=$(fnbody "$SECURITY_C" "cmd_security_overview")
-FIREWALL_BODY=$(fnbody "$SECURITY_C" "cmd_firewall_list")
-SCAN_BODY=$(fnbody "$SECURITY_C" "cmd_security_scan")
-BACKUP_LIST_BODY=$(fnbody "$BACKUP_C" "cmd_backup_list")
-DB_BACKUP_LIST_BODY=$(fnbody "$BACKUP_C" "cmd_db_backup_list")
-VOL_BACKUP_LIST_BODY=$(fnbody "$BACKUP_C" "cmd_vol_backup_list")
+OVERVIEW_BODY=$(fnbody "$SECURITY_C" "cmdSecurityOverview")
+FIREWALL_BODY=$(fnbody "$SECURITY_C" "cmdFirewallList")
+SCAN_BODY=$(fnbody "$SECURITY_C" "cmdSecurityScan")
+# The three backup listings share one table printer; each list body is its
+# own body plus that printer's, since the printer is what reads the fields.
+TABLE_BODY=$(fnbody "$BACKUP_C" "printBackupTable")
+via_table() { local b; b=$(fnbody "$BACKUP_C" "$1"); [ -n "$b" ] || return 0
+  if has "$b" 'printBackupTable\('; then printf '%s\n%s' "$b" "$TABLE_BODY"; else printf '%s' "$b"; fi; }
+BACKUP_LIST_BODY=$(via_table "cmdBackupList")
+DB_BACKUP_LIST_BODY=$(via_table "cmdDBBackupList")
+VOL_BACKUP_LIST_BODY=$(via_table "cmdVolBackupList")
 
-# ── §A cmd_security_overview reads real SecurityOverview fields ─────────
-echo "── §A cmd_security_overview: real field names, not fictional ones ──"
+# ── §A cmdSecurityOverview reads real SecurityOverview fields ─────────
+echo "── §A cmdSecurityOverview: real field names, not fictional ones ──"
 
 if [ -n "$OVERVIEW_BODY" ]; then
-  ok "A0 cmd_security_overview exists"
+  ok "A0 cmdSecurityOverview exists"
 else
-  bad "A0 cmd_security_overview is missing — every arm below is measuring nothing"
+  bad "A0 cmdSecurityOverview is missing — every arm below is measuring nothing"
 fi
 
 if has "$OVERVIEW_BODY" '"firewall_active"'; then
@@ -132,8 +140,8 @@ else
   bad "A6 does not surface the SSH hardening fields the agent actually provides"
 fi
 
-# ── §B cmd_firewall_list reads real FirewallStatus/FirewallRule fields ──
-echo "── §B cmd_firewall_list: real field names, not fictional ones ──"
+# ── §B cmdFirewallList reads real FirewallStatus/FirewallRule fields ──
+echo "── §B cmdFirewallList: real field names, not fictional ones ──"
 
 if has "$FIREWALL_BODY" '"active"'; then
   ok "B1 reads active (FirewallStatus's real bool field)"
@@ -141,7 +149,7 @@ else
   bad "B1 does not read active — still on the wrong field name"
 fi
 
-if lacks "$FIREWALL_BODY" '\["enabled"\]'; then
+if lacks "$FIREWALL_BODY" '"enabled"'; then
   ok "B2 no longer reads the nonexistent enabled field"
 else
   bad "B2 still reads enabled — FirewallStatus has no such field"
@@ -159,22 +167,22 @@ else
   bad "B4 does not read to — the one field that actually names the rule's target"
 fi
 
-if has "$FIREWALL_BODY" 'to_lowercase\(\).*contains\("allow"\)'; then
+if has "$FIREWALL_BODY" 'strings\.Contains\(strings\.ToLower\(action\), "allow"\)'; then
   ok "B5 action check tolerates the real \"ALLOW IN\"/\"DENY IN\" values"
 else
   bad "B5 action check still expects a bare \"allow\" the agent never sends"
 fi
 
-# ── §C cmd_security_scan reads Finding's real fields, derives risk locally ──
-echo "── §C cmd_security_scan: real Finding fields + client-derived risk ──"
+# ── §C cmdSecurityScan reads Finding's real fields, derives risk locally ──
+echo "── §C cmdSecurityScan: real Finding fields + client-derived risk ──"
 
-if lacks "$SCAN_BODY" 'result\["risk_level"\]'; then
+if lacks "$SCAN_BODY" '"risk_level"\)'; then
   ok "C1 no longer reads risk_level directly off the wire — ScanResult has no such field"
 else
   bad "C1 still reads result[\"risk_level\"] — always unwrap_or(\"unknown\") in production"
 fi
 
-if has "$SCAN_BODY" 'max_by_key' && has "$SCAN_BODY" '"severity"'; then
+if has "$SCAN_BODY" 'rank\[s\] >= best' && has "$SCAN_BODY" 'get\(f, "severity"\)'; then
   ok "C2 derives an overall risk level from the findings actually returned"
 else
   bad "C2 no client-side risk derivation found — the Risk level line has no data source left"
@@ -192,40 +200,40 @@ else
   bad "C4 does not read title — still expecting Finding to have a message field"
 fi
 
-if lacks "$SCAN_BODY" 'finding\["message"\]'; then
+if lacks "$SCAN_BODY" '"message"'; then
   ok "C5 no longer reads finding[\"message\"] — Finding has no such field"
 else
   bad "C5 still reads finding[\"message\"] — every finding line would print blank"
 fi
 
-# ── §D cmd_backup_list reads created_at, matching its own siblings ───────
-echo "── §D cmd_backup_list: created_at, matching cmd_db_backup_list/cmd_vol_backup_list ──"
+# ── §D cmdBackupList reads created_at, matching its own siblings ───────
+echo "── §D cmdBackupList: created_at, matching cmdDBBackupList/cmdVolBackupList ──"
 
 if has "$BACKUP_LIST_BODY" '"created_at"'; then
-  ok "D1 cmd_backup_list reads created_at"
+  ok "D1 cmdBackupList reads created_at"
 else
-  bad "D1 cmd_backup_list still reads the wrong field — CREATED column always prints '-'"
+  bad "D1 cmdBackupList still reads the wrong field — CREATED column always prints '-'"
 fi
 
-if lacks "$BACKUP_LIST_BODY" '\["created"\]'; then
-  ok "D2 cmd_backup_list no longer reads the nonexistent created field"
+if [ -n "$BACKUP_LIST_BODY" ] && lacks "$BACKUP_LIST_BODY" '"created"'; then
+  ok "D2 cmdBackupList no longer reads the nonexistent created field"
 else
-  bad "D2 cmd_backup_list still reads [\"created\"] — BackupInfo has no such field"
+  bad "D2 cmdBackupList still reads [\"created\"] — BackupInfo has no such field"
 fi
 
 # Positive controls: the sibling functions were ALREADY correct and must
 # stay that way — this is the exact contrast that exposed the bug (two
 # adjacent functions in the same file got it right, one didn't).
 if has "$DB_BACKUP_LIST_BODY" '"created_at"'; then
-  ok "D3 (control) cmd_db_backup_list still reads created_at — unchanged, was never broken"
+  ok "D3 (control) cmdDBBackupList still reads created_at — unchanged, was never broken"
 else
-  bad "D3 (control) cmd_db_backup_list regressed off created_at"
+  bad "D3 (control) cmdDBBackupList regressed off created_at"
 fi
 
 if has "$VOL_BACKUP_LIST_BODY" '"created_at"'; then
-  ok "D4 (control) cmd_vol_backup_list still reads created_at — unchanged, was never broken"
+  ok "D4 (control) cmdVolBackupList still reads created_at — unchanged, was never broken"
 else
-  bad "D4 (control) cmd_vol_backup_list regressed off created_at"
+  bad "D4 (control) cmdVolBackupList regressed off created_at"
 fi
 
 echo

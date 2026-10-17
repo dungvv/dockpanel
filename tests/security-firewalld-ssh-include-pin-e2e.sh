@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Regression pins for the s454 dockpanel-fanout run over
-# panel/agent/src/services/security.rs + panel/agent/src/routes/security.rs
+# Regression pins for the s454 dockpanel-fanout run over the agent's
+# services/security.rs + routes/security.rs — now the Go port,
+# panel/go/internal/agent/services/security.go + routes/security.go
 # (workflow wf_ec0595a4-efd; project_dockpanel_tech_debt ledger p193).
 #
 #   S1  parse_ssh_config()/modify_sshd_config() only ever read/wrote
@@ -31,6 +32,10 @@
 #       "r'm' -rf /"` runs `rm -rf /`. The backend's independent copy,
 #       is_safe_shell_command (routes/mod.rs), had no normalization at all.
 #
+# Behaviour a test can call directly (the sshd parser/writer, the hook and
+# shell validators) is pinned by Go tests, run here with `go test`; the arms
+# left as source checks pin wiring (which function calls which).
+#
 # Pure source analysis except where noted; no box, no network, no build.
 
 set -uo pipefail
@@ -42,7 +47,8 @@ bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
 # Strip comments and the test module, so a pin can never be satisfied (or
 # tripped) by prose describing the very thing it forbids.
-code()  { sed '/#\[cfg(test)\]/q' "$1" | grep -vE '^[[:space:]]*(///|//!|//|\*|/\*)'; }
+# (Go keeps its tests in *_test.go, so no test-module cut is needed.)
+code()  { grep -vE '^[[:space:]]*(//|\*|/\*)' "$1"; }
 has()   { [ -n "$(code "$1" | grep -F -- "$2")" ]; }
 hasre() { [ -n "$(code "$1" | grep -E -- "$2")" ]; }
 
@@ -56,125 +62,117 @@ fnbody()    { code "$1" | awk "/$2/,/^}/"; }
 bodyhas()   { [ -n "$(fnbody "$1" "$2" | grep -F -- "$3")" ]; }
 bodyhasre() { [ -n "$(fnbody "$1" "$2" | grep -E -- "$3")" ]; }
 
-SEC_SVC=panel/agent/src/services/security.rs
-SEC_ROUTE=panel/agent/src/routes/security.rs
-FIREWALL=panel/agent/src/services/firewall.rs
-CMDFILTER=panel/agent/src/services/command_filter.rs
-LOGS_SVC=panel/agent/src/services/logs.rs
-DIAG=panel/agent/src/services/diagnostics.rs
-AGENT_LOGS_ROUTE=panel/agent/src/routes/logs.rs
-BACKEND_MOD=panel/backend/src/routes/mod.rs
+GA=panel/go/internal/agent
+SEC_SVC=$GA/services/security.go
+FIREWALL=$GA/services/firewall.go
+LOGS_SVC=$GA/services/logs.go
+DIAG=$GA/services/diagnostics.go
+AGENT_LOGS_ROUTE=$GA/routes/logs.go
 
-for f in "$SEC_SVC" "$SEC_ROUTE" "$FIREWALL" "$CMDFILTER" "$LOGS_SVC" "$DIAG" "$AGENT_LOGS_ROUTE" "$BACKEND_MOD"; do
+for f in "$SEC_SVC" "$FIREWALL" "$LOGS_SVC" "$DIAG" "$AGENT_LOGS_ROUTE"; do
   [ -f "$f" ] || { echo "missing source file: $f"; exit 1; }
 done
 
 echo "── 1. S1: SSH config parsing/writing follows Include drop-ins ──"
 
-if has "$SEC_SVC" "fn linearized_sshd_lines"; then
-  ok "security.rs linearizes sshd_config + its Includes before parsing/writing"
+# 'linearizes sshd_config + Includes' retired: covered by TestSecurityParseSshConfigIncludeDropInWinsOverLaterMainDefault (panel/go/internal/agent/services/security_test.go)
+# 'path-parameterized for testability' retired (obsolete in Go): the tests call securityParseSshConfigAt directly, so it existing is compiler-enforced
+# 'parse reads through the linearized view' retired: covered by TestSecurityParseSshConfigFirstIncludedFileWinsLexically + TestSecurityParseSshConfigRelativeInclude (security_test.go)
+# 'modify resolves the governing file' retired: covered by TestSecurityModifySshdConfigWritesToTheFileThatActuallyGovernsTheKey + TestSecurityModifySshdConfigReplacesActiveDirectiveInGoverningFileNotMain (security_test.go)
+# 'first obtained value wins' retired: covered by TestSecurityParseSshConfigIncludeDropInWinsOverLaterMainDefault (security_test.go)
+if (cd panel/go && go test ./internal/agent/services/ -count=1 \
+      -run '^TestSecurity(ParseSshConfig|ModifySshdConfig)' >/dev/null 2>&1); then
+  ok "the sshd parser/writer Go tests pass: Includes followed, first value wins, writes land in the governing file"
 else
-  bad "linearized_sshd_lines is gone — Include-blindness may be back"
+  bad "the sshd Include Go tests fail — Include-blindness (or last-match-wins) may be back"
 fi
 
-if has "$SEC_SVC" "fn parse_ssh_config_at"; then
-  ok "parse_ssh_config is path-parameterized for testability"
+# The public entry points still go through the tested Include-aware bodies.
+if bodyhas "$SEC_SVC" "^func SecurityParseSshConfig\\(" "securityParseSshConfigAt(" \
+   && bodyhas "$SEC_SVC" "^func securityModifySshdConfig\\(" "securityModifySshdConfigAt("; then
+  ok "SecurityParseSshConfig / securityModifySshdConfig delegate to the tested Include-aware _At bodies"
 else
-  bad "parse_ssh_config_at is gone"
-fi
-
-if bodyhas "$SEC_SVC" "fn parse_ssh_config_at" "linearized_sshd_lines"; then
-  ok "parse_ssh_config_at reads through the linearized (Include-aware) view"
-else
-  bad "parse_ssh_config_at no longer calls linearized_sshd_lines — regressed to single-file read"
-fi
-
-if bodyhas "$SEC_SVC" "fn modify_sshd_config_at" "linearized_sshd_lines"; then
-  ok "modify_sshd_config_at resolves the governing file via the linearized view before writing"
-else
-  bad "modify_sshd_config_at no longer resolves an Include-aware target — a write could silently miss the file that actually governs the key"
-fi
-
-# The "first obtained value wins" precedence must actually be respected, not
-# just read Include lines without early-stopping per keyword.
-if bodyhasre "$SEC_SVC" "fn parse_ssh_config_at" 'if !port_set|if !pw_set|if !root_set'; then
-  ok "parse_ssh_config_at stops at the FIRST match per keyword (OpenSSH's own precedence)"
-else
-  bad "parse_ssh_config_at may take the LAST match instead of the first — inverts sshd's own precedence"
+  bad "a public sshd entry point no longer calls its tested _At body — the Go tests above no longer cover what runs"
 fi
 
 echo
 echo "── 2. S2: firewall rule add/remove/block-port speak firewalld too ──"
 
-if bodyhas "$SEC_SVC" "pub async fn add_firewall_rule" "Firewall::Firewalld"; then
-  ok "add_firewall_rule branches on the detected firewall"
+if bodyhas "$SEC_SVC" "^func SecurityAddFirewallRule\\(" "if FirewallDetect() == FirewallFirewalld {"; then
+  ok "SecurityAddFirewallRule branches on the detected firewall"
 else
-  bad "add_firewall_rule no longer checks for firewalld — back to a ufw-only 424 on RHEL"
+  bad "SecurityAddFirewallRule no longer checks for firewalld — back to a ufw-only 424 on RHEL"
 fi
 
-if bodyhas "$SEC_SVC" "pub async fn remove_firewall_rule" "Firewall::Firewalld"; then
-  ok "remove_firewall_rule branches on the detected firewall"
+if bodyhas "$SEC_SVC" "^func SecurityRemoveFirewallRule\\(" "if FirewallDetect() == FirewallFirewalld {"; then
+  ok "SecurityRemoveFirewallRule branches on the detected firewall"
 else
-  bad "remove_firewall_rule no longer checks for firewalld"
+  bad "SecurityRemoveFirewallRule no longer checks for firewalld"
 fi
 
-for fn in add_port remove_port remove_service rich_rule_spec add_rich_rule_raw remove_rich_rule_raw; do
-  if has "$FIREWALL" "fn $fn"; then
-    ok "firewall.rs exposes $fn"
+for fn in FirewallAddPort FirewallRemovePort FirewallRemoveService FirewallRichRuleSpec FirewallAddRichRuleRaw FirewallRemoveRichRuleRaw; do
+  if has "$FIREWALL" "func $fn("; then
+    ok "firewall.go exposes $fn"
   else
-    bad "firewall.rs is missing $fn — firewalld parity primitive lost"
+    bad "firewall.go is missing $fn — firewalld parity primitive lost"
   fi
 done
 
-if has "$SEC_SVC" "fn firewalld_entries"; then
+if has "$SEC_SVC" "func securityFirewalldEntries(" \
+   && bodyhas "$SEC_SVC" "^func securityFirewalldStatus\\(" "securityFirewalldEntries()" \
+   && bodyhas "$SEC_SVC" "^func SecurityRemoveFirewallRule\\(" "securityFirewalldEntries()"; then
   ok "firewalld_status and remove_firewall_rule share one numbered entry list (services+ports+rich rules)"
 else
-  bad "firewalld_entries is gone — the numbers the Security page shows and the ones remove_firewall_rule resolves can drift apart again"
+  bad "securityFirewalldEntries is gone (or no longer shared by status and remove) — the numbers the Security page shows and the ones remove_firewall_rule resolves can drift apart again"
 fi
 
 echo
 echo "── 3. S3: the auth log path is RHEL-aware, and a missing file is a real error ──"
 
-if has "$LOGS_SVC" "fn resolve_auth_log_path"; then
-  ok "logs.rs exposes a shared resolve_auth_log_path()"
+if has "$LOGS_SVC" "func LogsResolveAuthLogPath() string"; then
+  ok "logs.go exposes a shared LogsResolveAuthLogPath()"
 else
-  bad "resolve_auth_log_path is gone"
+  bad "LogsResolveAuthLogPath is gone"
 fi
 
-if bodyhas "$SEC_SVC" "pub async fn get_login_audit" "resolve_auth_log_path"; then
-  ok "get_login_audit resolves the auth log path instead of hardcoding /var/log/auth.log"
+if bodyhas "$SEC_SVC" "^func SecurityGetLoginAudit\\(" "path := LogsResolveAuthLogPath()"; then
+  ok "SecurityGetLoginAudit resolves the auth log path instead of hardcoding /var/log/auth.log"
 else
-  bad "get_login_audit hardcodes the Debian-only auth log path again"
+  bad "SecurityGetLoginAudit hardcodes the Debian-only auth log path again"
 fi
 
-if bodyhasre "$SEC_SVC" "pub async fn get_login_audit" '\.map_err\('; then
-  ok "get_login_audit propagates a read failure as an Err, not a silent empty Vec"
+if [ -n "$(fnbody "$SEC_SVC" "^func SecurityGetLoginAudit\\(" | tr '\n\t' '  ' | grep -E 'content, err := os\.ReadFile\(path\) +if err != nil \{ +return nil, fmt\.Errorf\(')" ]; then
+  ok "SecurityGetLoginAudit propagates a read failure as an Err, not a silent empty Vec"
 else
-  bad "get_login_audit swallows a missing/unreadable log into Ok(vec![]) again — indistinguishable from a genuinely quiet host"
+  bad "SecurityGetLoginAudit swallows a missing/unreadable log into Ok(vec![]) again — indistinguishable from a genuinely quiet host"
 fi
 
-if bodyhas "$SEC_SVC" "pub async fn get_login_audit" "unwrap_or_default"; then
-  bad "get_login_audit still has an unwrap_or_default() fallback on the read — the silent-empty-success path may be back"
+# Go's spelling of unwrap_or_default: discarding the read's error. Positive
+# anchor first, so an absent function cannot pass the absence check.
+if ! bodyhas "$SEC_SVC" "^func SecurityGetLoginAudit\\(" "os.ReadFile(path)"; then
+  bad "SecurityGetLoginAudit no longer reads the auth log at all — re-scope this pin"
+elif bodyhasre "$SEC_SVC" "^func SecurityGetLoginAudit\\(" ', _ :?= os\.ReadFile\(|return \[\]SecurityLoginEntry\{\}, nil'; then
+  bad "SecurityGetLoginAudit discards the read error — the silent-empty-success path may be back"
 else
-  ok "get_login_audit has no silent unwrap_or_default() on the auth log read"
+  ok "SecurityGetLoginAudit has no silent empty-result fallback on the auth log read"
 fi
 
 # Two sibling hardcodes found in the same sweep — same fix, different files.
-if has "$DIAG" 'resolve_auth_log_path()'; then
-  ok "diagnostics.rs's brute-force scan uses the RHEL-aware path"
+if has "$DIAG" 'LogsResolveAuthLogPath()'; then
+  ok "diagnostics.go's brute-force scan uses the RHEL-aware path"
 else
-  bad "diagnostics.rs still hardcodes /var/log/auth.log — its brute-force finding silently never fires on RHEL"
+  bad "diagnostics.go still hardcodes /var/log/auth.log — its brute-force finding silently never fires on RHEL"
 fi
 
-if has "$AGENT_LOGS_ROUTE" 'resolve_auth_log_path()'; then
-  ok "routes/logs.rs's log-sizes listing uses the RHEL-aware path"
+if has "$AGENT_LOGS_ROUTE" 'services.LogsResolveAuthLogPath()'; then
+  ok "routes/logs.go's log-sizes listing uses the RHEL-aware path"
 else
-  bad "routes/logs.rs's log-sizes listing still hardcodes /var/log/auth.log"
+  bad "routes/logs.go's log-sizes listing still hardcodes /var/log/auth.log"
 fi
 
 # No stray direct hardcode of the Debian-only path anywhere in the agent
-# crate's non-comment code, outside the one place that still legitimately
-# needs the literal string: resolve_auth_log_path's own existence probe.
+# (Go) non-comment code, outside the one place that still legitimately
+# needs the literal string: LogsResolveAuthLogPath's own existence probe.
 STRAY=""
 while IFS= read -r f; do
   [ -z "$f" ] && continue
@@ -183,10 +181,10 @@ while IFS= read -r f; do
     STRAY="$STRAY $f"
   fi
 done <<EOF
-$(grep -rl '/var/log/auth\.log' panel/agent/src/ --include="*.rs" 2>/dev/null || true)
+$(grep -rl '/var/log/auth\.log' "$GA" panel/go/cmd/dockpanel-agent --include="*.go" 2>/dev/null | grep -v '_test\.go$' || true)
 EOF
 if [ -z "$STRAY" ]; then
-  ok "no other agent-crate file still hardcodes the Debian-only auth log path"
+  ok "no other agent Go file still hardcodes the Debian-only auth log path"
 else
   bad "these files still hardcode /var/log/auth.log directly:$STRAY"
 fi
@@ -194,22 +192,20 @@ fi
 echo
 echo "── 4. S4: hook/shell command validators close the quote-split bypass ──"
 
-if bodyhas "$CMDFILTER" "pub fn is_safe_hook_command" "normalize_for_blocklist(command)"; then
-  ok "is_safe_hook_command routes its dangerous-pattern scan through normalize_for_blocklist"
+# is_safe_hook_command-normalizes arm retired: covered by TestCommandFilterHookCommandQuoteSplitEvasionRejected (panel/go/internal/agent/services/command_filter_test.go)
+if (cd panel/go && go test ./internal/agent/services/ -count=1 \
+      -run '^(TestCommandFilterHookCommandQuoteSplitEvasionRejected|TestCommandFilterNormalizeForBlocklist)$' >/dev/null 2>&1); then
+  ok "CommandFilterIsSafeHookCommand refuses r'm' -rf / and its quote-split siblings (Go test)"
 else
-  bad "is_safe_hook_command no longer normalizes — r'm' -rf / bypasses the blocklist and sh -c runs it for real"
+  bad "CommandFilterIsSafeHookCommand no longer normalizes — r'm' -rf / bypasses the blocklist and sh -c runs it for real"
 fi
 
-if has "$BACKEND_MOD" "fn normalize_for_blocklist"; then
-  ok "the backend has its own normalize_for_blocklist"
+# backend normalize_for_blocklist-exists arm retired (obsolete in Go): isSafeShellCommand calling it is compiler-enforced, its behaviour is tested below
+# is_safe_shell_command-normalizes arm retired: covered by TestShellCommandRejectsQuoteSplitEvasion (panel/go/internal/api/core_router_test.go)
+if (cd panel/go && go test ./internal/api/ -count=1 -run '^TestShellCommandRejectsQuoteSplitEvasion$' >/dev/null 2>&1); then
+  ok "the API's isSafeShellCommand refuses the same quote-split bypass (Go test)"
 else
-  bad "the backend's normalize_for_blocklist is gone"
-fi
-
-if bodyhas "$BACKEND_MOD" "pub fn is_safe_shell_command" "normalize_for_blocklist(cmd)"; then
-  ok "is_safe_shell_command routes through normalize_for_blocklist"
-else
-  bad "is_safe_shell_command no longer normalizes — same quote-split bypass as command_filter.rs had"
+  bad "isSafeShellCommand no longer normalizes — same quote-split bypass as command_filter had"
 fi
 
 echo

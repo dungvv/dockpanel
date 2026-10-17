@@ -5,7 +5,8 @@
 #
 #   #94  The panel sent the container environment under the key "env_vars".
 #        The agent's DeployRequest declared that field as `env` with a bare
-#        #[serde(default)], so the unrecognised key was dropped and the
+#        #[serde(default)] (Rust era; the Go agent's gitBuildDeployRequest now
+#        takes both spellings and refuses a body carrying both), so the unrecognised key was dropped and the
 #        recognised one defaulted to empty. Every git deploy — Dockerfile and
 #        Nixpacks, first deploy and redeploy, rollback and PR preview — started
 #        its container with no environment, and every layer reported success.
@@ -41,12 +42,14 @@ FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-GD_RS=panel/backend/src/routes/git_deploys.rs
-AGENT_GB=panel/agent/src/routes/git_build.rs
-BD_RS=panel/backend/src/routes/backup_destinations.rs
-BSCHED_RS=panel/backend/src/services/backup_scheduler.rs
-BPOL_RS=panel/backend/src/services/backup_policy_executor.rs
-BSCHEDR_RS=panel/backend/src/routes/backup_schedules.rs
+# The Go port (panel/go) is what ships; the API package is flat.
+API=panel/go/internal/api
+GD_RS=$API/rt_git_deploys.go
+AGENT_GB=panel/go/internal/agent/routes/git_build.go
+BD_RS=$API/rt_backup_destinations.go
+BSCHED_RS=$API/svc_backup_scheduler.go
+BPOL_RS=$API/svc_backup_policy_executor.go
+BSCHEDR_RS=$API/rt_backup_schedules.go
 ORCH_TSX=panel/frontend/src/pages/BackupOrchestrator.tsx
 SETTINGS_TSX=panel/frontend/src/pages/Settings.tsx
 BACKUPS_TSX=panel/frontend/src/pages/Backups.tsx
@@ -68,10 +71,10 @@ done
 # `//` is only stripped at the start of a (trimmed) line: stripping it mid-line
 # would blank the inside of every string containing a URL.
 #
-# `#[cfg(test)]` modules are dropped too. Several arms below COUNT call sites,
-# and a unit test that exercises the very function being counted would inflate
-# the total and fail an arm whose subject is correct. That is not hypothetical:
-# it cost the previous release's suite two false failures (#94c).
+# Several arms below COUNT call sites, and a unit test that exercises the very
+# function being counted would inflate the total and fail an arm whose subject
+# is correct (#94c). In Go the tests live in separate _test.go files, which no
+# arm reads, so there is no in-file test module to drop.
 code_of() {
   awk '{ t=$0; sub(/^[ \t]+/,"",t); if (t !~ /^\/\//) print }' "$1" \
     | sed 's:/\*.*\*/::g' \
@@ -79,8 +82,7 @@ code_of() {
         /\/\*/ { inblk=1 }
         !inblk { print }
         /\*\// { inblk=0 }
-      ' \
-    | awk '/^#\[cfg\(test\)\]/ { intest=1 } !intest { print }'
+      '
 }
 
 # Guard the guard: if stripping ever eats most of a file again, say so loudly
@@ -119,14 +121,14 @@ echo "§1 the panel spells the environment the way the agent reads it (#94)"
 # DISCOVERY, not a restated constant: the accepted spellings are parsed out of
 # the agent's struct, and the sent spelling out of the panel's one builder. A
 # rename on either side has to survive being compared with the other.
-AGENT_FIELD=$(code_of "$AGENT_GB" \
-  | awk '/struct DeployRequest/,/^}/' \
-  | grep -A1 -E '#\[serde\(default(, alias)?' \
-  | grep -oE '^[ \t]*[a-z_]+: HashMap<String, String>' \
-  | grep -oE '[a-z_]+' | head -1)
-AGENT_ALIASES=$(code_of "$AGENT_GB" \
-  | awk '/struct DeployRequest/,/^}/' \
-  | grep -oE 'alias = "[a-z_]+"' | grep -oE '"[a-z_]+"' | tr -d '"')
+# Go: every map[string]string field of gitBuildDeployRequest, by its json tag.
+# The first is the field, the rest are the accepted alternative spellings.
+AGENT_ENV_TAGS=$(code_of "$AGENT_GB" \
+  | awk '/^type gitBuildDeployRequest struct/,/^}/' \
+  | grep -E 'map\[string\]string' \
+  | grep -oE 'json:"[a-z_]+"' | sed -E 's/json:"([a-z_]+)"/\1/')
+AGENT_FIELD=$(printf '%s\n' "$AGENT_ENV_TAGS" | head -1)
+AGENT_ALIASES=$(printf '%s\n' "$AGENT_ENV_TAGS" | tail -n +2)
 AGENT_KEYS=$(printf '%s\n%s\n' "$AGENT_FIELD" "$AGENT_ALIASES" | grep -c . || true)
 
 if [ -n "$AGENT_FIELD" ] && [ "$AGENT_KEYS" -ge 2 ]; then
@@ -136,13 +138,13 @@ else
 fi
 
 PANEL_KEY=$(code_of "$GD_RS" \
-  | awk '/fn build_deploy_body/,/^}/' \
+  | awk '/^func rtGitDeploysBuildDeployBody\(/,/^}/' \
   | grep -oE '"(env|env_vars)":' | grep -oE 'env(_vars)?' | head -1)
 
 if [ -n "$PANEL_KEY" ]; then
-  ok "panel build_deploy_body sends the environment as '$PANEL_KEY'"
+  ok "panel rtGitDeploysBuildDeployBody sends the environment as '$PANEL_KEY'"
 else
-  bad "build_deploy_body sends no env key at all — the deploy body has lost the environment again"
+  bad "rtGitDeploysBuildDeployBody sends no env key at all — the deploy body has lost the environment again"
 fi
 
 # Both sides must be non-empty BEFORE they are compared. Without this guard the
@@ -161,19 +163,19 @@ fi
 echo
 echo "§2 never both spellings in one body (#94's own fix would break every deploy)"
 
-# serde rejects a payload carrying a field AND its alias as a duplicate field.
-BOTH=$(code_of "$GD_RS" | awk '/fn build_deploy_body/,/^}/' | grep -cE '"env(_vars)?":' || true)
-if [ "$BOTH" -eq 1 ]; then
-  ok "build_deploy_body sets exactly one env key"
+# §2 exactly-one-env-key retired: covered by TestRtGitDeploysDeployBodySendsTheKeyTheAgentReads (panel/go/internal/api/rt_git_deploys_test.go)
+# The agent side of the same rule (a body with both spellings is refused) is the
+# explicit `b.Env != nil && b.EnvVars != nil` check in gitBuildDeploy.
+if hasre "$AGENT_GB" 'b\.Env != nil && b\.EnvVars != nil'; then
+  ok "the agent refuses a body that carries both spellings"
 else
-  bad "build_deploy_body sets $BOTH env keys — serde treats a field plus its alias as a duplicate field and rejects the whole request"
+  bad "gitBuildDeploy no longer refuses env + env_vars together — which spelling wins is now silent"
 fi
 
 echo
 echo "§3 every deploy body comes from the one builder (#94's fifth call site)"
 
 DEPLOY_CALLS=$(countf "$GD_RS" '"/git/deploy"')
-BUILDER_CALLS=$(countre "$GD_RS" 'build_deploy_body\(DeployBody \{')
 
 if [ "$DEPLOY_CALLS" -ge 5 ]; then
   ok "found $DEPLOY_CALLS callers of /git/deploy to account for"
@@ -181,34 +183,57 @@ else
   bad "found only $DEPLOY_CALLS /git/deploy callers — the discovery pattern is broken, not the code (#100)"
 fi
 
+# Go shape: each caller passes either rtGitDeploysConfigDeployBody(...) (the
+# row-built production body) or a local assigned from
+# rtGitDeploysBuildDeployBody(rtGitDeploysDeployBody{...}). Anything else is a
+# hand-rolled map — how auto-rollback lost env, memory_mb and cpu_percent.
+BUILDER_CALLS=0
+while IFS= read -r arg; do
+  [ -n "$arg" ] || continue
+  if [ "$arg" = rtGitDeploysConfigDeployBody ] \
+     || hasre "$GD_RS" "$arg :?= rtGitDeploysBuildDeployBody\(rtGitDeploysDeployBody\{"; then
+    BUILDER_CALLS=$((BUILDER_CALLS+1))
+  fi
+done < <(code_of "$GD_RS" | grep -oE '"/git/deploy", [A-Za-z_]+' | sed -E 's/.*, //')
+
 if [ "$BUILDER_CALLS" -eq "$DEPLOY_CALLS" ]; then
-  ok "all $DEPLOY_CALLS deploy bodies are built by build_deploy_body"
+  ok "all $DEPLOY_CALLS deploy bodies are built by rtGitDeploysBuildDeployBody"
 else
-  bad "$DEPLOY_CALLS callers of /git/deploy but $BUILDER_CALLS uses of build_deploy_body — a body is being hand-rolled again, which is how auto-rollback lost env, memory_mb and cpu_percent"
+  bad "$DEPLOY_CALLS callers of /git/deploy but $BUILDER_CALLS bodies from rtGitDeploysBuildDeployBody — a body is being hand-rolled again, which is how auto-rollback lost env, memory_mb and cpu_percent"
 fi
 
-# The struct has no Default and no Option-defaulting, so every caller must name
-# every field. If that stops being true, an omission goes quiet again.
-if hasre "$GD_RS" 'struct DeployBody' && ! hasre "$GD_RS" 'impl Default for DeployBody'; then
-  ok "DeployBody has no Default — a caller cannot omit a field silently"
+if [ "$(code_of "$GD_RS" | awk '/^func rtGitDeploysConfigDeployBody\(/,/^}/' | grep -cE 'return rtGitDeploysBuildDeployBody\(rtGitDeploysDeployBody\{')" -eq 1 ]; then
+  ok "rtGitDeploysConfigDeployBody itself goes through the builder"
 else
-  bad "DeployBody gained a Default; omitting env or memory_mb would compile again"
+  bad "rtGitDeploysConfigDeployBody no longer returns rtGitDeploysBuildDeployBody(...) — the shared production path is hand-rolled"
+fi
+
+# Rust enforced "every caller names every field" by DeployBody having no
+# Default. A Go struct literal may omit fields and they zero silently, so the
+# guarantee is now asserted on the one literal that every production deploy
+# (manual, webhook, scheduled, rollback, auto-rollback) goes through. The
+# preview literal omits memory/cpu/volumes deliberately and says so.
+DB_FIELDS=$(code_of "$GD_RS" | awk '/^type rtGitDeploysDeployBody struct/,/^}/' \
+  | grep -oE '^[[:space:]]+[A-Z][A-Za-z]+[[:space:]]' | tr -d ' \t')
+CFG_BODY=$(code_of "$GD_RS" | awk '/^func rtGitDeploysConfigDeployBody\(/,/^}/')
+NFIELDS=$(printf '%s\n' "$DB_FIELDS" | grep -c . || true)
+MISSING=""
+for fld in $DB_FIELDS; do
+  [ "$(grep -cE "^[[:space:]]+$fld:" <<<"$CFG_BODY")" -gt 0 ] || MISSING="$MISSING $fld"
+done
+if [ "$NFIELDS" -lt 10 ]; then
+  bad "discovered only $NFIELDS rtGitDeploysDeployBody fields — the discovery is broken, not the code (#100)"
+elif [ -z "$MISSING" ]; then
+  ok "rtGitDeploysConfigDeployBody names all $NFIELDS DeployBody fields — none zeroes silently"
+else
+  bad "rtGitDeploysConfigDeployBody omits:$MISSING — in Go an omitted field zeroes silently, which is how auto-rollback lost env and limits"
 fi
 
 echo
 echo "§4 the environment reaching the agent is a map of strings (#94's aftermath)"
 
-if hasre "$GD_RS" 'fn env_object'; then
-  ok "env_vars is coerced before it is sent"
-else
-  bad "no env_object coercion — a non-string value in the env_vars JSONB now fails the WHOLE deploy at the agent's HashMap<String, String>"
-fi
-
-if hasre "$GD_RS" '"env": env_object\(' ; then
-  ok "the deploy body's env comes from the coercion, not from the raw column"
-else
-  bad "build_deploy_body passes env_vars through without coercion"
-fi
+# §4 env_object-exists retired: covered by TestRtGitDeploysEnvScalarsAreStringifiedRatherThanFailingTheDeploy (panel/go/internal/api/rt_git_deploys_test.go)
+# §4 env-from-coercion retired: covered by TestRtGitDeploysDeployBodySendsTheKeyTheAgentReads (panel/go/internal/api/rt_git_deploys_test.go)
 
 echo
 echo "§5 the destination the agent is given has been decrypted (#93, the silent half)"
@@ -216,36 +241,42 @@ echo "§5 the destination the agent is given has been decrypted (#93, the silent
 # Discovery: every site that posts a destination to the agent, versus the one
 # helper that decrypts. These must be the same set.
 DECRYPT_CALLERS=$(
-  { countre "$BD_RS"    'agent_destination_payload\('
-    countre "$BSCHED_RS" 'agent_destination_payload\('
-    countre "$BPOL_RS"   'agent_destination_payload\('
-  } | paste -sd+ | bc
+  # Shell arithmetic, not `| paste -sd+ | bc`: the Rust-era suite piped to bc,
+  # which the CI/container image does not ship, so the sum came out empty and
+  # this arm failed on a correct tree.
+  echo $(( $(countre "$BD_RS"    'rtBackupDestinationsAgentDestinationPayload\(') \
+         + $(countre "$BSCHED_RS" 'rtBackupDestinationsAgentDestinationPayload\(') \
+         + $(countre "$BPOL_RS"   'rtBackupDestinationsAgentDestinationPayload\(') ))
 )
 
 if [ "$DECRYPT_CALLERS" -ge 3 ]; then
-  ok "$DECRYPT_CALLERS call sites route through agent_destination_payload"
+  ok "$DECRYPT_CALLERS call sites route through rtBackupDestinationsAgentDestinationPayload"
 else
-  bad "only $DECRYPT_CALLERS uses of agent_destination_payload — the scheduler and the policy executor must both go through it, or they post ciphertext as the credential while Test Connection reports success"
+  bad "only $DECRYPT_CALLERS uses of rtBackupDestinationsAgentDestinationPayload — the scheduler and the policy executor must both go through it, or they post ciphertext as the credential while Test Connection reports success"
 fi
 
 for f in "$BSCHED_RS" "$BPOL_RS"; do
-  if hasre "$f" 'insert\("type"\.to_string\(\)'; then
+  if hasre "$f" '\["type"\][[:space:]]*='; then
     bad "$(basename "$f") folds \"type\" into a destination payload by hand — that is the hand-rolled path that skipped the decrypt"
   else
     ok "$(basename "$f") does not hand-roll a destination payload"
   fi
 done
 
-if hasre "$BD_RS" 'pub fn agent_destination_payload' && hasre "$BD_RS" 'decrypt_config_secrets\(config\)'; then
+if [ "$(code_of "$BD_RS" | awk '/^func rtBackupDestinationsAgentDestinationPayload\(/,/^}/' | grep -cF 'rtBackupDestinationsDecryptConfigSecrets(config)')" -gt 0 ]; then
   ok "the shared helper is the thing that decrypts"
 else
-  bad "agent_destination_payload is missing or no longer decrypts"
+  bad "rtBackupDestinationsAgentDestinationPayload is missing or no longer decrypts"
 fi
 
 echo
 echo "§6 a destination can be attached to a per-site schedule (#93, the 403)"
 
-if hasre "$BSCHEDR_RS" 'JOIN backup_destinations|bd JOIN servers'; then
+# Positive anchor first, then: any JOIN onto servers/backup_destinations that is
+# not a LEFT JOIN.
+if ! hasre "$BSCHEDR_RS" 'FROM backup_destinations bd'; then
+  bad "rt_backup_schedules.go no longer selects from backup_destinations — the absence check below would see nothing"
+elif [ "$(code_of "$BSCHEDR_RS" | grep -E 'JOIN (servers|backup_destinations)' | grep -cvE 'LEFT JOIN (servers|backup_destinations)' || true)" -gt 0 ]; then
   bad "the destination check still INNER JOINs servers on bd.server_id — that column is NULL on every destination the panel creates, so this answers 403 for all of them"
 else
   ok "the destination check no longer inner-joins on a column that is always NULL"
@@ -257,8 +288,9 @@ fi
 # owner was granted a choice nothing could show them. The arm follows the code
 # (lesson #150) and keeps asking the same question of it; that the writer still
 # REACHES the constant is asserted next door, in client-surface-gating.
-DEST_RS=panel/backend/src/routes/backup_destinations.rs
-if hasre "$DEST_RS" 'DESTINATION_CALLER_PREDICATE.*bd\.server_id IS NULL'; then
+DEST_RS=$BD_RS
+if hasre "$DEST_RS" 'rtBackupDestinationsDestinationCallerPredicate = .*bd\.server_id IS NULL' \
+   && hasre "$BSCHEDR_RS" 'rtBackupDestinationsDestinationCallerPredicate'; then
   ok "an unscoped (shared) destination is accepted"
 else
   bad "the check does not accept a NULL server_id — destinations created through the API have no server"
@@ -314,7 +346,7 @@ done
 echo
 echo "§9 the deep link the guidance layer already used actually lands (#93)"
 
-PREREQ_RS=panel/backend/src/services/prerequisites/backups.rs
+PREREQ_RS=$API/svc_prerequisites_backups.go
 if hasre "$PREREQ_RS" 'backup-orchestrator\?tab=destinations'; then
   ok "the prerequisite remediation links to the destinations tab"
 else
@@ -351,12 +383,19 @@ echo "§10 a vault read derives its key — the raw JWT secret is not the vault 
 # `get_encryption_key` and handing it to the low-level `decrypt` is exactly what
 # made adding `SECRETS_ENCRYPTION_KEY` strand every vault secret on an install
 # that already held data — so writers must still derive, and readers must not.
-VAULT_CALL='secrets_crypto::(encrypt|decrypt)\('
-VAULT_SURFACE='secrets_crypto::(encrypt|decrypt|decrypt_vault)\('
+#
+# Go names (flat api package, no module qualifier): encrypt/decrypt/decrypt_vault
+# → SecretsCryptoEncrypt / SecretsCryptoDecrypt / SecretsCryptoDecryptVault;
+# get_encryption_key → rtSecretsGetEncryptionKey, a wrapper around
+# SecretsCryptoVaultKeyPrimary (either counts as deriving). `func` definition
+# lines are not calls and are dropped before matching.
+VAULT_CALL='SecretsCrypto(Encrypt|Decrypt)\('
+VAULT_SURFACE='SecretsCrypto(Encrypt|Decrypt|DecryptVault)\('
+calls_of() { code_of "$1" | grep -vE '^func ' | grep -cE -- "$2" || true; }
 VAULT_FILES=()
 while IFS= read -r f; do
   [ -n "$f" ] && VAULT_FILES+=("$f")
-done < <(grep -rlE "$VAULT_SURFACE" panel/backend/src --include=*.rs 2>/dev/null | sort)
+done < <(grep -rlE "$VAULT_SURFACE" "$API" --include='*.go' 2>/dev/null | grep -v '_test\.go$' | sort)
 
 if [ "${#VAULT_FILES[@]}" -lt 3 ]; then
   bad "enumerated only ${#VAULT_FILES[@]} files on the vault surface — implausible, so every arm below would pass having examined nothing"
@@ -364,9 +403,9 @@ else
   ok "enumerated ${#VAULT_FILES[@]} files on the vault surface"
 
   for f in "${VAULT_FILES[@]}"; do
-    writes=$(countre "$f" 'secrets_crypto::encrypt\(')
+    writes=$(calls_of "$f" 'SecretsCryptoEncrypt\(')
     if [ "$writes" -gt 0 ]; then
-      if [ "$(countre "$f" 'get_encryption_key')" -gt 0 ]; then
+      if [ "$(countre "$f" 'rtSecretsGetEncryptionKey\(|SecretsCryptoVaultKeyPrimary\(')" -gt 0 ]; then
         ok "$(basename "$f") derives the vault key before writing"
       else
         bad "$(basename "$f") writes with the vault cipher without ever deriving the key — its values are unreadable by every other caller"
@@ -380,11 +419,11 @@ else
   # module itself, nothing may call the SINGLE-SOURCE `decrypt`. That call
   # cannot see a value written under a different key source, which is the
   # one-way door this section now exists to keep shut.
-  SINGLE_SOURCE_READ='secrets_crypto::decrypt\('
+  SINGLE_SOURCE_READ='SecretsCryptoDecrypt\('
   SS_HITS=0
   for f in "${VAULT_FILES[@]}"; do
-    case "$f" in *services/secrets_crypto.rs) continue ;; esac
-    n=$(countre "$f" "$SINGLE_SOURCE_READ")
+    case "$f" in */svc_secrets_crypto.go) continue ;; esac
+    n=$(calls_of "$f" "$SINGLE_SOURCE_READ")
     if [ "$n" -gt 0 ]; then
       SS_HITS=$((SS_HITS + n))
       bad "$(basename "$f") reads the vault with the single-source cipher — a value written under any other key source is invisible to it"
@@ -395,7 +434,7 @@ else
   # grep never ran" are the same output (lesson #480).
   MS_HITS=0
   for f in "${VAULT_FILES[@]}"; do
-    MS_HITS=$((MS_HITS + $(countre "$f" 'secrets_crypto::decrypt_vault\(')))
+    MS_HITS=$((MS_HITS + $(calls_of "$f" 'SecretsCryptoDecryptVault\(')))
   done
   if [ "$MS_HITS" -lt 1 ]; then
     bad "control failed: found 0 multi-source vault reads, so the absence arm above proves nothing"
@@ -411,10 +450,10 @@ fi
 # enumeration above: the vault cipher may never be handed a JWT secret. This is
 # the arm that would have been red for the four and a half months the feature
 # was advertised and inert.
-JWT_AS_VAULT_KEY='secrets_crypto::(encrypt|decrypt)\([^;]*,[[:space:]]*&?[A-Za-z_.]*jwt_secret'
+JWT_AS_VAULT_KEY='SecretsCrypto(Encrypt|Decrypt)\([^)]*,[[:space:]]*\*?[A-Za-z_.]*(jwt_?[sS]ecret|JWTSecret)\)'
 JWT_KEYED=0
-for f in $(grep -rlE "$VAULT_CALL" panel/backend/src --include=*.rs 2>/dev/null); do
-  n=$(countre "$f" "$JWT_AS_VAULT_KEY")
+for f in $(grep -rlE "$VAULT_CALL" "$API" --include='*.go' 2>/dev/null | grep -v '_test\.go$'); do
+  n=$(calls_of "$f" "$JWT_AS_VAULT_KEY")
   if [ "$n" -gt 0 ]; then
     JWT_KEYED=$((JWT_KEYED + n))
     bad "$(basename "$f") unlocks the vault with the JWT secret instead of the derived key"
@@ -428,8 +467,8 @@ fi
 # question: the manual Inject button runs the same query against the same rows
 # and PUTs the same body to the same agent route. If it ever stops doing so, the
 # arm above loses the reference implementation it is measured against.
-SECRETS_RS=panel/backend/src/routes/secrets.rs
-DEPLOY_RS=panel/backend/src/routes/deploy.rs
+SECRETS_RS=$API/rt_secrets.go
+DEPLOY_RS=$API/rt_deploy.go
 for f in "$SECRETS_RS" "$DEPLOY_RS"; do
   [ -f "$f" ] || { bad "missing file: $f"; continue; }
   assert_readable "$f" || continue
@@ -441,15 +480,15 @@ for f in "$SECRETS_RS" "$DEPLOY_RS"; do
 done
 
 # A skipped secret must be sayable, and the arm has to be keyed on THIS path's
-# own diagnostics: `deploy.rs` is a large file with warnings all over it, so an
+# own diagnostics: `rt_deploy.go` is a large file with warnings all over it, so an
 # arm asking only whether the file can warn at all is green on the broken tree
 # too — it would have passed for the whole time the feature was dead. The
 # `Auto-inject:` prefix belongs to this block alone; the success line reads
 # `Auto-injected`, so it cannot satisfy this on its own.
 if [ "$(countf "$DEPLOY_RS" '"Auto-inject: ')" -gt 0 ]; then
-  ok "deploy.rs reports the secrets it could not decrypt"
+  ok "rt_deploy.go reports the secrets it could not decrypt"
 else
-  bad "deploy.rs swallows decrypt failures again — an inert auto-inject looks exactly like an empty vault"
+  bad "rt_deploy.go swallows decrypt failures again — an inert auto-inject looks exactly like an empty vault"
 fi
 
 echo

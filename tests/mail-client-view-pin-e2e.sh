@@ -49,7 +49,7 @@ bad() { FAIL=$((FAIL + 1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
 NAV="$REPO/panel/frontend/src/data/navItems.ts"
 PAGE="$REPO/panel/frontend/src/pages/Mail.tsx"
-BACK="$REPO/panel/backend/src/routes/mail.rs"
+BACK="$REPO/panel/go/internal/api/rt_mail.go"
 
 for f in "$NAV" "$PAGE" "$BACK"; do
   [ -f "$f" ] || { echo "FATAL: missing subject $f"; exit 1; }
@@ -284,12 +284,27 @@ fi
 # copies of one rule drift unless something reads both.
 echo "§E cross-tree"
 
+# The extractor a Go handler applies: its FIRST auth call, followed through the
+# module's passthrough wrappers (rtMailAgentGet / rtMailAgentPostBody →
+# rtMailAdminScope → st.adminUser) so a wrapper that changed its own extractor
+# is seen here too. st.authUser is AuthUser, st.adminUser is AdminUser.
 extractor_of() {
-  perl -0777 -ne 'print $1 if /pub async fn '"$1"'\s*\((.*?)\)\s*->/s' <<< "$BACK_C"
+  local fn="$1" depth=0 call
+  while [ "$depth" -lt 4 ]; do
+    call=$(awk -v fn="$fn" 'index($0, "func " fn "(") == 1 {i=1; next} i && /^}/ {exit} i {print}' <<< "$BACK_C" \
+      | grep -oE 'st\.authUser\(|st\.adminUser\(|rtMail(AdminScope|AgentGet|AgentPostBody)\(' | head -1)
+    case "$call" in
+      'st.authUser(')  echo AuthUser; return ;;
+      'st.adminUser(') echo AdminUser; return ;;
+      '')              return ;;
+      *)               fn="${call%(}" ;;
+    esac
+    depth=$((depth + 1))
+  done
 }
 
-HOST_HANDLERS="mail_status mail_storage mailbox_backups rspamd_status webmail_status relay_status rate_limit_status tls_status get_queue mail_logs mailbox_backup blacklist_check dns_check create_domain delete_domain"
-OWNER_HANDLERS="list_domains domain_dns list_accounts create_account update_account delete_account list_aliases create_alias delete_alias"
+HOST_HANDLERS="rtMailMailStatus rtMailMailStorage rtMailMailboxBackups rtMailRspamdStatus rtMailWebmailStatus rtMailRelayStatus rtMailRateLimitStatus rtMailTlsStatus rtMailGetQueue rtMailMailLogs rtMailMailboxBackup rtMailBlacklistCheck rtMailDnsCheck rtMailCreateDomain rtMailDeleteDomain"
+OWNER_HANDLERS="rtMailListDomains rtMailDomainDns rtMailListAccounts rtMailCreateAccount rtMailUpdateAccount rtMailDeleteAccount rtMailListAliases rtMailCreateAlias rtMailDeleteAlias"
 
 WRONG=""
 for h in $HOST_HANDLERS; do
@@ -313,11 +328,11 @@ else
   bad "E2 the frontend leaves open handlers that are NOT AuthUser:$WRONG — the console promises what the API refuses"
 fi
 
-# Non-vacuity for §E: the extractor reader must actually be reading signatures.
+# Non-vacuity for §E: the extractor reader must actually be reading handlers.
 # If `extractor_of` returned empty for everything, E1 and E2 would both fail —
 # but a future edit could make it return something harmless for everything, and
 # then both would pass. This is the arm that notices.
-if has "$(extractor_of list_domains)" 'AuthUser' && ! has "$(extractor_of create_domain)" 'AuthUser'; then
+if has "$(extractor_of rtMailListDomains)" 'AuthUser' && has "$(extractor_of rtMailCreateDomain)" 'AdminUser'; then
   ok "E3 the extractor reader distinguishes AuthUser from AdminUser on two known handlers"
 else
   bad "E3 the extractor reader cannot tell the two extractors apart — E1 and E2 prove nothing"

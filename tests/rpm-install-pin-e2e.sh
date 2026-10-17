@@ -62,7 +62,7 @@ bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 # NEGATIVE arm (match ⇒ bad) silently green, which is the direction that ships.
 comment_marker_for() {
   case "$1" in
-    *.rs|*.mjs|*.js|*.ts|*.tsx)                echo '//' ;;
+    *.go|*.rs|*.mjs|*.js|*.ts|*.tsx)           echo '//' ;;
     *.json)                                    echo ''   ;;  # JSON has no comments
     *)                                         echo '#'  ;;  # .sh, .service, .conf, .toml
   esac
@@ -86,17 +86,24 @@ code_lines() {
     # double quotes — otherwise a URL inside a string literal would lose its
     # tail, and this tree has several. Backslash escapes are skipped so an
     # escaped quote does not flip the parity.
+    #
+    # Go adds raw strings: a backtick opens one that may run over many lines
+    # (the agent's shell scripts and unit templates live in them), and nothing
+    # inside it — `//`, `/*`, a quote — is syntax. `inraw` carries that state
+    # across lines so a URL or a `//` on a raw-string line is never cut.
     awk '
-      /^[[:space:]]*\/\*/ &&  /\*\/[[:space:]]*$/ { print ""; next }
-      /^[[:space:]]*\/\*/                         { inblk = 1; print ""; next }
+      !inraw && !inblk && /^[[:space:]]*\/\*/ &&  /\*\/[[:space:]]*$/ { print ""; next }
+      !inraw && !inblk && /^[[:space:]]*\/\*/                         { inblk = 1; print ""; next }
       inblk { if ($0 ~ /\*\/[[:space:]]*$/) inblk = 0; print ""; next }
-      /^[[:space:]]*\/\//                         { print ""; next }
+      !inraw && /^[[:space:]]*\/\//                         { print ""; next }
       {
         line = $0; out = line; n = length(line); q = 0; i = 1
         while (i <= n) {
           c = substr(line, i, 1)
+          if (inraw) { if (c == "`") inraw = 0; i++; continue }
           if (c == "\\") { i += 2; continue }
           if (c == "\"") { q = 1 - q; i++; continue }
+          if (q == 0 && c == "`") { inraw = 1; i++; continue }
           if (q == 0 && c == "/" && substr(line, i + 1, 1) == "/") { out = substr(line, 1, i - 1); break }
           i++
         }
@@ -134,10 +141,14 @@ code_lineno() { local f="$1"; shift; code_lines "$f" | grep -n "$@" 2>/dev/null 
 # filters those arms apply keep working unchanged. The name glob is a parameter
 # because the arms differ in scope, and narrowing one of them by accident is
 # exactly the silent failure this whole retrofit is about.
+# Go keeps its tests in *_test.go files, which must SPELL the forbidden things
+# to assert their absence (safecmd_test.go names the forbidden flag), so the
+# tree scan is production-only — the role code_prod's test-module cut played
+# for the Rust tree.
 code_grep_tree() {
   local root="$1" glob="$2"; shift 2
   local f
-  find "$root" -type f -name "$glob" -print0 2>/dev/null | while IFS= read -r -d '' f; do
+  find "$root" -type f -name "$glob" ! -name '*_test.go' -print0 2>/dev/null | while IFS= read -r -d '' f; do
     code_lines "$f" | grep -n "$@" 2>/dev/null | sed "s#^#${f}:#" || true
   done
 }
@@ -155,7 +166,11 @@ code_grep_tree() {
 # whole pipeline, and an `if` around it reads a clean match as a failure. It
 # does not fire deterministically either — a subject small enough to fit the
 # pipe buffer gets away with it, so the arm that breaks is chosen by file size.
-code_prod() { code_lines "$1" | awk 'fin { next } { print } /#\[cfg\(test\)\]/ { fin = 1 }'; }
+#
+# Go: production and tests live in different files, so there is no in-file test
+# module to cut and code_prod is code_lines. Kept as a name so the arms that
+# mean "production code only" still say so.
+code_prod() { code_lines "$1"; }
 
 # Extract a top-level Rust fn body: from its signature to the closing brace in
 # column 0. Used below so assertions are about CALL SITES rather than about a
@@ -168,18 +183,21 @@ code_prod() { code_lines "$1" | awk 'fin { next } { print } /#\[cfg\(test\)\]/ {
 # spelled out on code_prod: three arms here pipe this function straight into a
 # grep whose status decides the arm, and an early exit made all three report the
 # symbol missing from bodies that plainly contain it.
-fn_body() { code_lines "$1" | awk -v pat="fn $2(" 'fin { next } index($0, pat) { inside=1 } inside { print; if ($0 == "}") fin = 1 }'; }
+# Go: a top-level `func NAME(` (index 1, so a call site cannot open a body).
+fn_body() { code_lines "$1" | awk -v pat="func $2(" 'fin { next } index($0, pat) == 1 { inside=1 } inside { print; if ($0 == "}") fin = 1 }'; }
 
-UNIT=panel/agent/dockpanel-agent.service
+# Go port: the shipped agent is panel/go (internal/agent); its unit file is
+# go:embed'ed from services/.
+UNIT=panel/go/internal/agent/services/dockpanel-agent.service
 SETUP=scripts/setup.sh
 UPDATE=scripts/update.sh
-AGENT_SRC=panel/agent/src
-SI=panel/agent/src/routes/service_installer.rs
-PKG=panel/agent/src/services/pkg.rs
-PHP=panel/agent/src/routes/php.rs
-SEC=panel/agent/src/services/security.rs
-DIAG=panel/agent/src/services/diagnostics.rs
-SAFE=panel/agent/src/safe_cmd.rs
+AGENT_SRC=panel/go/internal/agent
+SI=panel/go/internal/agent/routes/service_installer.go
+PKG=panel/go/internal/agent/services/pkg.go
+PHP=panel/go/internal/agent/routes/php.go
+SEC=panel/go/internal/agent/services/security.go
+DIAG=panel/go/internal/agent/services/diagnostics.go
+SAFE=panel/go/internal/agent/safecmd/safecmd.go
 
 for f in "$UNIT" "$SETUP" "$UPDATE" "$SI" "$PKG" "$PHP" "$SEC" "$DIAG" "$SAFE"; do
   [ -f "$f" ] || { echo "missing file: $f"; exit 1; }
@@ -193,9 +211,12 @@ done
 # away from it.
 NEG_APT_RE='^ReadWritePaths=.* /etc/apt( |$)'
 NEG_SEDRANGE_RE="sed -i '/\^?\[\[:space:\]\]\*server \{/,/"
-NEG_UFW_FX='safe_command("ufw")'
-NEG_DPKG_FX='safe_command("dpkg")'
-NEG_APTONLY_FX='apt_only_reason'
+# Go: every exec wrapper takes the binary as a plain string argument
+# (safecmd.Exec(ctx, "ufw", …), serviceInstallerRun(t, "ufw", …), …), so the
+# binary is matched as an argument rather than as one wrapper's spelling.
+NEG_UFW_RE='"ufw",[^)]*"allow"'
+NEG_DPKG_RE='[(, ]"dpkg"[,)]'
+NEG_APTONLY_RE='apt_only_reason|[Aa]ptOnlyReason'
 NEG_REDIS_RE='"(enable|start)", *"redis-server"'
 NEG_DEBNODE_FX='deb.nodesource.com'
 NEG_PIPE_FX='--pipe'
@@ -203,10 +224,14 @@ NEG_PIPE_FX='--pipe'
 # The two tree-wide scans, as functions, so §11 can point them at a fixture tree
 # holding the genuine defect instead of re-typing the pipeline.
 scan_ufw_allow() {
-  code_grep_tree "$1" '*.rs' -F -e "$NEG_UFW_FX" \
-    | grep -vE 'services/firewall\.rs' \
-    | grep -vE 'routes/service_installer\.rs' \
-    | grep -E '"allow"' || true
+  code_grep_tree "$1" '*.go' -E -e "$NEG_UFW_RE" \
+    | grep -vE 'services/firewall\.go' \
+    | grep -vE 'routes/service_installer\.go' || true
+}
+# services/pkg.go IS the package abstraction (its dpkg probe is the Debian half
+# of PkgIsInstalled), so it is the one file allowed to name dpkg.
+scan_dpkg() {
+  code_grep_tree "$1" '*.go' -E -e "$NEG_DPKG_RE" | grep -vE 'services/pkg\.go:' || true
 }
 scan_stray_pipe() {
   # `grep -r -- PATTERN dir --include=…` silently treats the include as a FILE
@@ -369,22 +394,22 @@ offenders=$(scan_ufw_allow "$AGENT_SRC")
 if [ -n "$offenders" ]; then
   bad "code opens a port through ufw directly:
 $offenders
-    → use services::firewall::allow_tcp, which dispatches on the running firewall AND returns whether it worked"
+    → use services.FirewallAllowTcp, which dispatches on the running firewall AND returns whether it worked"
 else
-  ok "port-opening goes through services/firewall.rs on every path"
+  ok "port-opening goes through services/firewall.go on every path"
 fi
 
 # Firewall STATUS must branch on the detected firewall rather than assuming ufw.
-if has_code "$SEC" -F -e 'firewalld_status' && has_code "$SEC" -F -e 'firewall::detect'; then
+if has_code "$SEC" -F -e 'securityFirewalldStatus()' && has_code "$SEC" -F -e 'FirewallDetect() == FirewallFirewalld'; then
   ok "the Security page dispatches on the running firewall instead of calling a firewalld box unfirewalled"
 else
-  bad "security.rs no longer dispatches on the detected firewall — on the RHEL family the Security overview reports 'no firewall' for a box that is firewalled"
+  bad "security.go no longer dispatches on the detected firewall — on the RHEL family the Security overview reports 'no firewall' for a box that is firewalled"
 fi
 
-if has_code "$DIAG" -F -e 'firewall::detect'; then
+if has_code "$DIAG" -F -e 'FirewallDetect()'; then
   ok "diagnostics raises 'no firewall' from the real firewall state, not from ufw's absence"
 else
-  bad "diagnostics.rs is back to asking ufw — it will warn 'Firewall (ufw) is not active' on every firewalld box and name a tool the operator does not have"
+  bad "diagnostics.go is back to asking ufw — it will warn 'Firewall (ufw) is not active' on every firewalld box and name a tool the operator does not have"
 fi
 
 echo
@@ -394,13 +419,16 @@ echo "── 5. Package queries work on both package databases ──"
 # false for EVERY package: the Services page reported PHP and Fail2Ban as not
 # installed while both were installed and running. There were four separate
 # hand-rolled copies of it, which is how it stayed wrong in all of them.
-if [ -n "$(code_grep_tree "$AGENT_SRC" '*.rs' -F -e "$NEG_DPKG_FX")" ]; then
-  bad "an agent file calls dpkg directly — there is no dpkg on the RHEL family, so that query answers false for every package. Use services::pkg::is_installed"
+PKG_DPKG=$(code_count "$PKG" -E -e "$NEG_DPKG_RE")
+[ "$PKG_DPKG" -gt 0 ] || bad "CONTROL: services/pkg.go no longer names dpkg at all — the dpkg pattern may not match Go's call shape, so the absence arm below is vacuous"
+if [ -n "$(scan_dpkg "$AGENT_SRC")" ]; then
+  bad "an agent file calls dpkg directly — there is no dpkg on the RHEL family, so that query answers false for every package. Use services.PkgIsInstalled:
+$(scan_dpkg "$AGENT_SRC")"
 else
   ok "no direct dpkg calls in the agent — package presence goes through services::pkg"
 fi
 
-if has_code "$PKG" -F -e 'PkgMgr::Rpm'; then
+if has_code "$PKG" -F -e 'PkgMgrRpm'; then
   ok "services::pkg dispatches on the box's real package database"
 else
   bad "services::pkg no longer handles rpm — every package query is Debian-only again"
@@ -441,7 +469,7 @@ echo "── 7. The refusals that remain are TRUE, and the one that must remain 
 #
 # Scope is every file under the agent tree, not only Rust, because that is what
 # the original of this scan covered and narrowing it would fail in silence.
-if [ -n "$(code_grep_tree "$AGENT_SRC" '*' -F -e "$NEG_APTONLY_FX")" ]; then
+if [ -n "$(code_grep_tree "$AGENT_SRC" '*' -E -e "$NEG_APTONLY_RE")" ]; then
   bad "apt_only_reason still has callers — s266 replaced it, so any survivor is a handler refusing for a reason that is no longer true"
 else
   ok "the blanket apt-only refusal is gone everywhere, not just where it was convenient"
@@ -456,16 +484,16 @@ fi
 #
 # s338: commenting out the three lines that make this decision used to leave the
 # arm green. fn_body strips first now, so a disabled call is not a call.
-UFW_BODY=$(fn_body "$SI" install_ufw)
-if printf '%s' "$UFW_BODY" | grep -c 'ufw_refusal_reason' >/dev/null; then
+UFW_BODY=$(fn_body "$SI" serviceInstallerInstallUfw)
+if printf '%s' "$UFW_BODY" | grep -c 'services.PkgUfwRefusalReason()' >/dev/null; then
   ok "install_ufw still asks whether UFW is the right firewall for this box"
 else
   bad "install_ufw no longer calls ufw_refusal_reason — on the RHEL family this reinstates the s265 two-firewalls outage, with the panel unreachable and no certificate"
 fi
 
 # Positional: the refusal must come BEFORE the install, or it refuses nothing.
-refuse_ln=$(printf '%s\n' "$UFW_BODY" | grep -n 'ufw_refusal_reason' | head -1 | cut -d: -f1)
-inst_ln=$(printf '%s\n'  "$UFW_BODY" | grep -n 'pkg::install'        | head -1 | cut -d: -f1)
+refuse_ln=$(printf '%s\n' "$UFW_BODY" | grep -n 'PkgUfwRefusalReason' | head -1 | cut -d: -f1)
+inst_ln=$(printf '%s\n'  "$UFW_BODY" | grep -n 'services.PkgInstall('  | head -1 | cut -d: -f1)
 if [ -n "$refuse_ln" ] && [ -n "$inst_ln" ] && [ "$refuse_ln" -lt "$inst_ln" ]; then
   ok "install_ufw refuses before it installs, not after"
 elif [ -z "$inst_ln" ]; then
@@ -475,7 +503,7 @@ else
 fi
 
 # The refusal must be driven by what is RUNNING, not by the package database.
-if fn_body "$PKG" ufw_refusal_reason | grep -c 'firewall::detect' >/dev/null; then
+if fn_body "$PKG" PkgUfwRefusalReason | grep -c 'FirewallDetect()' >/dev/null; then
   ok "the UFW refusal is decided by the firewall actually running, not by the distro name"
 else
   bad "ufw_refusal_reason no longer consults firewall::detect — it is guessing from the package manager instead of from what holds the rules"
@@ -487,8 +515,8 @@ echo "── 8. Package operations dispatch on the real manager ──"
 # Every optional-service installer must go through the abstraction. Counting
 # guarded-vs-total positionally means adding a NEW installer that shells apt
 # directly fails this, rather than the pin passing because the others are fine.
-INSTALLERS='install_php install_certbot install_fail2ban install_powerdns install_redis install_nodejs install_waf install_cloudflared'
-PKGROUTE_RE='pkg::(install|install_available|add_repo)'
+INSTALLERS='serviceInstallerInstallPhp serviceInstallerInstallCertbot serviceInstallerInstallFail2ban serviceInstallerInstallPowerdns serviceInstallerInstallRedis serviceInstallerInstallNodejs serviceInstallerInstallWaf serviceInstallerInstallCloudflared'
+PKGROUTE_RE='services\.Pkg(Install|InstallAvailable|AddRepo)\('
 total=0 routed=0 unrouted=''
 for f in $INSTALLERS; do
   total=$((total+1))
@@ -509,9 +537,9 @@ fi
 # to the non-modular base package — PHP 8.0.30 on Rocky 9, older than every
 # stream the box offers and end-of-life since 2023 — while the Services page
 # reports PHP installed and running. The stream must be selected FIRST.
-PHP_BODY=$(fn_body "$SI" install_php)
-stream_ln=$(printf '%s\n' "$PHP_BODY" | grep -n 'enable_php_stream' | head -1 | cut -d: -f1)
-pinst_ln=$(printf '%s\n'  "$PHP_BODY" | grep -n 'pkg::install'      | head -1 | cut -d: -f1)
+PHP_BODY=$(fn_body "$SI" serviceInstallerInstallPhp)
+stream_ln=$(printf '%s\n' "$PHP_BODY" | grep -n 'PkgEnablePhpStream' | head -1 | cut -d: -f1)
+pinst_ln=$(printf '%s\n'  "$PHP_BODY" | grep -n 'services.PkgInstall(' | head -1 | cut -d: -f1)
 if [ -n "$stream_ln" ] && [ -n "$pinst_ln" ] && [ "$stream_ln" -lt "$pinst_ln" ]; then
   ok "install_php selects the PHP module stream before installing, not after"
 else
@@ -521,8 +549,8 @@ fi
 # A package name and a systemd unit name are different strings that merely
 # coincide on Debian. Translating one and not the other installs the right
 # package and then enables a unit that is not there.
-REDIS_BODY=$(fn_body "$SI" install_redis)
-if printf '%s' "$REDIS_BODY" | grep -c 'service_name' >/dev/null && \
+REDIS_BODY=$(fn_body "$SI" serviceInstallerInstallRedis)
+if printf '%s' "$REDIS_BODY" | grep -c 'services.PkgServiceName(' >/dev/null && \
    ! printf '%s' "$REDIS_BODY" | grep -cE "$NEG_REDIS_RE" >/dev/null; then
   ok "install_redis enables the translated unit name, not the hardcoded Debian one"
 else
@@ -531,24 +559,28 @@ fi
 
 # php.rs was the surface s265's refusal layer never reached: no family guard at
 # all, so every handler failed with a raw "Failed to find executable apt-get".
-if fn_body "$PHP" install_version | grep -c 'php_streams' >/dev/null; then
-  ok "php.rs install_version branches on the package family before reaching apt machinery"
+if fn_body "$PHP" phpInstallVersion | grep -c 'services.PkgPhpStreams()' >/dev/null; then
+  ok "php.go phpInstallVersion branches on the package family before reaching apt machinery"
 else
-  bad "php.rs install_version has no family guard — on the RHEL family it falls through to apt-cache/ppa:ondrej and fails with 'Failed to find executable apt-get'"
+  bad "php.go phpInstallVersion has no family guard — on the RHEL family it falls through to apt-cache/ppa:ondrej and fails with 'Failed to find executable apt-get'"
 fi
 
 # The PHP page must not report every offered version as installed just because
 # the RPM family collapses them onto one package.
-if has_code "$PHP" -F -e 'installed_php_version'; then
-  ok "php.rs distinguishes PHP versions on a family that ships only one package"
+if has_code "$PHP" -F -e 'services.PkgInstalledPhpVersion()'; then
+  ok "php.go distinguishes PHP versions on a family that ships only one package"
 else
-  bad "php.rs asks the collapsed package query per version — on the RHEL family that reports ALL offered versions as installed"
+  bad "php.go asks the collapsed package query per version — on the RHEL family that reports ALL offered versions as installed"
 fi
 
 # A missing file that SKIPS is worse than one that fails: the PowerDNS schema
 # path is distro-specific, and both old branches were [ -f ]-guarded, so a miss
 # left an empty database behind a successful install.
-if fn_body "$SI" install_powerdns | grep -c 'schema not found' >/dev/null; then
+# Go: the SQLite schema load is the serviceInstallerSqliteSetup script const,
+# so the arm requires both the loud failure in the script AND that the
+# installer actually runs that script.
+if code_lines "$SI" | grep -c "echo 'PowerDNS SQLite schema not found in any known location' >&2; exit 1" >/dev/null && \
+   fn_body "$SI" serviceInstallerInstallPowerdns | grep -c 'serviceInstallerSqliteSetup' >/dev/null; then
   ok "the PowerDNS SQLite schema load fails loudly when no known schema path matches"
 else
   bad "the PowerDNS schema load can silently skip — the install reports success, pdns starts, and the DNS server answers nothing"
@@ -568,11 +600,13 @@ fi
 # ("a" | "b" | "c" => {\n "target"\n }), which a line-oriented match cannot see.
 # The hand-rolled comment filter this line used to carry is gone: fn_body now
 # blanks comments for every subject, so it was a second, weaker copy.
-MAPS=$( { fn_body "$PKG" rpm_name; fn_body "$PKG" php_rpm_name; } | tr '\n' ' ')
+# Go spells a map arm `case "a", "b": return "target"`, so the arrow is
+# `"from"` … `return "to"` with no other `case` in between.
+MAPS=$( { fn_body "$PKG" pkgRpmName; fn_body "$PKG" pkgPhpRpmName; } | tr '\n' ' ')
 map_missing=''
 while IFS='|' read -r from to; do
   [ -z "$from" ] && continue
-  printf '%s' "$MAPS" | grep -cE "\"$from\"[^=]*=>[^,]*\"$to\"" >/dev/null || map_missing="$map_missing $from"
+  printf '%s' "$MAPS" | grep -cE "\"$from\"[^:]*:[[:space:]]*return \"$to\"" >/dev/null || map_missing="$map_missing $from"
 done <<'ARROWS'
 pdns-backend-pgsql|pdns-backend-postgresql
 pdns-backend-sqlite3|pdns-backend-sqlite
@@ -588,7 +622,7 @@ fi
 
 # NodeSource and Cloudflare both publish per-family repos. The agent used to
 # fetch the deb script on every distro while setup.sh already branched.
-ADDREPO=$(fn_body "$PKG" add_repo)
+ADDREPO=$(fn_body "$PKG" PkgAddRepo)
 if printf '%s' "$ADDREPO" | grep -c 'rpm.nodesource.com' >/dev/null && \
    printf '%s' "$ADDREPO" | grep -c "$NEG_DEBNODE_FX" >/dev/null && \
    ! has_code "$SI" -F -e "$NEG_DEBNODE_FX"; then
@@ -608,7 +642,7 @@ echo "── 6. The privileged escape hatch must never pass file descriptors aga
 # operation on every RHEL box failed this way, for as long as the sandbox had
 # existed.
 #
-# These assertions read CODE ONLY. safe_cmd.rs discusses the forbidden flag at
+# These assertions read CODE ONLY. safecmd.go (Rust: safe_cmd.rs) discusses the forbidden flag at
 # length in its doc comments precisely because it must never use it again, so a
 # grep over the raw file would match the explanation and sit green through the
 # regression it names — the trap that let one of s266's own pins pass its
@@ -634,9 +668,9 @@ fi
 
 # /tmp is NOT usable: PID1 runs as init_t and writing a tmp_t file is denied on
 # the RHEL family. Measured, not assumed.
-CAPDIR=$(code_prod "$SAFE" | sed -n 's/^const CAPTURE_DIR: &str = "\([^"]*\)".*/\1/p')
+CAPDIR=$(code_prod "$SAFE" | sed -n 's/^const CaptureDir = "\([^"]*\)".*/\1/p')
 if [ -z "$CAPDIR" ]; then
-  bad "CAPTURE_DIR is gone from $SAFE, so this check cannot see where captured output lands"
+  bad "CaptureDir is gone from $SAFE, so this check cannot see where captured output lands"
 elif printf '%s' "$CAPDIR" | grep -cE '^/(tmp|var/tmp)(/|$)' >/dev/null; then
   bad "capture files live in $CAPDIR — PID1 (init_t) may not write tmp_t, so every unsandboxed command loses its output on RHEL"
 elif printf '%s' "$RWP" | tr ' ' '\n' | sed 's/^-//' | grep -cxF "$(printf '%s' "$CAPDIR" | sed 's#\(/var/lib/[^/]*\).*#\1#')" >/dev/null; then
@@ -646,14 +680,14 @@ else
 fi
 
 # The hatch is shared, but a call site could still hand-roll systemd-run.
-# Do NOT look for the flag on the same LINE as systemd-run: panel_update.rs
+# Do NOT look for the flag on the same LINE as systemd-run: panel_update.go
 # builds its invocation across several .arg() calls, so a per-line match cannot
 # see it and this assertion passed its own mutation test until it was rewritten.
 # The flag has no other legitimate use anywhere in the agent, so require it
 # absent from every code line outside the one file whose comments explain it.
 stray_pipe=$(scan_stray_pipe "$AGENT_SRC" "$SAFE")
 if [ -n "$stray_pipe" ]; then
-  bad "a file outside safe_cmd.rs names --pipe, which reaches the wall again through that path:${stray_pipe}"
+  bad "a file outside safecmd.go names --pipe, which reaches the wall again through that path:${stray_pipe}"
 else
   ok "no call site hand-rolls a descriptor-passing systemd-run"
 fi
@@ -676,16 +710,19 @@ run_the TOKENWORD --now
 echo "a literal hash # inside a string keeps TOKENSTR"
 FIX
 
-cat > "$FIXDIR/f.rs" <<'FIX'
+cat > "$FIXDIR/f.go" <<'FIX'
 // TOKENWORD in a line comment
 /*
  * TOKENWORD in a block comment
  */
-let live = call(TOKENWORD);
-let trail = other(); // TOKENWORD trailing
-let url = "https://example.invalid/TOKENURL";
-let glob = "COPY /app/target/release/*";
-let after_glob = keep(TOKENAFTER);
+live := call(TOKENWORD)
+trail := other() // TOKENWORD trailing
+url := "https://example.invalid/TOKENURL"
+glob := "COPY /app/target/release/*"
+afterGlob := keep(TOKENAFTER)
+script := `curl https://example.invalid/TOKENRAW1 &&
+// TOKENRAW2 is raw-string text, not a comment
+done`
 FIX
 
 printf '{ "name": "x", "note": "TOKENWORD" }\n' > "$FIXDIR/f.json"
@@ -702,25 +739,31 @@ else
   bad "shell: the stripper ate a '#' inside a string — a negative arm would now pass on broken code"
 fi
 
-if [ "$(code_count "$FIXDIR/f.rs" -F -e 'TOKENWORD')" -eq 1 ]; then
-  ok "rust: '//' line, '/* */' block and trailing '//' all blanked (1 code hit of 4)"
+if [ "$(code_count "$FIXDIR/f.go" -F -e 'TOKENWORD')" -eq 1 ]; then
+  ok "go: '//' line, '/* */' block and trailing '//' all blanked (1 code hit of 4)"
 else
-  bad "rust: expected exactly 1 code hit for TOKENWORD, got $(code_count "$FIXDIR/f.rs" -F -e 'TOKENWORD')"
+  bad "go: expected exactly 1 code hit for TOKENWORD, got $(code_count "$FIXDIR/f.go" -F -e 'TOKENWORD')"
 fi
 
-if [ "$(code_count "$FIXDIR/f.rs" -F -e 'TOKENURL')" -eq 1 ]; then
-  ok "rust: '//' inside a quoted string survives — a URL is not a comment"
+if [ "$(code_count "$FIXDIR/f.go" -F -e 'TOKENURL')" -eq 1 ]; then
+  ok "go: '//' inside a quoted string survives — a URL is not a comment"
 else
-  bad "rust: the stripper cut a line at the '//' of a URL inside a string literal"
+  bad "go: the stripper cut a line at the '//' of a URL inside a string literal"
 fi
 
 # s294: a `/*` inside a string literal opened a block comment that ran to the
 # next `*/` and deleted 485 lines of git_build.rs. The guard is that a block is
 # recognised only where one is WRITTEN — opening at line start.
-if [ "$(code_count "$FIXDIR/f.rs" -F -e 'TOKENAFTER')" -eq 1 ]; then
-  ok "rust: a '/*' inside a string literal does not open a block (the s294 guard holds)"
+if [ "$(code_count "$FIXDIR/f.go" -F -e 'TOKENAFTER')" -eq 1 ]; then
+  ok "go: a '/*' inside a string literal does not open a block (the s294 guard holds)"
 else
-  bad "rust: a string containing '/*' swallowed the code after it — the s294 stripper defect is back"
+  bad "go: a string containing '/*' swallowed the code after it — the s294 stripper defect is back"
+fi
+
+if [ "$(code_count "$FIXDIR/f.go" -F -e 'TOKENRAW1')" -eq 1 ] && [ "$(code_count "$FIXDIR/f.go" -F -e 'TOKENRAW2')" -eq 1 ]; then
+  ok "go: a raw string's '//' (mid-line and at line start) is string text, not a comment"
+else
+  bad "go: the stripper cut a raw (backtick) string — a negative arm over the agent's embedded scripts would pass on broken code"
 fi
 
 if [ "$(code_count "$FIXDIR/f.json" -F -e 'TOKENWORD')" -eq 1 ]; then
@@ -779,31 +822,32 @@ PINNED=(
   "$SETUP|-F|$SELINUX_FX"
   "$UPDATE|-F|$SELINUX_FX"
   "$UPDATE|-F|firewall-cmd"
-  "$SI|-E|fn install_ufw\("
-  "$SI|-F|ufw_refusal_reason"
-  "$SI|-F|pkg::install"
+  "$SI|-E|^func serviceInstallerInstallUfw\("
+  "$SI|-F|PkgUfwRefusalReason"
+  "$SI|-F|services.PkgInstall("
   "$SI|-E|$PKGROUTE_RE"
-  "$SI|-F|enable_php_stream"
-  "$SI|-F|service_name"
+  "$SI|-F|PkgEnablePhpStream"
+  "$SI|-F|services.PkgServiceName("
   "$SI|-F|schema not found"
-  "$PKG|-F|PkgMgr::Rpm"
-  "$PKG|-F|firewall::detect"
+  "$SI|-F|serviceInstallerSqliteSetup"
+  "$PKG|-F|PkgMgrRpm"
+  "$PKG|-F|FirewallDetect()"
   "$PKG|-F|rpm.nodesource.com"
   "$PKG|-F|$NEG_DEBNODE_FX"
-  "$PKG|-E|fn ufw_refusal_reason\("
-  "$PKG|-E|fn rpm_name\("
-  "$PKG|-E|fn php_rpm_name\("
-  "$PKG|-E|fn add_repo\("
-  "$PHP|-F|php_streams"
-  "$PHP|-F|installed_php_version"
-  "$PHP|-E|fn install_version\("
-  "$SEC|-F|firewalld_status"
-  "$SEC|-F|firewall::detect"
-  "$DIAG|-F|firewall::detect"
+  "$PKG|-E|^func PkgUfwRefusalReason\("
+  "$PKG|-E|^func pkgRpmName\("
+  "$PKG|-E|^func pkgPhpRpmName\("
+  "$PKG|-E|^func PkgAddRepo\("
+  "$PHP|-F|services.PkgPhpStreams()"
+  "$PHP|-F|services.PkgInstalledPhpVersion()"
+  "$PHP|-E|^func phpInstallVersion\("
+  "$SEC|-F|securityFirewalldStatus()"
+  "$SEC|-F|FirewallDetect() == FirewallFirewalld"
+  "$DIAG|-F|FirewallDetect()"
   "$SAFE|-F|--wait"
   "$SAFE|-F|StandardOutput=file:"
   "$SAFE|-F|StandardError=file:"
-  "$SAFE|-E|^const CAPTURE_DIR"
+  "$SAFE|-E|^const CaptureDir"
 )
 
 # Turn every CODE line matching the pattern into a comment, leaving the text.
@@ -814,6 +858,8 @@ PINNED=(
 # tidy: comment_marker_for dispatches on it, so a scratch file called `mutated`
 # is read as shell no matter what it holds — and every Rust subject would then
 # report the stripper broken when what was broken was the temp filename.
+# (Go's `//` marker is fine inside a raw string too: a commented-out line that
+# opened a raw string would desync, but no pinned pattern sits on such a line.)
 comment_out_matches() {
   local src="$1" dst="$2" mode="$3" pat="$4" marker
   marker=$(comment_marker_for "$src")
@@ -889,9 +935,9 @@ else
   bad "§2's sed-range arm no longer sees a real range edit — the stripper is eating shell code"
 fi
 
-cat > "$FIXDIR/tree/ports.rs" <<'FIX'
-pub async fn open_mail_ports() {
-    let _ = safe_command("ufw").arg("allow").arg("25/tcp").run().await;
+cat > "$FIXDIR/tree/ports.go" <<'FIX'
+func openMailPorts() {
+	_, _ = safecmd.Exec(ctx, "ufw", "allow", "25/tcp")
 }
 FIX
 if [ -n "$(scan_ufw_allow "$FIXDIR/tree")" ]; then
@@ -900,69 +946,71 @@ else
   bad "§4's direct-ufw arm no longer sees a real ufw allow — the tree scan is stripping code, not comments"
 fi
 
-cat > "$FIXDIR/tree/pkgquery.rs" <<'FIX'
-pub async fn is_installed(name: &str) -> bool {
-    safe_command("dpkg").arg("-l").arg(name).run().await.is_ok()
+cat > "$FIXDIR/tree/pkgquery.go" <<'FIX'
+func isInstalled(name string) bool {
+	out, err := safecmd.Exec(ctx, "dpkg", "-l", name)
+	return err == nil && out.Success()
 }
 FIX
-if [ -n "$(code_grep_tree "$FIXDIR/tree" '*.rs' -F -e "$NEG_DPKG_FX")" ]; then
+if [ -n "$(scan_dpkg "$FIXDIR/tree")" ]; then
   NEGFIRE=$((NEGFIRE+1)); ok "§5's direct-dpkg arm still fires when a real dpkg call is in code"
 else
   bad "§5's direct-dpkg arm no longer sees a real dpkg call — the tree scan is stripping code, not comments"
 fi
 
-cat > "$FIXDIR/tree/refusal.rs" <<'FIX'
-pub async fn install_thing() -> Result<(), String> {
-    if let Some(why) = pkg::apt_only_reason().await { return Err(why); }
-    Ok(())
+cat > "$FIXDIR/tree/refusal.go" <<'FIX'
+func installThing() error {
+	if why := services.PkgAptOnlyReason(); why != "" {
+		return errors.New(why)
+	}
+	return nil
 }
 FIX
-if [ -n "$(code_grep_tree "$FIXDIR/tree" '*' -F -e "$NEG_APTONLY_FX")" ]; then
+if [ -n "$(code_grep_tree "$FIXDIR/tree" '*' -E -e "$NEG_APTONLY_RE")" ]; then
   NEGFIRE=$((NEGFIRE+1)); ok "§7's stale-refusal arm still fires when a real caller survives"
 else
   bad "§7's stale-refusal arm no longer sees a real caller — the tree scan is stripping code, not comments"
 fi
 
-cat > "$FIXDIR/redis.rs" <<'FIX'
-pub async fn install_redis() -> Result<(), String> {
-    let unit = pkg::service_name("redis-server").await;
-    systemctl(&["enable", "redis-server"]).await;
-    Ok(())
+cat > "$FIXDIR/redis.go" <<'FIX'
+func serviceInstallerInstallRedis(w http.ResponseWriter, _ *http.Request) {
+	unit := services.PkgServiceName("redis-server")
+	serviceInstallerSystemctl(120*time.Second, "enable", "redis-server")
+	_ = unit
 }
 FIX
-if printf '%s' "$(fn_body "$FIXDIR/redis.rs" install_redis)" | grep -cE "$NEG_REDIS_RE" >/dev/null; then
+if printf '%s' "$(fn_body "$FIXDIR/redis.go" serviceInstallerInstallRedis)" | grep -cE "$NEG_REDIS_RE" >/dev/null; then
   NEGFIRE=$((NEGFIRE+1)); ok "§8's hardcoded-redis-unit arm still fires when the Debian unit name is really enabled"
 else
   bad "§8's hardcoded-redis-unit arm no longer sees a real hardcoded unit — fn_body is stripping code, not comments"
 fi
 
-cp "$SI" "$FIXDIR/si.rs"
-printf '\nconst NODE_SETUP: &str = "https://deb.nodesource.com/setup_22.x";\n' >> "$FIXDIR/si.rs"
-if has_code "$FIXDIR/si.rs" -F -e "$NEG_DEBNODE_FX"; then
+cp "$SI" "$FIXDIR/si.go"
+printf '\nconst nodeSetup = "https://deb.nodesource.com/setup_22.x"\n' >> "$FIXDIR/si.go"
+if has_code "$FIXDIR/si.go" -F -e "$NEG_DEBNODE_FX"; then
   NEGFIRE=$((NEGFIRE+1)); ok "§8's hardcoded-deb-repo arm still fires when an installer really names the deb script"
 else
   bad "§8's hardcoded-deb-repo arm no longer sees a real deb repo URL — the stripper cut a string literal"
 fi
 
-# The plant must land BEFORE the test module, because code_prod stops there.
-# Appending would put it out of scope and the silence would look like a working
-# stripper rather than a misplaced fixture.
-awk '/^#\[cfg\(test\)\]/ && !seen { print "    push(\"--pipe\".into());"; seen=1 } { print }' \
-    "$SAFE" > "$FIXDIR/safe.rs"
-if code_prod "$FIXDIR/safe.rs" | grep -cF -e "$NEG_PIPE_FX" >/dev/null; then
+# Rust had to plant BEFORE the in-file test module, because code_prod stopped
+# there. Go has no such module, so the plant is appended — and must still fire.
+cp "$SAFE" "$FIXDIR/safe.go"
+printf '\nfunc planted() []string { return []string{"--pipe"} }\n' >> "$FIXDIR/safe.go"
+if code_prod "$FIXDIR/safe.go" | grep -cF -e "$NEG_PIPE_FX" >/dev/null; then
   NEGFIRE=$((NEGFIRE+1)); ok "the WALL arm still fires when the forbidden flag is really in production code"
 else
   bad "the WALL arm no longer sees a real use of the forbidden flag — code_prod is cutting production code"
 fi
 
-cat > "$FIXDIR/tree/other.rs" <<'FIX'
-pub fn build() -> Command {
-    let mut c = Command::new("systemd-run");
-    c.arg("--pipe");
-    c
+cat > "$FIXDIR/tree/other.go" <<'FIX'
+func build(ctx context.Context) *exec.Cmd {
+	args := []string{"--wait"}
+	args = append(args, "--pipe")
+	return safecmd.Command(ctx, "systemd-run", args...)
 }
 FIX
-if [ -n "$(scan_stray_pipe "$FIXDIR/tree" "$FIXDIR/tree/none.rs")" ]; then
+if [ -n "$(scan_stray_pipe "$FIXDIR/tree" "$FIXDIR/tree/none.go")" ]; then
   NEGFIRE=$((NEGFIRE+1)); ok "the stray-flag arm still fires when another file really hand-rolls the invocation"
 else
   bad "the stray-flag arm no longer sees a real hand-rolled invocation — the tree scan is stripping code, not comments"

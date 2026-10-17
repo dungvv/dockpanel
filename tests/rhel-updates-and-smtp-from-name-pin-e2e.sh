@@ -46,7 +46,14 @@
 #     UnsandboxedCommand::output_with_timeout(), which also stops the named
 #     transient unit on timeout.
 #
-# Pure source analysis; no box, no network, no build.
+# Go subjects: panel/go/internal/agent/routes/updates.go (updatesList,
+# updatesCount, updatesApply, updatesRpmCheckUpdate, updatesParseRpmUpdateLine,
+# updatesRebootRequired), panel/go/internal/agent/services/smtp.go
+# (SmtpConfigure) and panel/go/internal/agent/routes/php.go
+# (phpInstallVersion, phpUninstallVersion; the Rust output_with_timeout is
+# safecmd's (*Unsandboxed).OutputWithTimeout).
+#
+# Pure source analysis, plus `go test -run` for the parser's unit tests (§2).
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -55,125 +62,118 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-# Strip comments and the test module. Only exits at a #[cfg(test)] line
-# immediately followed by `mod ` — a real test module, not a cfg-gated
-# function/const variant elsewhere in the file (project_dockpanel_lessons_p182).
-code() {
-  awk '
-    held == 1 {
-      if ($0 ~ /^mod /) { exit }
-      print heldline
-      held = 0
-    }
-    /^#\[cfg\(test\)\]$/ { held = 1; heldline = $0; next }
-    { print }
-  ' "$1" | grep -vE '^[[:space:]]*(///|//!|//|\*|/\*)'
-}
-has()   { [ -n "$(code "$1" | grep -F -- "$2")" ]; }
-hasre() { [ -n "$(code "$1" | grep -E -- "$2")" ]; }
-fnbody()    { code "$1" | awk "/$2/,/^}/"; }
+# Strip comments. Go: `/* … */` blocks and `//` at line start or after
+# whitespace (a `http://` inside a string literal survives). Go tests live in
+# _test.go files, so there is no in-file test module to cut.
+code()      { perl -0777 -pe 's{/\*.*?\*/}{}gs; s{(^|[ \t])//[^\n]*}{$1}gm' "$1"; }
+has()       { [ -n "$(code "$1" | grep -F -- "$2")" ]; }
+hasre()     { [ -n "$(code "$1" | grep -E -- "$2")" ]; }
+# Body of a top-level Go func: from `func NAME(` to the next top-level item.
+fnbody()    { code "$1" | FN="$2" perl -0777 -ne 'my $n=$ENV{FN}; print $1 if /(\nfunc \Q$n\E\(.*?)(?=\n(?:func |const |var |type )|\z)/s'; }
 bodyhas()   { [ -n "$(fnbody "$1" "$2" | grep -F -- "$3")" ]; }
 bodyhasre() { [ -n "$(fnbody "$1" "$2" | grep -E -- "$3")" ]; }
 count()     { code "$1" | grep -Fc -- "$2"; }
 
-UPDATES=panel/agent/src/routes/updates.rs
-SMTP=panel/agent/src/services/smtp.rs
-PHP=panel/agent/src/routes/php.rs
+UPDATES=panel/go/internal/agent/routes/updates.go
+UPDATES_TEST=panel/go/internal/agent/routes/updates_test.go
+SMTP=panel/go/internal/agent/services/smtp.go
+PHP=panel/go/internal/agent/routes/php.go
 
-for f in "$UPDATES" "$SMTP" "$PHP"; do
+for f in "$UPDATES" "$UPDATES_TEST" "$SMTP" "$PHP"; do
   [ -f "$f" ] || { echo "missing source file: $f"; exit 1; }
 done
 
-echo "── 1. Topic 1: routes/updates.rs gains a dnf/yum path via pkg.rs ──"
-if hasre "$UPDATES" 'use crate::services::pkg::\{self, Installer, PkgMgr\};'; then
-  ok "updates.rs imports the pkg.rs dual-family abstraction"
+echo "── 1. Topic 1: routes/updates.go gains a dnf/yum path via pkg.go ──"
+if has "$UPDATES" '"github.com/ovexro/dockpanel/panel/go/internal/agent/services"' && has "$UPDATES" 'services.PkgMgrRpm'; then
+  ok "updates.go imports the pkg.go dual-family abstraction"
 else
-  bad "updates.rs no longer imports pkg::{Installer,PkgMgr} — RHEL path may be gone"
+  bad "updates.go no longer imports services' PkgMgr/PkgInstaller — RHEL path may be gone"
 fi
-if bodyhasre "$UPDATES" "^async fn rpm_check_update" 'Some\(0\) \| Some\(100\)'; then
-  ok "rpm_check_update distinguishes check-update's 0/100/error exit codes"
+if bodyhasre "$UPDATES" updatesRpmCheckUpdate 'out\.ExitCode != 0 && out\.ExitCode != 100'; then
+  ok "updatesRpmCheckUpdate distinguishes check-update's 0/100/error exit codes"
 else
-  bad "rpm_check_update no longer distinguishes 0 (no updates) from 100 (updates) from a real error"
+  bad "updatesRpmCheckUpdate no longer distinguishes 0 (no updates) from 100 (updates) from a real error"
 fi
-if bodyhas "$UPDATES" "^fn parse_rpm_update_line" "rsplit_once('.')?"; then
-  ok "parse_rpm_update_line requires the name.arch dot (rejects a false-positive 3-word line)"
+# parse-dot arm retired: covered by TestUpdatesSkipsSectionHeadersAndTheMetadataBanner ("Security: 3 patches") (panel/go/internal/agent/routes/updates_test.go)
+if bodyhas "$UPDATES" updatesList 'services.PkgManager() == services.PkgMgrRpm'; then
+  ok "updatesList branches on PkgMgrRpm"
 else
-  bad "parse_rpm_update_line's dot requirement is missing — may misparse a non-package summary line as one"
+  bad "updatesList no longer branches on PkgMgrRpm — may be apt-only again"
 fi
-if bodyhasre "$UPDATES" "^async fn list_updates" 'PkgMgr::Rpm'; then
-  ok "list_updates branches on PkgMgr::Rpm"
+if bodyhas "$UPDATES" updatesCount 'services.PkgManager() == services.PkgMgrRpm'; then
+  ok "updatesCount branches on PkgMgrRpm"
 else
-  bad "list_updates no longer branches on PkgMgr::Rpm — may be apt-only again"
+  bad "updatesCount no longer branches on PkgMgrRpm — may be apt-only again"
 fi
-if bodyhasre "$UPDATES" "^async fn update_count" 'PkgMgr::Rpm'; then
-  ok "update_count branches on PkgMgr::Rpm"
+if bodyhas "$UPDATES" updatesApply 'services.PkgGetInstaller()' && bodyhas "$UPDATES" updatesApply 'safecmd.NewUnsandboxed(inst.Bin())'; then
+  ok "updatesApply selects its binary via services.PkgGetInstaller() rather than a hardcoded apt-get"
 else
-  bad "update_count no longer branches on PkgMgr::Rpm — may be apt-only again"
+  bad "updatesApply no longer calls services.PkgGetInstaller() — may have regressed to hardcoded apt-get"
 fi
-if bodyhasre "$UPDATES" "^async fn apply_updates" 'pkg::installer\(\).await'; then
-  ok "apply_updates selects its binary via pkg::installer() rather than a hardcoded apt-get"
+if bodyhasre "$UPDATES" updatesApply 'NewUnsandboxed\("apt(-get)?"'; then
+  bad "updatesApply still hardcodes safecmd.NewUnsandboxed(\"apt-get\") — the RHEL branch may be dead code"
 else
-  bad "apply_updates no longer calls pkg::installer() — may have regressed to hardcoded apt-get"
+  ok "updatesApply no longer hardcodes the apt-get binary directly"
 fi
-if bodyhas "$UPDATES" "^async fn apply_updates" 'safe_command_unsandboxed("apt-get", &[])'; then
-  bad "apply_updates still hardcodes safe_command_unsandboxed(\"apt-get\", ...) — the RHEL branch may be dead code"
+if bodyhas "$UPDATES" updatesRebootRequired '"needs-restarting", "-r"'; then
+  ok "updatesRebootRequired has an RHEL fallback (needs-restarting -r)"
 else
-  ok "apply_updates no longer hardcodes the apt-get binary directly"
-fi
-if bodyhasre "$UPDATES" "^async fn reboot_required" 'needs-restarting'; then
-  ok "reboot_required has an RHEL fallback (needs-restarting -r)"
-else
-  bad "reboot_required lost its RHEL fallback — reboot banner will never show on RPM boxes"
+  bad "updatesRebootRequired lost its RHEL fallback — reboot banner will never show on RPM boxes"
 fi
 
 echo
 echo "── 2. Topic 1 control: the new RPM parser is unit-tested, not just source-shaped ──"
-if grep -qF 'fn parses_a_real_dnf_check_update_line' "$UPDATES"; then
-  ok "parse_rpm_update_line has a Rust unit test for a real dnf line"
+GOT=$(cd panel/go && go test ./internal/agent/routes/ -count=1 -v \
+  -run '^(TestUpdatesParsesARealDnfCheckUpdateLine|TestUpdatesSkipsSectionHeadersAndTheMetadataBanner)$' 2>&1)
+if grep -qF -- '--- PASS: TestUpdatesParsesARealDnfCheckUpdateLine' <<<"$GOT"; then
+  ok "updatesParseRpmUpdateLine has a passing Go unit test for a real dnf line"
 else
-  bad "no unit test found for parse_rpm_update_line"
+  bad "no passing unit test for updatesParseRpmUpdateLine (TestUpdatesParsesARealDnfCheckUpdateLine)"
 fi
-if grep -qF 'fn skips_section_headers_and_the_metadata_banner' "$UPDATES"; then
-  ok "parse_rpm_update_line has a unit test for non-package lines"
+if grep -qF -- '--- PASS: TestUpdatesSkipsSectionHeadersAndTheMetadataBanner' <<<"$GOT"; then
+  ok "updatesParseRpmUpdateLine has a passing unit test for non-package lines"
 else
-  bad "no unit test found guarding against section-header false positives"
+  bad "no passing unit test guarding against section-header false positives"
 fi
 
 echo
-echo "── 3. Topic 2: services/smtp.rs — from_name reaches msmtp via from_full_name ──"
-if bodyhas "$SMTP" "^pub fn configure" 'from_full_name'; then
-  ok "configure() writes msmtp's from_full_name directive"
+echo "── 3. Topic 2: services/smtp.go — from_name reaches msmtp via from_full_name ──"
+if bodyhas "$SMTP" SmtpConfigure 'from_full_name'; then
+  ok "SmtpConfigure writes msmtp's from_full_name directive"
 else
-  bad "configure() no longer writes from_full_name — from_name is dead again"
+  bad "SmtpConfigure no longer writes from_full_name — from_name is dead again"
 fi
-if bodyhasre "$SMTP" "^pub fn configure" 'from_name\.is_empty\(\)'; then
-  ok "configure() guards on from_name being empty before emitting the directive"
+if bodyhas "$SMTP" SmtpConfigure 'if fromName != "" {'; then
+  ok "SmtpConfigure guards on fromName being empty before emitting the directive"
 else
-  bad "configure()'s empty-from_name guard is missing"
+  bad "SmtpConfigure's empty-fromName guard is missing"
 fi
 # Control: from_full_name must be INSIDE the account block (after `from`,
 # before `user`), not in `defaults` — msmtp scopes it per-account like `from`.
 # The template is a raw string with a REAL newline between the two lines,
 # so this checks adjacency by line number rather than a single-line regex.
-FROM_LINE=$(grep -n 'from[[:space:]]*{from}$' "$SMTP" | head -1 | cut -d: -f1)
-NAME_LINE=$(grep -n '^{from_name_line}user' "$SMTP" | head -1 | cut -d: -f1)
-if [ -n "$FROM_LINE" ] && [ -n "$NAME_LINE" ] && [ "$NAME_LINE" -eq $((FROM_LINE + 1)) ]; then
+FROM_LINE=$(grep -n '^from[[:space:]]*%s$' "$SMTP" | head -1 | cut -d: -f1)
+NAME_LINE=$(grep -n '^%suser[[:space:]]' "$SMTP" | head -1 | cut -d: -f1)
+ACCT_LINE=$(grep -n '^account[[:space:]]*default$' "$SMTP" | head -1 | cut -d: -f1)
+if [ -n "$FROM_LINE" ] && [ -n "$NAME_LINE" ] && [ -n "$ACCT_LINE" ] \
+   && [ "$NAME_LINE" -eq $((FROM_LINE + 1)) ] && [ "$ACCT_LINE" -lt "$FROM_LINE" ]; then
   ok "from_full_name is emitted immediately after from, inside the account block"
 else
   bad "from_full_name's placement in the config template changed (from=$FROM_LINE, name=$NAME_LINE) — re-verify it is still inside the account block"
 fi
 
 echo
-echo "── 4. Topic 2: services/smtp.rs — msmtp.log is no longer truncated on every save ──"
-if bodyhasre "$SMTP" "^pub fn configure" '!std::path::Path::new\("/var/log/msmtp\.log"\)\.exists\(\)'; then
-  ok "configure() only creates msmtp.log when it does not already exist"
+echo "── 4. Topic 2: services/smtp.go — msmtp.log is no longer truncated on every save ──"
+SMTP_FN=$(fnbody "$SMTP" SmtpConfigure)
+if perl -0777 -ne 'exit !/const logPath = "\/var\/log\/msmtp\.log"\s*\n\s*if _, err := os\.Stat\(logPath\); err != nil \{\s*\n\s*_ = os\.WriteFile\(logPath,/' <<<"$SMTP_FN"; then
+  ok "SmtpConfigure only creates msmtp.log when it does not already exist"
 else
-  bad "configure() no longer guards the msmtp.log write — may truncate on every save again"
+  bad "SmtpConfigure no longer guards the msmtp.log write — may truncate on every save again"
 fi
 # Control: exactly one write to this path, and it must be the guarded one —
-# a regression that adds a second unconditional write would slip past a
-# has()-only check.
-WRITE_COUNT=$(count "$SMTP" '/var/log/msmtp.log", "").ok();')
+# a regression that adds a second unconditional write (by const or literal,
+# WriteFile or an O_TRUNC open) would slip past a has()-only check.
+WRITE_COUNT=$(code "$SMTP" | grep -cE 'os\.(WriteFile|OpenFile|Create)\((logPath|"/var/log/msmtp\.log")')
 if [ "$WRITE_COUNT" -eq 1 ]; then
   ok "exactly one write to msmtp.log in the file (the guarded one)"
 else
@@ -181,27 +181,26 @@ else
 fi
 
 echo
-echo "── 5. Off-menu: routes/php.rs propagates output_with_timeout to its 3 remaining sites ──"
-if bodyhasre "$PHP" "^async fn install_version\(" 'output_with_timeout'; then
-  ok "install_version() uses output_with_timeout"
+echo "── 5. Off-menu: routes/php.go uses OutputWithTimeout at its 3 privileged-transaction sites ──"
+if bodyhas "$PHP" phpInstallVersion '.OutputWithTimeout(300 * time.Second)'; then
+  ok "phpInstallVersion() uses OutputWithTimeout"
 else
-  bad "install_version() does not use output_with_timeout — orphaned-unit fix not propagated"
+  bad "phpInstallVersion() does not use OutputWithTimeout — orphaned-unit fix not propagated"
 fi
-if bodyhasre "$PHP" "^async fn uninstall_version\(" 'output_with_timeout'; then
-  ok "uninstall_version() uses output_with_timeout (covers both the purge and the autoremove follow-up)"
+if [ "$(fnbody "$PHP" phpUninstallVersion | grep -cF '.OutputWithTimeout(300 * time.Second)')" -ge 2 ]; then
+  ok "phpUninstallVersion() uses OutputWithTimeout (covers both the purge and the autoremove follow-up)"
 else
-  bad "uninstall_version() does not use output_with_timeout — orphaned-unit fix not propagated"
+  bad "phpUninstallVersion() does not use OutputWithTimeout at both sites — orphaned-unit fix not propagated"
 fi
-# Control: zero remaining instances of the OLD double-wrap pattern
-# (tokio::time::timeout(...) around a plain .output() call) anywhere in the
-# file — this is the exact shape v2.213.0 fixed in pkg.rs and this session
-# fixed here; a regression re-introducing it anywhere would slip past the
-# two positive checks above alone.
-OLD_PATTERN_COUNT=$(code "$PHP" | grep -Pzo 'tokio::time::timeout\(\s*std::time::Duration::from_secs\(300\),\s*safe_command_unsandboxed' 2>/dev/null | grep -ac 'tokio::time::timeout' || true)
+# Control: zero instances of the OLD double-wrap shape anywhere in the file —
+# a caller-side deadline (context.WithTimeout / WithDeadline) around a plain
+# (*Unsandboxed).Output(ctx) kills only the LOCAL systemd-run waiter, leaving
+# the privileged transaction running orphaned in its transient unit.
+OLD_PATTERN_COUNT=$(code "$PHP" | grep -cE 'context\.With(Timeout|Deadline)\(' || true)
 if [ "${OLD_PATTERN_COUNT:-0}" -eq 0 ]; then
-  ok "no remaining caller-side tokio::time::timeout wrapping a plain safe_command_unsandboxed(...).output() in php.rs"
+  ok "no caller-side context deadline wrapping a plain safecmd.NewUnsandboxed(...).Output() in php.go"
 else
-  bad "found $OLD_PATTERN_COUNT remaining old-shape timeout wraps in php.rs — the orphaned-unit bug may still exist somewhere"
+  bad "found $OLD_PATTERN_COUNT caller-side context deadlines in php.go — the orphaned-unit bug may still exist somewhere"
 fi
 
 echo

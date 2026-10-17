@@ -5,7 +5,7 @@
 # and for an alert type that could not be resolved at all.
 #
 #   §A  `alerts` carries the entity key, and the unresolvable rows were retired.
-#   §B  `resolve_alert` is SCOPED BY THAT KEY, refuses to run unscoped, sends
+#   §B  `NotificationsResolveAlert` is SCOPED BY THAT KEY, refuses to run unscoped, sends
 #       nothing when it resolved nothing, and honours the per-type mute. This is
 #       the section that matters: `alert_state` is keyed
 #       (server_id, alert_type, state_key) and this UPDATE was keyed only
@@ -30,11 +30,11 @@
 #       while `check_escalations` re-paged it every thirty minutes and the
 #       resolved-only purge never collected it. §H also pins the OTHER half: the
 #       three standing conditions must NOT be cleared, because `DNS01_DOWNGRADED`
-#       is raised on that same success path and `fire_alert_deduped` windows on
+#       is raised on that same success path and `NotificationsFireAlertDeduped` windows on
 #       `created_at` regardless of status, so resolving it would swallow its own
 #       re-fire.
 #   §I  a disabled alert type is not a fired alert. `try_fire_alert` returned
-#       `Ok(())` whether it recorded a row or found the type switched off, so the
+#       `Ok(())` (Rust era; now `NotificationsTryFireAlert`) whether it recorded a row or found the type switched off, so the
 #       caller published a `visible_on_status_page` incident for an alert the
 #       operator had silenced, and stamped the SSL ladder's rung for a page that
 #       never went out.
@@ -42,7 +42,11 @@
 #       `postmortem` still keeps it. The stamp survived a reopen, so the public
 #       status page rendered "Resolved <n> ago" over a live `investigating`.
 #
-# Pure source analysis: no box, no network, no build.
+# Pure source analysis: no box, no network, no build. Subjects are the Go API
+# (panel/go/internal/api: svc_*.go / rt_*.go / migrations); identifiers follow
+# its PORTING.md prefixes (resolve_alert -> NotificationsResolveAlert, etc.).
+# The mutation record below was taken against the original Rust subjects; the
+# arms were repointed to the Go code's shape when the Rust tree was retired.
 #
 # MUTATION-TESTED at HEAD — 7 mutations, 7 kills, each by the arm it names, with
 # the control asserted to print a real summary first (an empty one is not a pass,
@@ -74,14 +78,15 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-NOTIF=panel/backend/src/services/notifications.rs
-ENGINE=panel/backend/src/services/alert_engine.rs
-HEALER=panel/backend/src/services/auto_healer.rs
-UPTIME=panel/backend/src/services/uptime.rs
-SCANNER=panel/backend/src/services/security_scanner.rs
-STOPS=panel/backend/src/services/expected_stops.rs
-INC=panel/backend/src/routes/incidents.rs
-MIG=panel/backend/migrations/20260813000000_alert_state_key.sql
+API=panel/go/internal/api
+NOTIF=$API/svc_notifications.go
+ENGINE=$API/svc_alert_engine.go
+HEALER=$API/svc_auto_healer.go
+UPTIME=$API/svc_uptime.go
+SCANNER=$API/svc_security_scanner.go
+STOPS=$API/svc_expected_stops.go
+INC=$API/rt_incidents.go
+MIG=$API/migrations/20260813000000_alert_state_key.sql
 
 for f in "$NOTIF" "$ENGINE" "$HEALER" "$UPTIME" "$SCANNER" "$STOPS" "$INC" "$MIG"; do
   [ -f "$f" ] || bad "MISSING SUBJECT FILE: $f"
@@ -101,20 +106,19 @@ code() {
 
 subj() { local t; t=$(code "$1"); [ -n "$t" ] || return 1; printf '%s' "$t"; }
 
-# The body of one top-level fn, bounded by the NEXT top-level fn. A fixed
+# The body of one top-level Go func (plain or method), from the line after its
+# `func` line to the gofmt-guaranteed closing `}` in column 0. A fixed
 # `grep -A n` window is not a function (lesson #131/#172).
 fnbody() {
   awk -v name="$2" '
-    /^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn / {
-      if ($0 ~ "(pub |pub\\(crate\\) )?(async )?fn " name "\\(") { inside=1; next }
-      inside=0
-    }
+    index($0, "func " name "(") == 1 || $0 ~ ("^func \\([^)]*\\) " name "\\(") { inside=1; next }
+    inside && /^}$/ { exit }
     inside { print }
   ' <<< "$1"
 }
 
 # Every call to $2 in file $1, one per line, arguments PAREN-BALANCED and
-# whitespace-flattened. Immune to rustfmt reflowing a call across lines — the
+# whitespace-flattened. Immune to gofmt reflowing a call across lines — the
 # defect class that published 813 routes against a real 821 (lesson #462).
 calls() {
   perl -0777 -ne '
@@ -163,24 +167,24 @@ else
 fi
 
 if N=$(subj "$NOTIF"); then
-  FIRE=$(fnbody "$N" try_fire_alert)
+  FIRE=$(fnbody "$N" NotificationsTryFireAlert)
   if [ -n "$FIRE" ] && grep -qE 'INSERT INTO alerts .*state_key' <<< "$FIRE"; then
-    ok "A5 try_fire_alert records the key it will later be resolved by"
+    ok "A5 NotificationsTryFireAlert records the key it will later be resolved by"
   else
-    bad "A5 try_fire_alert records the key it will later be resolved by"
+    bad "A5 NotificationsTryFireAlert records the key it will later be resolved by"
   fi
 else
   bad "A5 $NOTIF is readable"
 fi
 
 echo
-echo "== §B  resolve_alert is scoped, refuses to run unscoped, and stays quiet =="
+echo "== §B  NotificationsResolveAlert is scoped, refuses to run unscoped, and stays quiet =="
 
 if N=$(subj "$NOTIF"); then
-  BODY=$(fnbody "$N" resolve_alert)
+  BODY=$(fnbody "$N" NotificationsResolveAlert)
 
   if [ -z "$BODY" ]; then
-    for b in B1 B2 B3 B4; do bad "$b resolve_alert body could not be extracted"; done
+    for b in B1 B2 B3 B4; do bad "$b NotificationsResolveAlert body could not be extracted"; done
   else
     # THE headline arm. Count the UPDATE arms and require EVERY one to carry the
     # key — asserting the enumeration first (#143), because "0 of 0 arms are
@@ -203,15 +207,15 @@ if N=$(subj "$NOTIF"); then
 
     # "Resolved: X" for something that was never firing is a false all-clear,
     # and two auto_healer callers reach here without checking first.
-    if grep -qE 'rows_affected\(\)' <<< "$BODY" \
-    && grep -qE 'if resolved == 0' <<< "$BODY"; then
+    if grep -qE 'resolved, err := execSQL\(' <<< "$BODY" \
+    && grep -qE 'if resolved == 0 \{' <<< "$BODY"; then
       ok "B3 a recovery notice is sent only if something was actually resolved"
     else
       bad "B3 a recovery notice is sent only if something was actually resolved"
     fi
 
     # A muted type that pages on recovery is still a page.
-    if grep -qE 'is_type_muted' <<< "$BODY"; then
+    if grep -qE 'notificationsIsTypeMuted\(' <<< "$BODY"; then
       ok "B4 the recovery notice honours the per-type mute"
     else
       bad "B4 the recovery notice honours the per-type mute"
@@ -220,11 +224,11 @@ if N=$(subj "$NOTIF"); then
 
   # The mute must be SINGLE-SOURCED. It drifted apart once already: applied on
   # the firing path, skipped on the resolve path.
-  USERS=$(grep -cE '\bis_type_muted\(' <<< "$N")
-  if grep -qE 'fn is_type_muted' <<< "$N" && [ "$USERS" -ge 3 ]; then
-    ok "B5 is_type_muted is one function used by both the firing and resolving paths"
+  USERS=$(grep -cE '\bnotificationsIsTypeMuted\(' <<< "$N")
+  if grep -qE '^func notificationsIsTypeMuted\(' <<< "$N" && [ "$USERS" -ge 3 ]; then
+    ok "B5 notificationsIsTypeMuted is one function used by both the firing and resolving paths"
   else
-    bad "B5 is_type_muted is one function used by both paths — $USERS references"
+    bad "B5 notificationsIsTypeMuted is one function used by both paths — $USERS references"
   fi
 else
   for b in B1 B2 B3 B4 B5; do bad "$b $NOTIF is readable"; done
@@ -238,18 +242,18 @@ echo "== §C  every per-entity caller passes a real key =="
 # matches C2's own `Container '` selector — so the arm that checks every
 # per-entity caller passes a real key was silently checking eleven of twelve.
 # It is correctly keyed; that is luck, not coverage.
-ALLCALLS=$( { calls "$ENGINE" notifications::resolve_alert
-              calls "$HEALER" notifications::resolve_alert
-              calls "$STOPS" notifications::resolve_alert
-              calls "$UPTIME" notifications::resolve_alert; } 2>/dev/null )
+ALLCALLS=$( { calls "$ENGINE" NotificationsResolveAlert
+              calls "$HEALER" NotificationsResolveAlert
+              calls "$STOPS" NotificationsResolveAlert
+              calls "$UPTIME" NotificationsResolveAlert; } 2>/dev/null )
 NCALLS=$(grep -c . <<< "$ALLCALLS")
 
 # Assert the enumeration BEFORE trusting it (#143): an empty call list would
 # make every arm below vacuously green.
 if [ "$NCALLS" -ge 12 ]; then
-  ok "C1 enumeration is sound — $NCALLS resolve_alert call sites found"
+  ok "C1 enumeration is sound — $NCALLS NotificationsResolveAlert call sites found"
 else
-  bad "C1 enumeration is sound — only $NCALLS resolve_alert call sites found (expected >= 12)"
+  bad "C1 enumeration is sound — only $NCALLS NotificationsResolveAlert call sites found (expected >= 12)"
 fi
 
 # A call about a NAMED entity that also passes a literal "" is the original bug
@@ -270,11 +274,11 @@ echo
 echo "== §D  slow_response can be resolved =="
 
 if U=$(subj "$UPTIME"); then
-  SLOWRESOLVE=$(grep -E '"slow_response"' <<< "$(calls "$UPTIME" notifications::resolve_alert)")
+  SLOWRESOLVE=$(grep -E '"slow_response"' <<< "$(calls "$UPTIME" NotificationsResolveAlert)")
   if [ -n "$SLOWRESOLVE" ]; then
-    ok "D1 uptime.rs resolves slow_response when the response time recovers"
+    ok "D1 svc_uptime.go resolves slow_response when the response time recovers"
   else
-    bad "D1 uptime.rs resolves slow_response when the response time recovers"
+    bad "D1 svc_uptime.go resolves slow_response when the response time recovers"
   fi
 
   # Dedup keyed on the monitor's id, not on the title. The title carries the
@@ -282,7 +286,7 @@ if U=$(subj "$UPTIME"); then
   # and made the first unreachable.
   #
   # Was a single INSERT ... WHERE NOT EXISTS (state_key = $5::text); s414
-  # split firing into a guard-SELECT + notifications::try_fire_alert so the
+  # split firing into a guard-SELECT + NotificationsTryFireAlert so the
   # firing half honours mutes/escalation like every other alert type. The
   # guard's own WHERE clause is what this pins now.
   if grep -qE "AND state_key = \\\$2\\)" <<< "$U"; then
@@ -293,11 +297,11 @@ if U=$(subj "$UPTIME"); then
 
   # Fire and resolve must agree on the key or the resolve silently matches
   # nothing — a green build with the bug intact.
-  NKEY=$(grep -cE 'monitor\.id\.to_string\(\)' <<< "$U")
+  NKEY=$(grep -cE '\bm\.ID\.String\(\)' <<< "$U")
   if [ "$NKEY" -ge 2 ]; then
-    ok "D3 fire and resolve use the SAME key expression ($NKEY uses of monitor.id)"
+    ok "D3 fire and resolve use the SAME key expression ($NKEY uses of m.ID.String())"
   else
-    bad "D3 fire and resolve use the same key expression — only $NKEY use(s) of monitor.id"
+    bad "D3 fire and resolve use the same key expression — only $NKEY use(s) of m.ID.String()"
   fi
 else
   for d in D1 D2 D3; do bad "$d $UPTIME is readable"; done
@@ -307,8 +311,8 @@ echo
 echo "== §E  reopening an incident clears the resolution stamp, on both paths =="
 
 if I=$(subj "$INC"); then
-  # PUT path: the match must name all three live statuses.
-  if grep -qE 'Some\("investigating"\) \| Some\("identified"\) \| Some\("monitoring"\) => ", resolved_at = NULL"' <<< "$I"; then
+  # PUT path: the switch case must name all three live statuses.
+  if perl -0777 -ne 'exit(/case "investigating", "identified", "monitoring":\s*resolvedAtClause = ", resolved_at = NULL"/ ? 0 : 1)' <<< "$I"; then
     ok "E1 the PUT path clears resolved_at for all three live statuses"
   else
     bad "E1 the PUT path clears resolved_at for all three live statuses"
@@ -316,8 +320,7 @@ if I=$(subj "$INC"); then
 
   # POST path: the sibling that would have been left behind. Both endpoints
   # write this column, so fixing one leaves the defect reachable.
-  if grep -qE 'matches!\(req\.status\.as_str\(\), "investigating" \| "identified" \| "monitoring"\)' <<< "$I" \
-  && grep -qE 'SET status = \$2, resolved_at = NULL, updated_at = NOW\(\)' <<< "$I"; then
+  if perl -0777 -ne 'exit(/switch req\.Status \{\s*case "investigating", "identified", "monitoring":\s*sql = "UPDATE managed_incidents SET status = \$2, resolved_at = NULL, updated_at = NOW\(\)/ ? 0 : 1)' <<< "$I"; then
     ok "E2 the POST path clears resolved_at for all three live statuses"
   else
     bad "E2 the POST path clears resolved_at for all three live statuses"
@@ -328,18 +331,21 @@ if I=$(subj "$INC"); then
   # written about.
   #
   # Stated as a property of the CLEARING SITES themselves rather than as one
-  # spelled-out match arm. The first cut of this arm anchored on
+  # spelled-out match arm. In Go the case label sits on the line ABOVE the
+  # clearing assignment, so each clearing site is read together with the
+  # `case` that governs it, and every clearer must have one. The first cut of this arm anchored on
   # `"postmortem"[^)]*=> ", resolved_at = NULL"`, which cannot cross the `)` that
   # a real over-reach puts in the way — so it stayed GREEN under the very
   # mutation it names, and only E1's exact-string arm caught it by accident
   # (lesson #442: the mutation run is the test OF the suite).
-  CLEARERS=$(grep -nE 'resolved_at = NULL' <<< "$I")
-  NCLEAR=$(grep -c . <<< "$CLEARERS")
+  NCLEAR=$(grep -cE 'resolved_at = NULL' <<< "$I")
+  CLEARERS=$(perl -0777 -ne 'while (/^[ \t]*(case [^\n]*:)[ \t]*\n[^\n]*resolved_at = NULL[^\n]*/gm) { print "$1\n" }' <<< "$I")
+  NCASED=$(grep -c . <<< "$CLEARERS")
   TAINTED=$(grep -c 'postmortem' <<< "$CLEARERS")
-  if [ "$NCLEAR" -ge 2 ] && [ "$TAINTED" -eq 0 ]; then
+  if [ "$NCLEAR" -ge 2 ] && [ "$NCASED" -eq "$NCLEAR" ] && [ "$TAINTED" -eq 0 ]; then
     ok "E3 postmortem KEEPS its resolution stamp — $NCLEAR clearing sites, none mentions it"
   else
-    bad "E3 postmortem KEEPS its resolution stamp — $NCLEAR clearing sites, $TAINTED mention it"
+    bad "E3 postmortem KEEPS its resolution stamp — $NCLEAR clearing sites ($NCASED under a case label), $TAINTED mention it"
   fi
 else
   for e in E1 E2 E3; do bad "$e $INC is readable"; done
@@ -349,37 +355,40 @@ echo
 echo "── s378 §F: a maintenance window silences the engine, not just the monitors ──"
 
 # The panel offers a button labelled *Silence Alerts*, and the guide said "no
-# alerts fire during the window". `uptime.rs` honoured it; this engine — which
+# alerts fire during the window". `svc_uptime.go` honoured it; this engine — which
 # owns 14 of the 19 alert types — had never read the table, so `offline`,
 # `service_down` and `container_down`, the three a planned maintenance is
 # CERTAIN to cause, were exactly the ones that still paged.
 #
 # The arms below pin WHERE the check happens, not merely THAT it happens. That
-# distinction is the whole fix: `check_server_offline` selects the servers with
+# distinction is the whole fix: `alertEngineCheckServerOffline` selects the servers with
 # no firing row and then writes one, so a guard at the FIRE would leave the row
 # claiming the operator was paged while nothing was sent, and the condition
 # would never page again. §F5 is the arm that forbids that regression.
 
 if EG=$(subj "$ENGINE"); then
-  RUNBODY=$(fnbody "$EG" run)
+  # The Rust `run` loop body is the Go per-tick function.
+  RUNBODY=$(fnbody "$EG" alertEngineTick)
 
-  # F1 — loaded ONCE per tick, like uptime.rs does it, not per server per type.
-  NLOAD=$(grep -c 'maintenance_users(&pool)' <<< "$RUNBODY")
-  if [ "$NLOAD" -eq 1 ]; then
+  # F1 — loaded ONCE per tick, like svc_uptime.go does it, not per server per type.
+  # Floored on the whole file too: a second loader elsewhere is the same regression.
+  NLOAD=$(grep -c 'alertEngineMaintenanceUsers(ctx, db)' <<< "$RUNBODY")
+  NLOADALL=$(grep -c 'alertEngineMaintenanceUsers(' <<< "$EG")
+  if [ "$NLOAD" -eq 1 ] && [ "$NLOADALL" -eq 2 ]; then
     ok "F1 the tick loads the open-window set exactly once"
   else
-    bad "F1 the tick loads the open-window set exactly once — found $NLOAD"
+    bad "F1 the tick loads the open-window set exactly once — found $NLOAD in the tick, $NLOADALL references in the file (expected 1 + the definition)"
   fi
 
   # F2/F3 — DERIVED, not listed. Every top-level check the tick calls with the
   # pool must both TAKE the set and USE it. Taking it and not using it is the
   # half-edit a signature-only arm cannot see (lesson #600).
   GUARDED=""; UNGUARDED=""
-  for fn in check_resource_thresholds check_server_offline check_ssl_expiry check_stack_ssl_expiry check_registered_cert_expiry; do
+  for fn in alertEngineCheckResourceThresholds alertEngineCheckServerOffline alertEngineCheckSslExpiry alertEngineCheckStackSslExpiry alertEngineCheckRegisteredCertExpiry; do
     B=$(fnbody "$EG" "$fn")
-    if grep -q 'maint\.contains(' <<< "$B"; then GUARDED="$GUARDED $fn"; else UNGUARDED="$UNGUARDED $fn"; fi
+    if grep -qE 'if maint\[[A-Za-z.]+\] \{' <<< "$B"; then GUARDED="$GUARDED $fn"; else UNGUARDED="$UNGUARDED $fn"; fi
   done
-  NTAKE=$(grep -c 'maint: &HashSet<Uuid>' <<< "$EG")
+  NTAKE=$(grep -cE '^func alertEngineCheck[A-Za-z]+\(ctx context\.Context, db \*pgxpool\.Pool, maint map\[uuid\.UUID\]bool\)' <<< "$EG")
   if [ "$NTAKE" -eq 5 ]; then
     ok "F2 all five pool-driven checks take the open-window set"
   else
@@ -394,8 +403,8 @@ if EG=$(subj "$ENGINE"); then
   # F4 — the fleet loop guards BEFORE the first per-member check, not after.
   # Ordering asserted by line number with both anchors present (lesson #582);
   # a guard below the call is a guard that has already paged.
-  GLINE=$(grep -n 'maint\.contains(&member\.user_id)' <<< "$RUNBODY" | head -1 | cut -d: -f1)
-  CLINE=$(grep -n 'check_gpu_thresholds(' <<< "$RUNBODY" | head -1 | cut -d: -f1)
+  GLINE=$(grep -n 'if maint\[member\.UserID\] {' <<< "$RUNBODY" | head -1 | cut -d: -f1)
+  CLINE=$(grep -n 'alertEngineCheckGpuThresholds(' <<< "$RUNBODY" | head -1 | cut -d: -f1)
   if [ -n "$GLINE" ] && [ -n "$CLINE" ] && [ "$GLINE" -lt "$CLINE" ]; then
     ok "F4 the fleet loop skips a silenced owner before any per-member check (guard $GLINE < call $CLINE)"
   else
@@ -405,8 +414,8 @@ if EG=$(subj "$ENGINE"); then
   # F5 — ABSENCE arm with a positive control. The suppression must NOT migrate
   # into the fire funnel: every caller that stamps `alert_state` does so beside
   # its fire, so a funnel-level skip converts a deferral into permanent silence.
-  FWR=$(fnbody "$EG" fire_alert_with_retry)
-  if grep -q 'try_fire_alert(' <<< "$FWR"; then
+  FWR=$(fnbody "$EG" alertEngineFireAlertWithRetry)
+  if grep -q 'NotificationsTryFireAlert(' <<< "$FWR"; then
     ok "F5-control the fire funnel was extracted and is non-empty"
     if grep -q 'maint' <<< "$FWR"; then
       bad "F5 the window is NOT consulted at the fire — it is, and every stamp beside a fire then claims a page that never went out"
@@ -428,14 +437,18 @@ fi
 # archive, where it enumerates nothing and the arm goes red on correct code.
 # The enumeration is asserted non-empty first, so "found none" can never be
 # mistaken for either a pass or a real absence.
-SVCDIR=panel/backend/src/services
-ALLSVC=$(/usr/bin/grep -rlE 'fn ' "$SVCDIR" 2>/dev/null | wc -l)
-SUPPRESSORS=$(/usr/bin/grep -rl 'maintenance_windows' "$SVCDIR" 2>/dev/null | sort | paste -sd' ')
+# The Go api package is flat: the services tree is its svc_*.go files (tests
+# excluded — a fixture naming the table is not a suppression site).
+SVCDIR=$API
+SVCFILES=$(ls "$SVCDIR"/svc_*.go 2>/dev/null | grep -v '_test\.go$')
+ALLSVC=$( [ -n "$SVCFILES" ] && /usr/bin/grep -lE '^func ' $SVCFILES 2>/dev/null | wc -l)
+ALLSVC=${ALLSVC:-0}
+SUPPRESSORS=$( [ -n "$SVCFILES" ] && /usr/bin/grep -l 'maintenance_windows' $SVCFILES 2>/dev/null | sort | paste -sd' ' -)
 if [ "$ALLSVC" -lt 10 ]; then
   bad "F6-control the services tree enumerated $ALLSVC files — the scan found nothing to measure"
 else
   ok "F6-control the services tree enumerated $ALLSVC files"
-  if [ "$SUPPRESSORS" = "$SVCDIR/alert_engine.rs $SVCDIR/uptime.rs" ]; then
+  if [ "$SUPPRESSORS" = "$SVCDIR/svc_alert_engine.go $SVCDIR/svc_uptime.go" ]; then
     ok "F6 exactly the two standing-condition services suppress: $SUPPRESSORS"
   else
     bad "F6 exactly the two standing-condition services suppress — found: ${SUPPRESSORS:-none}"
@@ -445,10 +458,10 @@ fi
 echo
 echo "── s401 §G: the DEDUP guard is keyed per condition, not per site ────────────"
 
-# §C asserts that every per-entity caller of `resolve_alert` passes a real key,
+# §C asserts that every per-entity caller of `NotificationsResolveAlert` passes a real key,
 # and states the principle it was written for: a scoped query all of whose
 # callers feed the whole-server key is the same bug with more steps. That is
-# exactly what `fire_alert_deduped` was — the OTHER function keyed on
+# exactly what `NotificationsFireAlertDeduped` was — the OTHER function keyed on
 # `state_key`, whose callers were never enumerated.
 #
 # All eight of its call sites raise `ssl_renewal_failure`, covering FIVE
@@ -465,25 +478,23 @@ echo "── s401 §G: the DEDUP guard is keyed per condition, not per site ─�
 #
 # ⚠ The fix must NOT key on the loop. Two comments in the subjects say the
 # scanner and the healer deliberately share a bucket for the same certificate
-# (`security_scanner.rs` "Deduped per site so the six-hourly scan cannot stack up
+# (the security scanner's "Deduped per site so the six-hourly scan cannot stack up
 # duplicates alongside the auto-healer's own alert"), so the SAME condition in
 # both loops must keep collapsing to one alert. G4 pins that direction; without
 # it a "fix" that keyed per call site would pass G2 and G3 and reintroduce the
 # flood the dedup exists to stop.
 
-SCANNER=panel/backend/src/services/security_scanner.rs
-
-DEDUP_H=$(calls "$HEALER" notifications::fire_alert_deduped 2>/dev/null)
-DEDUP_S=$(calls "$SCANNER" notifications::fire_alert_deduped 2>/dev/null)
+DEDUP_H=$(calls "$HEALER" NotificationsFireAlertDeduped 2>/dev/null)
+DEDUP_S=$(calls "$SCANNER" NotificationsFireAlertDeduped 2>/dev/null)
 DEDUP_ALL=$(printf '%s\n%s\n' "$DEDUP_H" "$DEDUP_S" | grep -c .)
 
 # Assert the enumeration BEFORE trusting it (#143, and §C1's own precedent): an
 # empty call list makes every arm below vacuously green, which is precisely how
 # this defect survived two suites that both mention `fire_alert_deduped`.
 if [ "$DEDUP_ALL" -ge 8 ]; then
-  ok "G1 enumeration is sound — $DEDUP_ALL fire_alert_deduped call sites found"
+  ok "G1 enumeration is sound — $DEDUP_ALL NotificationsFireAlertDeduped call sites found"
 else
-  bad "G1 enumeration is sound — only $DEDUP_ALL fire_alert_deduped call sites found (expected >= 8)"
+  bad "G1 enumeration is sound — only $DEDUP_ALL NotificationsFireAlertDeduped call sites found (expected >= 8)"
 fi
 
 # G2 is C2 for the other keyed function. A dedup guard scoped by a key that every
@@ -491,32 +502,34 @@ fi
 UNKEYED_D=$(printf '%s\n%s\n' "$DEDUP_H" "$DEDUP_S" | grep -E '"ssl_renewal_failure", ""')
 NUNKEYED_D=$(grep -c . <<< "$UNKEYED_D")
 if [ "$NUNKEYED_D" -eq 0 ]; then
-  ok "G2 no fire_alert_deduped call passes the whole-server key for a per-certificate condition"
+  ok "G2 no NotificationsFireAlertDeduped call passes the whole-server key for a per-certificate condition"
 else
-  bad "G2 fire_alert_deduped calls pass a real key — $NUNKEYED_D pass the empty key"
+  bad "G2 NotificationsFireAlertDeduped calls pass a real key — $NUNKEYED_D pass the empty key"
   while IFS= read -r c; do [ -n "$c" ] && printf '        unkeyed: %.140s\n' "$c"; done <<< "$UNKEYED_D"
 fi
 
 # G3: the conditions are distinct SUBJECTS. Counting the keys rather than
 # asserting a fixed list means a sixth condition must pick a key of its own
-# instead of borrowing one, and the count moves when it does.
+# instead of borrowing one, and the count moves when it does. Only the
+# per-site keys (the named constants) — the stack/docker-app arms key on a
+# domain-bearing helper and are a different population (§H8).
 KEYS=$(printf '%s\n%s\n' "$DEDUP_H" "$DEDUP_S" \
-       | grep -oE '"ssl_renewal_failure", [A-Za-z0-9_:]+' \
-       | sed -E 's/.*:://' | sort -u)
+       | grep -oE '"ssl_renewal_failure", NotificationsSslRenewalKey[A-Za-z0-9]+' \
+       | sed -E 's/.*NotificationsSslRenewalKey//' | sort -u)
 NKEYS=$(grep -c . <<< "$KEYS")
 if [ "$NKEYS" -eq 5 ]; then
-  ok "G3 the five renewal conditions are five dedup subjects: $(paste -sd' ' <<< "$KEYS")"
+  ok "G3 the five renewal conditions are five dedup subjects: $(paste -sd' ' - <<< "$KEYS")"
 else
-  bad "G3 the five renewal conditions are five dedup subjects — found $NKEYS: $(paste -sd' ' <<< "$KEYS")"
+  bad "G3 the five renewal conditions are five dedup subjects — found $NKEYS: $(paste -sd' ' - <<< "$KEYS")"
 fi
 
 # G4 — the still-member direction, and the one a per-call-site "fix" would fail.
 # Each condition raised by BOTH loops must carry the SAME key in both, or the
 # six-hourly scan stacks a duplicate on top of the healer's alert for one cert.
 SHARED_OK=1
-for k in FAILED DNS01_DECLINED DNS01_DOWNGRADED; do
-  inh=$(grep -cE "ssl_renewal_key::$k\b" <<< "$DEDUP_H")
-  ins=$(grep -cE "ssl_renewal_key::$k\b" <<< "$DEDUP_S")
+for k in Failed Dns01Declined Dns01Downgraded; do
+  inh=$(grep -cE "NotificationsSslRenewalKey$k\b" <<< "$DEDUP_H")
+  ins=$(grep -cE "NotificationsSslRenewalKey$k\b" <<< "$DEDUP_S")
   if [ "$inh" -lt 1 ] || [ "$ins" -lt 1 ]; then
     SHARED_OK=0
     printf '        %s: healer=%s scanner=%s\n' "$k" "$inh" "$ins"
@@ -531,10 +544,12 @@ fi
 # G5: one home for the keys. An inline literal at a call site is how a sixth
 # condition quietly rejoins an existing subject, and it is invisible to G3
 # because a literal that matches an existing key changes no count.
-KEYDEFS=$(sed -n '/^pub mod ssl_renewal_key {/,/^}/p' "$NOTIF" | grep -cE '^\s*pub const [A-Z0-9_]+: &str = ')
+# Go has no module: the keys are one `const ( ... )` block of
+# NotificationsSslRenewalKey* names in svc_notifications.go.
+KEYDEFS=$(grep -cE '^[[:space:]]*NotificationsSslRenewalKey[A-Za-z0-9]+ = "' "$NOTIF")
 INLINE=$(printf '%s\n%s\n' "$DEDUP_H" "$DEDUP_S" | grep -E '"ssl_renewal_failure", "' | grep -c .)
 # ⚠ 5 -> 6 at v2.156.0, in the same commit as the key that moved it. The sixth is
-# MAIL_HOST_CONFLICT, raised from routes/mail.rs when a mail host's certificate is
+# MAIL_HOST_CONFLICT, raised from the mail routes when a mail host's certificate is
 # deliberately NOT issued because issuing it would overwrite a wildcard or a
 # foreign certificate. It is NOT a healer/scanner subject, so G3 above is
 # untouched and still counts five conditions in those two loops — the two arms
@@ -543,43 +558,43 @@ INLINE=$(printf '%s\n%s\n' "$DEDUP_H" "$DEDUP_S" | grep -E '"ssl_renewal_failure
 # given two opposite messages about the same site one dedup subject, which is the
 # suppression defect v2.154.0 shipped to fix.
 if [ "$KEYDEFS" -eq 6 ] && [ "$INLINE" -eq 0 ]; then
-  ok "G5 all six keys are named constants in one module, and no call site inlines a literal"
+  ok "G5 all six keys are named constants in one const block, and no call site inlines a literal"
 else
-  bad "G5 all six keys are named constants in one module — $KEYDEFS defined, $INLINE inline literal(s) at call sites"
+  bad "G5 all six keys are named constants in one const block — $KEYDEFS defined, $INLINE inline literal(s) at call sites"
 fi
 
 echo
 echo "== §H  a successful renewal clears the alerts that said none happened, and only those =="
 
 if N=$(subj "$NOTIF"); then
-  RES=$(fnbody "$N" resolve_ssl_renewal_failure)
+  RES=$(fnbody "$N" NotificationsResolveSslRenewalFailure)
   # FLOOR the body before trusting any absence arm below it. An empty extraction
   # would make H3 and H4 pass over nothing at all (#461).
   RESLINES=$(grep -c . <<< "$RES")
   if [ "$RESLINES" -ge 8 ]; then
-    ok "H1 resolve_ssl_renewal_failure body extracted — $RESLINES lines"
+    ok "H1 NotificationsResolveSslRenewalFailure body extracted — $RESLINES lines"
 
     # It must decide through the TESTED predicate over the WHOLE key list, not a
     # hand-written subset. A literal list here would compile, behave identically
     # today, and silently stop tracking `renewal_success_clears` — whose unit
     # tests are the only thing that says which keys belong.
-    if grep -qE 'ssl_renewal_key::ALL' <<< "$RES" \
-    && grep -qE 'renewal_success_clears' <<< "$RES"; then
-      ok "H2 the resolver filters the whole key list through renewal_success_clears"
+    if grep -qE 'range NotificationsSslRenewalKeyAll\b' <<< "$RES" \
+    && grep -qE 'NotificationsRenewalSuccessClears\(' <<< "$RES"; then
+      ok "H2 the resolver filters the whole key list through NotificationsRenewalSuccessClears"
     else
-      bad "H2 the resolver filters the whole key list through renewal_success_clears — a hand-written subset drifts from the tested predicate"
+      bad "H2 the resolver filters the whole key list through NotificationsRenewalSuccessClears — a hand-written subset drifts from the tested predicate"
     fi
 
-    # ⚠ THE SCOPING ARM. `resolve_alert` picks its arm on `server_id.is_some()`
+    # ⚠ THE SCOPING ARM. `NotificationsResolveAlert` picks its arm on `serverID != nil`
     # FIRST, so a server id here builds `WHERE server_id = $2` and misses every
-    # row the SCANNER raised — that loop fires with `None` while the healer's
-    # FAILED fires with `Some(server_id)`. The same logical alert exists in two
+    # row the SCANNER raised — that loop fires with `nil` while the healer's
+    # FAILED fires with a server id. The same logical alert exists in two
     # shapes and only the site arm matches both.
-    RESCALL=$(calls "$NOTIF" resolve_alert | grep -F 'ssl_renewal_failure' || true)
-    if [ -n "$RESCALL" ] && grep -qE '\( *pool, *user_id, *None, *Some\(site_id\)' <<< "$RESCALL"; then
-      ok "H3 the resolve is scoped by site with server_id None, so it matches rows from BOTH loops"
+    RESCALL=$(calls "$NOTIF" NotificationsResolveAlert | grep -F 'ssl_renewal_failure' || true)
+    if [ -n "$RESCALL" ] && grep -qE '^\( *ctx, *db, *userID, *nil, *&siteID,' <<< "$RESCALL"; then
+      ok "H3 the resolve is scoped by site with serverID nil, so it matches rows from BOTH loops"
     else
-      bad "H3 the resolve is scoped by site with server_id None — a server id misses every scanner-raised row (got: ${RESCALL:-no call found})"
+      bad "H3 the resolve is scoped by site with serverID nil — a server id misses every scanner-raised row (got: ${RESCALL:-no call found})"
     fi
 
     # The three standing conditions must not be reachable from this body. Naming
@@ -587,9 +602,10 @@ if N=$(subj "$NOTIF"); then
     # success path, so resolving it lets the re-fire land inside its own dedup
     # window and disappear.
     STANDING=0
-    for k in DNS01_DOWNGRADED DECLINED MAIL_HOST_CONFLICT; do
-      # DNS01_DECLINED contains DECLINED, so match the qualified path exactly.
-      if grep -qE "ssl_renewal_key::${k}\b" <<< "$RES"; then
+    for k in Dns01Downgraded Declined MailHostConflict; do
+      # Dns01Declined does not share the NotificationsSslRenewalKeyDeclined
+      # prefix, and \b stops Declined matching a longer name.
+      if grep -qE "NotificationsSslRenewalKey${k}\b" <<< "$RES"; then
         STANDING=$((STANDING+1))
         printf '     names %s\n' "$k"
       fi
@@ -600,37 +616,23 @@ if N=$(subj "$NOTIF"); then
       bad "H4 the resolver names none of the three standing conditions — $STANDING named, and a success does not disprove them"
     fi
   else
-    for a in H1 H2 H3 H4; do bad "$a resolve_ssl_renewal_failure body is too small to test ($RESLINES lines) — the resolver is missing or was renamed"; done
+    for a in H1 H2 H3 H4; do bad "$a NotificationsResolveSslRenewalFailure body is too small to test ($RESLINES lines) — the resolver is missing or was renamed"; done
   fi
 
-  # The predicate itself must keep its conservative fall-through. A `_ => true`
-  # would resolve every key added later without anybody deciding to.
-  # ⚠ The catch-all ONLY. The first cut of this arm also matched a bare
-  # `=> true`, which goes red against a CORRECT explicit rewrite
-  # (`… => true, _ => false`) — an arm red on correct code, which is how K4
-  # failed at v2.156.0. Floored, because a renamed function makes fnbody return
-  # nothing and `! grep -q` on an empty string is green.
-  PRED=$(fnbody "$N" renewal_success_clears)
-  NPRED=$(grep -c . <<< "$PRED")
-  if [ "$NPRED" -ge 3 ] && ! grep -qE '_ *=> *true' <<< "$PRED"; then
-    ok "H5 renewal_success_clears has no catch-all-true — an unknown key is left alone"
-  else
-    bad "H5 renewal_success_clears has no catch-all-true — $NPRED lines extracted; an unknown key must not be resolved by default"
-  fi
+  # H5 retired: covered by TestNotificationsAnUnrecognisedKeyIsLeftAlone (panel/go/internal/api/svc_notifications_test.go)
 
   # ALL must list every constant BY NAME, or a key added later is silently never
-  # considered by `renewal_success_clears`.
+  # considered by `NotificationsRenewalSuccessClears`.
   #
   # ⚠ MEMBERSHIP, not length. The first cut of this arm compared the declared
-  # array length against KEYDEFS — which the Rust compiler already enforces, so
+  # array length against KEYDEFS — which the compiler already enforces, so
   # it tested nothing the build did not: dropping MAIL_HOST_CONFLICT and
   # duplicating DECLINED to hold the length at six passed G5, H2, H6 AND the
-  # unit tests. Matched on the whole line (`^\s*NAME,$`) because DNS01_DECLINED
-  # contains DECLINED, and scoped to the array's own range because a bare grep
-  # for a key name is satisfied by its own `pub const` declaration above.
-  MODBLOCK=$(sed -n '/^pub mod ssl_renewal_key {/,/^}/p' "$NOTIF")
-  ALLBLOCK=$(sed -n '/pub const ALL: \[&str; *[0-9]*\] *= *\[/,/\];/p' <<< "$MODBLOCK")
-  KEYNAMES=$(grep -oE '^\s*pub const [A-Z0-9_]+:' <<< "$MODBLOCK" | grep -oE '[A-Z0-9_]{2,}' | grep -v '^ALL$')
+  # unit tests. Matched on the whole line (`^\s*NAME,$`) so one name cannot
+  # satisfy another, and scoped to the array literal's own range because a
+  # bare grep for a key name is satisfied by its own const declaration.
+  ALLBLOCK=$(sed -n '/^var NotificationsSslRenewalKeyAll = \[[0-9]*\]string{/,/^}/p' "$NOTIF")
+  KEYNAMES=$(grep -oE '^[[:space:]]*NotificationsSslRenewalKey[A-Za-z0-9]+ = "' "$NOTIF" | grep -oE 'NotificationsSslRenewalKey[A-Za-z0-9]+')
   NKEYNAMES=$(grep -c . <<< "$KEYNAMES")
   MEMBER_BAD=0
   if [ "$NKEYNAMES" -ge 5 ] && [ -n "$ALLBLOCK" ]; then
@@ -643,15 +645,15 @@ if N=$(subj "$NOTIF"); then
       fi
     done <<< "$KEYNAMES"
     if [ "$MEMBER_BAD" -eq 0 ]; then
-      ok "H6 ssl_renewal_key::ALL lists each of the $NKEYNAMES constants exactly once"
+      ok "H6 NotificationsSslRenewalKeyAll lists each of the $NKEYNAMES constants exactly once"
     else
-      bad "H6 ssl_renewal_key::ALL lists each of the $NKEYNAMES constants exactly once — $MEMBER_BAD wrong, so a key the resolver never considers"
+      bad "H6 NotificationsSslRenewalKeyAll lists each of the $NKEYNAMES constants exactly once — $MEMBER_BAD wrong, so a key the resolver never considers"
     fi
   else
-    bad "H6 ssl_renewal_key::ALL membership — extraction broke ($NKEYNAMES names, ALL block ${ALLBLOCK:+present}${ALLBLOCK:-absent})"
+    bad "H6 NotificationsSslRenewalKeyAll membership — extraction broke ($NKEYNAMES names, ALL block ${ALLBLOCK:+present}${ALLBLOCK:-absent})"
   fi
 else
-  for a in H1 H2 H3 H4 H5 H6; do bad "$a $NOTIF is readable"; done
+  for a in H1 H2 H3 H4 H6; do bad "$a $NOTIF is readable"; done
 fi
 
 # Both renewal-SUCCESS paths must call it. A guard on one loop only is the drift
@@ -660,7 +662,7 @@ fi
 for pair in "HEALER:$HEALER" "SCANNER:$SCANNER"; do
   label=${pair%%:*}; file=${pair#*:}
   if F=$(subj "$file"); then
-    if grep -qE 'resolve_ssl_renewal_failure' <<< "$F"; then
+    if grep -qE 'NotificationsResolveSslRenewalFailure\(' <<< "$F"; then
       ok "H7 the $label renewal-success path clears the renewal alerts"
     else
       bad "H7 the $label renewal-success path clears the renewal alerts — this loop renews and never resolves"
@@ -672,43 +674,43 @@ done
 
 # ⭐ H8 — THE STACK RENEWAL'S FIRE AND RESOLVE, WHICH H7 STRUCTURALLY CANNOT SEE.
 #
-# H7 greps the WHOLE FILE for `resolve_ssl_renewal_failure`, so the SITE arm
+# H7 greps the WHOLE FILE for `NotificationsResolveSslRenewalFailure`, so the SITE arm
 # satisfies it for the whole module — classic sibling satisfaction. The Compose
 # stack arm added at v2.161.0 cannot use that resolver at all: it takes a
 # non-optional `site_id` (a stack has none) and iterates a fixed key array that
 # cannot hold a domain-bearing composite. It therefore fires and resolves through
-# `resolve_alert` with its own key, and if those two spellings ever drift the
+# `NotificationsResolveAlert` with its own key, and if those two spellings ever drift the
 # alert fires and never clears — thirty-minute escalations for a week about a
 # certificate that is already healthy. That is the exact defect
-# `resolve_ssl_renewal_failure` was written for, reached by a different door.
+# `NotificationsResolveSslRenewalFailure` was written for, reached by a different door.
 #
 # So this arm reads the stack function's OWN body, and requires the key to come
 # from the SHARED function on both sides — a literal on either side is drift
 # waiting to happen.
 if S=$(subj "$SCANNER"); then
-  STACKFN=$(fnbody "$S" renew_stack_certificate)
+  STACKFN=$(fnbody "$S" securityScannerRenewStackCertificate)
   STACKLINES=$(grep -c . <<< "$STACKFN")
   # Floor: an empty or mis-anchored body would satisfy every absence below and
   # print green for a function that no longer exists (lesson #143).
   if [ "$STACKLINES" -ge 40 ]; then
-    ok "H8 renew_stack_certificate body extracted — $STACKLINES lines"
+    ok "H8 securityScannerRenewStackCertificate body extracted — $STACKLINES lines"
 
-    KEYUSES=$(grep -oF 'stack_renewal_state_key(domain)' <<< "$STACKFN" | wc -l | tr -d ' ')
+    KEYUSES=$(grep -oF 'SecurityScannerStackRenewalStateKey(domain)' <<< "$STACKFN" | wc -l | tr -d ' ')
     if [ "$KEYUSES" = "2" ]; then
       ok "H8a the stack alert's key is computed once and used by BOTH the fire and the resolve"
     else
       bad "H8a the stack alert's key is computed once and used by BOTH the fire and the resolve" \
-          "expected 2 uses of stack_renewal_state_key(domain), got $KEYUSES — a hand-spelled key on either side is a fire that never clears"
+          "expected 2 uses of SecurityScannerStackRenewalStateKey(domain), got $KEYUSES — a hand-spelled key on either side is a fire that never clears"
     fi
 
-    if grep -qF 'resolve_alert(' <<< "$STACKFN"; then
+    if grep -qF 'NotificationsResolveAlert(' <<< "$STACKFN"; then
       ok "H8b the stack renewal-success path clears its own alert"
     else
       bad "H8b the stack renewal-success path clears its own alert" \
           "this loop renews and never resolves — the alert escalates every 30 minutes for a week after a success"
     fi
   else
-    bad "H8 renew_stack_certificate body extracted" \
+    bad "H8 securityScannerRenewStackCertificate body extracted" \
         "got $STACKLINES lines, expected >= 40 — the anchor has moved and §H8 is measuring nothing"
   fi
 else
@@ -719,82 +721,85 @@ echo
 echo "== §I  a disabled alert type is not a fired alert =="
 
 if N=$(subj "$NOTIF"); then
-  FIRE2=$(fnbody "$N" try_fire_alert)
+  FIRE2=$(fnbody "$N" NotificationsTryFireAlert)
   FIRELINES=$(grep -c . <<< "$FIRE2")
   if [ "$FIRELINES" -ge 20 ]; then
-    ok "I1 try_fire_alert body extracted — $FIRELINES lines"
+    ok "I1 NotificationsTryFireAlert body extracted — $FIRELINES lines"
 
-    # The signature must carry the answer. `Result<(), String>` cannot express
-    # "nothing was recorded", which is the whole defect.
+    # The signature must carry the answer. `Result<(), String>` (the Rust
+    # original) cannot express "nothing was recorded", which is the whole defect.
     #
-    # ⚠ Read off try_fire_alert's OWN declaration. The first cut was two
-    # independent whole-file greps — `fn try_fire_alert` anywhere and
-    # `Result<bool, String>` anywhere — and a sibling declaration satisfies the
-    # second: changing this function to `Result<u8, String>` while ANY other fn
-    # in the file returns `Result<bool, String>` left the arm green, including
-    # one declared inside `#[cfg(test)]`, which `code()` does not blank. #797.
-    SIG=$(perl -0777 -ne 'print $1 if /fn try_fire_alert\b.*?(\)\s*->\s*[^{]+)\{/s' <<< "$(code "$NOTIF")")
-    if [ -n "$SIG" ] && grep -qE 'Result<bool, String>' <<< "$SIG"; then
-      ok "I2 try_fire_alert's own signature returns whether it recorded anything"
+    # ⚠ Read off NotificationsTryFireAlert's OWN declaration. The first cut was
+    # two independent whole-file greps, and a sibling declaration satisfied the
+    # second. #797.
+    SIG=$(grep -E '^func NotificationsTryFireAlert\(' <<< "$N" | head -1 | sed -E 's/.*\)[[:space:]]*(\([^()]*\))[[:space:]]*\{$/\1/')
+    if [ -n "$SIG" ] && [ "$SIG" = "(bool, error)" ]; then
+      ok "I2 NotificationsTryFireAlert's own signature returns whether it recorded anything"
     else
-      bad "I2 try_fire_alert's own signature returns whether it recorded anything — got '${SIG:-no declaration found}'"
+      bad "I2 NotificationsTryFireAlert's own signature returns whether it recorded anything — got '${SIG:-no declaration found}'"
     fi
 
-    # ⚠ THE POSITIVE HALF. I3 only asserts what must be ABSENT, so a function
-    # that answers `Ok(false)` on EVERY path — nothing ever recorded, the SSL
-    # ladder never advancing, no incident ever raised — satisfied §I completely
-    # and the whole suite stayed 44/0. A guard is not proven by its refusals.
+    # ⚠ THE POSITIVE HALF. I3 only asserts what the disabled path returns, so a
+    # function that answers `false, nil` on EVERY path — nothing ever recorded,
+    # the SSL ladder never advancing, no incident ever raised — would satisfy it.
+    # A guard is not proven by its refusals. (`return false, fmt.Errorf(...)` on
+    # the INSERT's own error path is an error, not a "not recorded" answer.)
     INSLINE=$(grep -nE 'INSERT INTO alerts' <<< "$FIRE2" | head -1 | cut -d: -f1)
-    TRUE_AFTER=$(grep -nE 'Ok\(true\)' <<< "$FIRE2" | awk -F: -v i="${INSLINE:-0}" '$1 > i' | grep -c .)
-    FALSE_AFTER=$(grep -nE 'Ok\(false\)' <<< "$FIRE2" | awk -F: -v i="${INSLINE:-0}" '$1 > i' | grep -c .)
+    TRUE_AFTER=$(grep -nE 'return true, nil$' <<< "$FIRE2" | awk -F: -v i="${INSLINE:-0}" '$1 > i' | grep -c .)
+    FALSE_AFTER=$(grep -nE 'return false, nil$' <<< "$FIRE2" | awk -F: -v i="${INSLINE:-0}" '$1 > i' | grep -c .)
     if [ -n "$INSLINE" ] && [ "$TRUE_AFTER" -ge 1 ] && [ "$FALSE_AFTER" -eq 0 ]; then
       ok "I6 every path past the alerts INSERT reports a real fire ($TRUE_AFTER true, $FALSE_AFTER false)"
     else
-      bad "I6 every path past the alerts INSERT reports a real fire — INSERT at ${INSLINE:-absent}, $TRUE_AFTER Ok(true) and $FALSE_AFTER Ok(false) after it"
+      bad "I6 every path past the alerts INSERT reports a real fire — INSERT at ${INSLINE:-absent}, $TRUE_AFTER 'return true, nil' and $FALSE_AFTER 'return false, nil' after it"
     fi
 
-    # ⚠ Asserted as the ABSENCE of the old value plus the presence of the new
-    # one. Grepping for `is_alert_enabled` would be satisfied by the CALL alone
-    # even if its result were thrown away (#797), and grepping only for
-    # `Ok(false)` would not notice a stray `Ok(())` left on another path.
-    NOUNIT=$(grep -cE 'Ok\(\(\)\)' <<< "$FIRE2")
-    if [ "$NOUNIT" -eq 0 ] && [ "$(grep -cE 'return Ok\(false\)' <<< "$FIRE2")" -ge 1 ]; then
-      ok "I3 no path returns the old unit value — the disabled path returns Ok(false)"
+    # The Rust arm also forbade a leftover `Ok(())`; Go's (bool, error)
+    # signature (I2) makes a unit return uncompilable, so what remains is the
+    # disabled path's own answer. Asserted on the RESULT of the enabled check,
+    # not the call alone — grepping for the call would be satisfied even if
+    # its result were thrown away (#797).
+    if perl -0777 -ne 'exit(/if !NotificationsIsAlertEnabled\([^)]*\) \{\s*return false, nil\s*\}/ ? 0 : 1)' <<< "$FIRE2"; then
+      ok "I3 the disabled path returns false, nil — a suppressed alert does not read as fired"
     else
-      bad "I3 no path returns the old unit value — $NOUNIT Ok(()) still present, so a suppressed alert still reads as fired"
+      bad "I3 the disabled path must return false, nil — a suppressed alert still reads as fired"
     fi
   else
-    for a in I1 I2 I3 I6; do bad "$a try_fire_alert body is too small to test ($FIRELINES lines)"; done
+    for a in I1 I2 I3 I6; do bad "$a NotificationsTryFireAlert body is too small to test ($FIRELINES lines)"; done
   fi
 else
   for a in I1 I2 I3 I6; do bad "$a $NOTIF is readable"; done
 fi
 
 if E=$(subj "$ENGINE"); then
-  RETRY=$(fnbody "$E" fire_alert_with_retry)
+  RETRY=$(fnbody "$E" alertEngineFireAlertWithRetry)
   RETRYLINES=$(grep -c . <<< "$RETRY")
   if [ "$RETRYLINES" -ge 20 ]; then
     # POSITIONAL, not a window (#172): the suppressed arm has to come BEFORE the
     # incident write, or the incident is created either way and the public status
-    # page still publishes an alert the operator switched off.
-    SUPP=$(grep -nE 'Ok\(false\) *=> *return false' <<< "$RETRY" | head -1 | cut -d: -f1)
+    # page still publishes an alert the operator switched off. And it must
+    # return FALSE, not true — read as one block, so a `return true` there
+    # cannot satisfy it.
+    SUPP=$(grep -nE 'if err == nil && !fired \{' <<< "$RETRY" | head -1 | cut -d: -f1)
     INCID=$(grep -nE 'INSERT INTO managed_incidents' <<< "$RETRY" | head -1 | cut -d: -f1)
-    if [ -n "$SUPP" ] && [ -n "$INCID" ] && [ "$SUPP" -lt "$INCID" ]; then
+    if [ -n "$SUPP" ] && [ -n "$INCID" ] && [ "$SUPP" -lt "$INCID" ] \
+       && perl -0777 -ne 'exit(/if err == nil && !fired \{\s*return false\s*\}/ ? 0 : 1)' <<< "$RETRY"; then
       ok "I4 the suppressed arm returns false before any incident is written (line $SUPP < $INCID)"
     else
       bad "I4 the suppressed arm returns false before any incident is written — suppressed at ${SUPP:-absent}, incident at ${INCID:-absent}"
     fi
 
-    # And it must return FALSE, not true: the SSL ladder gates `last_warned_day`
-    # on this answer, so a `true` here consumes a rung for a page that never
-    # went out and `ssl_decision` only ever fires a TIGHTER one afterwards.
-    if grep -qE 'Ok\(true\) *=>' <<< "$RETRY"; then
-      ok "I5 the fired and suppressed cases are distinct match arms"
+    # The SSL ladder gates `last_warned_day` on this answer, so a `true` for
+    # the suppressed case consumes a rung for a page that never went out and
+    # `alertEngineSslDecision` only ever fires a TIGHTER one afterwards. The
+    # fired case is its OWN branch (`if err == nil {` reached only once
+    # `!fired` has returned) and is the one that answers true.
+    if grep -qE '^[[:space:]]*if err == nil \{$' <<< "$RETRY" && grep -qE '^[[:space:]]*return true$' <<< "$RETRY"; then
+      ok "I5 the fired and suppressed cases are distinct branches"
     else
-      bad "I5 the fired and suppressed cases are distinct match arms — a catch-all Ok(_) cannot tell them apart"
+      bad "I5 the fired and suppressed cases are distinct branches — a single err == nil branch cannot tell them apart"
     fi
   else
-    for a in I4 I5; do bad "$a fire_alert_with_retry body is too small to test ($RETRYLINES lines)"; done
+    for a in I4 I5; do bad "$a alertEngineFireAlertWithRetry body is too small to test ($RETRYLINES lines)"; done
   fi
 else
   for a in I4 I5; do bad "$a $ENGINE is readable"; done

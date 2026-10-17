@@ -44,6 +44,15 @@
 #       nothing cannot read as a pass.
 #
 # EVERY ARM IN §A–§G WAS RUN AGAINST v2.81.0 AND REQUIRED TO BE RED.
+#
+# GO PORT: every backend subject is now the Go tree (the Rust panel/{backend,
+# agent} trees are no longer built): panel/go/internal/api/rt_*.go / svc_*.go /
+# migrations, and panel/go/internal/agent/{routes/terminal.go,
+# services/command_filter.go}. Function names follow PORTING.md
+# (users::remove → rtUsersRemove, services::drift::build_report →
+# DriftBuildReport, …). Rust `.bind(a).bind(b)` order becomes Go's positional
+# argument list after the SQL string; `#[serde(skip_serializing)]` becomes
+# `json:"-"`; `claims.role`/`claims.sub` become `c.Role`/`claims.Sub`.
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
@@ -80,7 +89,8 @@ has() { grep -qE -- "$2" <<< "$1"; }
 
 # Collapse to one line: grep is line-oriented, so an arm pinning a multi-line SQL
 # string or an ordered pair of builder calls needs the newlines gone.
-flat() { tr '\n' ' ' <<< "$1" | tr -s ' '; }
+# Go indents with tabs, so tabs are folded into the single space too.
+flat() { tr '\n' ' ' <<< "$1" | tr -s ' \t' ' '; }
 
 # Brace depth immediately BEFORE the first occurrence of fixed-string $2 in
 # flattened body $1. Depth 1 = a top-level statement directly inside the
@@ -106,7 +116,7 @@ depth_before() {
 # braces instead and stops at depth 0.
 fnbody() {
   awk -v fn="$2" '
-    index($0, "fn " fn) && !started { started=1 }
+    !started && (index($0, "func " fn "(") || $0 ~ ("^func [(][^)]*[)] " fn "[(]")) { started=1 }
     started {
       n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
       if (opened || n>0) opened=1
@@ -115,17 +125,18 @@ fnbody() {
   ' <<< "$1"
 }
 
-USERS=panel/backend/src/routes/users.rs
-SERVERS=panel/backend/src/routes/servers.rs
-SITES=panel/backend/src/routes/sites.rs
-DASH=panel/backend/src/routes/dashboard.rs
-DRIFT=panel/backend/src/routes/drift.rs
-DRIFT_SVC=panel/backend/src/services/drift.rs
-ALERTS=panel/backend/src/routes/alerts.rs
-FILTER=panel/agent/src/services/command_filter.rs
-MONITORS=panel/backend/src/routes/monitors.rs
-RESELLER=panel/backend/src/routes/reseller_dashboard.rs
-AUTH=panel/backend/src/routes/auth.rs
+API=panel/go/internal/api
+USERS=$API/rt_users.go
+SERVERS=$API/rt_servers.go
+SITES=$API/rt_sites.go
+DASH=$API/rt_dashboard.go
+DRIFT=$API/rt_drift.go
+DRIFT_SVC=$API/svc_drift.go
+ALERTS=$API/rt_alerts.go
+FILTER=panel/go/internal/agent/services/command_filter.go
+MONITORS=$API/rt_monitors.go
+RESELLER=$API/rt_reseller_dashboard.go
+AUTH=$API/rt_auth.go
 LAYOUT=panel/frontend/src/hooks/useLayoutState.ts
 SITESTSX=panel/frontend/src/pages/Sites.tsx
 DETAIL=panel/frontend/src/pages/SiteDetail.tsx
@@ -138,7 +149,7 @@ done
 # ── §A  deleting an account must not delete a server's sites ──────────────────
 
 USERS_SRC=$(code "$USERS")
-REMOVE=$(flat "$(fnbody "$USERS_SRC" "remove")")
+REMOVE=$(flat "$(fnbody "$USERS_SRC" "rtUsersRemove")")
 
 if [ -z "$REMOVE" ]; then
   bad "A0 could not extract users::remove — the extractor is broken, not the tree"
@@ -166,7 +177,8 @@ else
 
   # A3 — one transaction. Two statements that can half-apply are how a machine
   # ends up owned by a user row that no longer exists.
-  if has "$REMOVE" '\.begin\(\)' && has "$REMOVE" '\.commit\(\)'; then
+  if has "$REMOVE" 'tx, err := st\.DB\.Begin\(ctx\)' && has "$REMOVE" 'tx\.Commit\(ctx\)' \
+     && has "$REMOVE" 'execSQL\(ctx, tx, "UPDATE servers SET user_id' && has "$REMOVE" 'execSQL\(ctx, tx, "DELETE FROM users'; then
     ok "A3 the re-point and the delete share one transaction"
   else
     bad "A3 users::remove does not wrap the re-point + delete in a transaction"
@@ -184,7 +196,7 @@ fi
 # A5 — THE SCHEMA CLAIM THIS ALL RESTS ON. If either edge stops being CASCADE the
 # arms above are pinning a fix for a defect that no longer exists, and this arm is
 # how the next reader finds that out instead of assuming.
-MIG=$(cat panel/backend/migrations/*.sql 2>/dev/null)
+MIG=$(cat $API/migrations/*.sql 2>/dev/null)
 if grep -qE 'user_id UUID NOT NULL REFERENCES users\(id\) ON DELETE CASCADE' <<< "$MIG" \
    && grep -qE 'sites ADD COLUMN IF NOT EXISTS server_id UUID REFERENCES servers\(id\) ON DELETE CASCADE' <<< "$MIG"; then
   ok "A5 both cascade edges are still in the schema (users→servers→sites)"
@@ -195,7 +207,7 @@ fi
 # ── §B  a second administrator can see the machines ───────────────────────────
 
 SERVERS_SRC=$(code "$SERVERS")
-SLIST=$(flat "$(fnbody "$SERVERS_SRC" "list")")
+SLIST=$(flat "$(fnbody "$SERVERS_SRC" "rtServersList")")
 
 if [ -z "$SLIST" ]; then
   bad "B0 could not extract servers::list"
@@ -210,7 +222,7 @@ else
   else
     bad "B1 servers::list's WHERE clause is neither the old shape nor the pinned one — re-read it"
   fi
-  if has "$SLIST" 'claims\.role == "admin"'; then
+  if has "$SLIST" 'c\.Sub, c\.Role == "admin"\)'; then
     ok "B2 the widening is bound to the admin role, not to a bare truth"
   else
     bad "B2 servers::list widened without binding the condition to the admin role"
@@ -219,7 +231,10 @@ fi
 
 # B3 — THE WIDENING MUST NOT LEAK THE AGENT TOKEN. `SELECT *` feeds this struct,
 # and the agent token is root on the agent (the terminal ticket is signed with it).
-if has "$(flat "$(code "$SERVERS")")" 'serde\(skip_serializing\)\] +pub agent_token'; then
+# Go: the list scans into rtServersServer, so its AgentToken must be `json:"-"`.
+SRV_STRUCT=$(flat "$(sed -n '/^type rtServersServer struct/,/^}/p' <<< "$SERVERS_SRC")")
+if [ -n "$SRV_STRUCT" ] && has "$SLIST" 'queryAll\[rtServersServer\]' \
+   && has "$SRV_STRUCT" 'AgentToken string `json:"-" db:"agent_token"`'; then
   ok "B3 Server::agent_token is still skip_serializing — widening the list cannot disclose it"
 else
   bad "B3 Server::agent_token is no longer skip_serializing — a widened list would hand out the agent's root credential"
@@ -228,7 +243,7 @@ fi
 # ── §C  transfer moves the staging child ──────────────────────────────────────
 
 SITES_SRC=$(code "$SITES")
-XFER=$(flat "$(fnbody "$SITES_SRC" "transfer")")
+XFER=$(flat "$(fnbody "$SITES_SRC" "rtSitesTransfer")")
 
 if [ -z "$XFER" ] || ! has "$XFER" 'UPDATE sites SET user_id'; then
   bad "C0 could not extract sites::transfer with its UPDATE"
@@ -251,6 +266,7 @@ else
 fi
 
 # C3 — THE CONSTANT THAT CLAIMS TO BE DERIVED. `OWNERSHIP_DENORMALIZED_TABLES`
+# (Go: `rtSitesOwnershipDenormalizedTables`)
 # says it is "every table in the schema carrying BOTH columns". Derive that set
 # from the migrations and require the constant to equal it, so the claim cannot
 # quietly become false when a migration adds a table.
@@ -271,7 +287,7 @@ DERIVED=$(perl -0777 -ne '
 # harvesting the JSON keys of the response (`dependent_rows_moved`, `new_owner`,
 # `previous_owner`, …) as though they were table names. That printed a confident
 # RED against a correct tree. Take the FIRST block only.
-DECLARED=$(awk '/OWNERSHIP_DENORMALIZED_TABLES/ { inblk=1 } inblk { print; if (/\];/) exit }' "$SITES" \
+DECLARED=$(awk '/^var rtSitesOwnershipDenormalizedTables/ { inblk=1 } inblk { print; if (/\}/) exit }' "$SITES" \
            | grep -oE '"[a-z_]+"' | tr -d '"' | sort -u | tr '\n' ' ')
 if [ -z "$DERIVED" ]; then
   bad "C3 derived ZERO tables carrying both user_id and site_id — the deriver is broken, not the tree"
@@ -283,29 +299,16 @@ fi
 
 # ── §D  the site shell's cross-site guard ─────────────────────────────────────
 
-FILTER_SRC=$(code "$FILTER")
-TERMPAT=$(flat "$(sed -n '/TERMINAL_BLOCKED_PATTERNS/,/^\];/p' <<< "$FILTER_SRC")")
-
-if [ -z "$TERMPAT" ]; then
-  bad "D0 could not extract TERMINAL_BLOCKED_PATTERNS"
-else
-  ok "D0 TERMINAL_BLOCKED_PATTERNS extracted"
-  if has "$TERMPAT" '"/var/www/"'; then
-    ok "D1 the absolute cross-site spelling is still blocked"
-  else
-    bad "D1 /var/www/ is no longer blocked in the site terminal"
-  fi
-  if has "$TERMPAT" '"\.\."'; then
-    ok "D2 the relative spelling is blocked too"
-  else
-    bad "D2 '..' is not blocked — cat ../other-site/wp-config.php walks past the /var/www/ pattern from a cwd inside /var/www"
-  fi
-fi
+# D0 retired: covered by TestCommandFilterSafeTerminalCommands (panel/go/internal/agent/services/command_filter_test.go) — the Go pattern list is exercised directly, not extracted
+# D1 retired: covered by TestCommandFilterSafeTerminalCommands (panel/go/internal/agent/services/command_filter_test.go) — "ls /var/www/other" is refused
+# D2 retired: covered by TestCommandFilterSafeTerminalCommands (panel/go/internal/agent/services/command_filter_test.go) — "cat ../other.com/wp-config.php" and "cd .." are refused
+[ -f "$FILTER" ] || bad "D0b command_filter.go missing — the retired D0-D2 tests have no subject"
 
 # D3 — the guard applies to SITE terminals only. If this ever stops being true an
 # administrator's server shell loses `cd ..`, which is a real regression in the
 # opposite direction.
-TERM_RS=panel/agent/src/routes/terminal.rs
+TERM_RS=panel/go/internal/agent/routes/terminal.go
+TERM_GO=$(code "$TERM_RS")
 # ⚠ NOT a count of `is_site_terminal` mentions anywhere in the file. That was the
 # first draft and a mutation SURVIVED it: replacing one call site's `is_site_terminal`
 # with `true` dropped the file-wide count 3 -> 2, which still satisfied
@@ -319,13 +322,14 @@ TERM_RS=panel/agent/src/routes/terminal.rs
 # "extracting a helper moves the subject of every pin that measured it". The arm
 # follows the code, and D3b below is the companion that lesson demands — the one
 # that proves the ORIGINAL callers still REACH the helper, so the gate cannot be
-# quietly reintroduced per-branch.
-N_CALLS=$(grep -c 'is_safe_terminal_command' "$TERM_RS")
+# quietly reintroduced per-branch. (Go: observe_input → terminalObserveInput,
+# is_site_terminal → isSite, the filter → services.CommandFilterIsSafeTerminalCommand.)
+N_CALLS=$(grep -c 'CommandFilterIsSafeTerminalCommand' <<< "$TERM_GO")
 # The block check must live in ONE place and be gated on the SAME line, so there
 # is no window between the gate and the check for a later edit to slip into.
 if [ "$N_CALLS" -ne 1 ]; then
   bad "D3 expected exactly 1 is_safe_terminal_command call site, found $N_CALLS — the reader or the shape changed"
-elif grep -qE 'is_site_terminal && !command_filter::is_safe_terminal_command' "$TERM_RS"; then
+elif grep -qE 'if isSite && !services\.CommandFilterIsSafeTerminalCommand\(line\)' <<< "$TERM_GO"; then
   ok "D3 the single is_safe_terminal_command call is gated on is_site_terminal in the same condition"
 else
   bad "D3 the block check is no longer gated on is_site_terminal — an administrator's SERVER shell would lose 'cd ..'"
@@ -336,12 +340,15 @@ fi
 # arm did not, so the ONE input path with no detection was the one the product's
 # own UI never uses and only a scripted client takes. A unit test cannot see this
 # — it calls `observe_input` directly and would stay green with a branch reverted.
-N_OBSERVE=$(grep -c 'observe_input(' "$TERM_RS")
-# 1 declaration + 2 call sites (+ the test helpers, which live in the same file).
-N_OBSERVE_CALLS=$(grep -cE '= observe_input\(&?(data|text),' "$TERM_RS")
+# Go shape: ONE call of terminalObserveInput, inside the `forward` closure, and
+# both input arms (raw text frame, JSON {type:input} frame) go through forward.
+# The test helpers live in terminal_test.go, so this file holds only real calls.
+N_OBSERVE=$(grep -c 'terminalObserveInput(' <<< "$TERM_GO")
+N_OBSERVE_FWD=$(grep -cE 'seen := terminalObserveInput\(data, &cmdBuffer, isSite\)' <<< "$TERM_GO")
+N_OBSERVE_CALLS=$(grep -cE '!forward\((data|text)\)' <<< "$TERM_GO")
 if [ "$N_OBSERVE" -lt 2 ]; then
-  bad "D3b observe_input is not present in $TERM_RS — the reader is broken, not the tree"
-elif [ "$N_OBSERVE_CALLS" -eq 2 ]; then
+  bad "D3b terminalObserveInput is not present in $TERM_RS — the reader is broken, not the tree"
+elif [ "$N_OBSERVE" -eq 2 ] && [ "$N_OBSERVE_FWD" -eq 1 ] && [ "$N_OBSERVE_CALLS" -eq 2 ]; then
   ok "D3b both input arms (JSON frame and raw text) reach the single observe_input path"
 else
   bad "D3b $N_OBSERVE_CALLS of 2 input arms reach observe_input — a frame shape is being classified differently again"
@@ -362,10 +369,10 @@ while read -r fn; do
   # names the column in an INSERT column list instead — so the first draft of this
   # arm censused 3 of 4 and reported the extractor broken. Membership is "the SQL
   # names user_id AND the handler binds its own caller", which both forms satisfy.
-  { has "$B" 'user_id' && has "$B" 'claims\.sub'; } || continue
+  { has "$B" 'user_id' && has "$B" 'claims\.Sub'; } || continue
   E_N=$((E_N+1))
-  has "$B" 'require_admin' && E_VIOL=$((E_VIOL+1)) && printf '%s\n' "$fn" >> /tmp/.s324_e_viol
-done < <(printf '%s\n' certificate_dashboard create_maintenance list_maintenance delete_maintenance)
+  { has "$B" 'requireAdmin\(' || has "$B" 'st\.adminUser\('; } && E_VIOL=$((E_VIOL+1)) && printf '%s\n' "$fn" >> /tmp/.s324_e_viol
+done < <(printf '%s\n' rtMonitorsCertificateDashboard rtMonitorsCreateMaintenance rtMonitorsListMaintenance rtMonitorsDeleteMaintenance)
 
 if [ "$E_N" -lt 4 ]; then
   bad "E0 censused only $E_N of 4 user-scoped monitors handlers — the extractor is broken, not the tree"
@@ -374,7 +381,7 @@ elif [ "$E_VIOL" -eq 0 ]; then
 else
   while read -r fn; do
     [ -n "$fn" ] || continue
-    bad "E1 monitors::$fn gates with require_admin over SQL already scoped WHERE user_id = \$1 — it refuses a caller their own rows"
+    bad "E1 $fn gates with requireAdmin over SQL already scoped WHERE user_id = \$1 — it refuses a caller their own rows"
   done < <(cat /tmp/.s324_e_viol 2>/dev/null)
 fi
 rm -f /tmp/.s324_e_viol
@@ -399,7 +406,7 @@ fi
 # into surrounding code containing `claims.role == "admin"` — so the arm reported
 # that the allow-list names a privileged role when the declaration names three
 # unprivileged ones. First block only, and it must be the `const` line.
-ALLOW=$(awk '/const RESELLER_MANAGEABLE_ROLES/ { inblk=1 } inblk { print; if (/;/) exit }' <<< "$RES_SRC" | tr '\n' ' ')
+ALLOW=$(awk '/^var rtResellerDashboardManageableRoles = / { inblk=1 } inblk { print; if (/\}/) exit }' <<< "$RES_SRC" | tr '\n' ' ')
 if [ -z "$ALLOW" ]; then
   bad "F2 RESELLER_MANAGEABLE_ROLES not found"
 elif has "$ALLOW" '"admin"' || has "$ALLOW" '"reseller"'; then
@@ -413,7 +420,8 @@ fi
 # F3 — the two halves must agree. `list_users` scoping on reseller_id alone is
 # fine ONLY while the action predicate covers what it lists; this arm is what
 # makes them one decision instead of two.
-LIST_U=$(flat "$(fnbody "$RES_SRC" "list_users")")
+LIST_U=$(flat "$(fnbody "$RES_SRC" "rtResellerDashboardListUsers")")
+[ -n "$LIST_U" ] && has "$LIST_U" 'reseller_id' || bad "F3-control could not extract rtResellerDashboardListUsers — F3's absence check is vacuous"
 if has "$LIST_U" "role = 'user'"; then
   bad "F3 list_users now filters by role while the action predicate uses an allow-list — the two halves have drifted again, in the other direction"
 else
@@ -465,7 +473,7 @@ else
   bad "G4 2FA enforcement is read from neither shape — re-read it"
 fi
 
-if has "$(flat "$(fnbody "$(code "$AUTH")" "twofa_status")")" 'enforced'; then
+if has "$(flat "$(fnbody "$(code "$AUTH")" "rtAuthTwofaStatus")")" '"enforced"'; then
   ok "G5 twofa_status serves the enforcement flag it is read from"
 else
   bad "G5 twofa_status does not return 'enforced' — G4's reader has no writer"
@@ -480,7 +488,7 @@ fi
 # ONE dashboard route whose entire purpose is showing an admin every server.
 
 DASH_SRC=$(code "$DASH")
-FLEET=$(flat "$(fnbody "$DASH_SRC" "fleet_overview")")
+FLEET=$(flat "$(fnbody "$DASH_SRC" "rtDashboardFleetOverview")")
 
 if [ -z "$FLEET" ]; then
   bad "I0 could not extract dashboard::fleet_overview"
@@ -501,7 +509,7 @@ else
   # Negative control: this route takes ONLY AdminUser (unlike servers::list,
   # which serves both roles and needs the bound `$2 OR` widening) — so a
   # correct fix has no reason to bind claims.sub into either query at all.
-  if has "$FLEET" '\.bind\(claims\.sub\)'; then
+  if has "$FLEET" '\b(claims|c)\.Sub\b'; then
     bad "I3 fleet_overview still binds claims.sub into a query — the widening is incomplete"
   else
     ok "I3 no query in fleet_overview binds claims.sub — genuinely fleet-wide, not a hidden per-admin filter"
@@ -515,8 +523,8 @@ fi
 # `AdminUser`-only, same fix shape as `fleet_overview`: drop the filter.
 
 DRIFT_SRC=$(code "$DRIFT")
-DSERVERS=$(flat "$(fnbody "$DRIFT_SRC" "servers")")
-DREPORT=$(flat "$(fnbody "$DRIFT_SRC" "report")")
+DSERVERS=$(flat "$(fnbody "$DRIFT_SRC" "rtDriftServers")")
+DREPORT=$(flat "$(fnbody "$DRIFT_SRC" "rtDriftReport")")
 
 if [ -z "$DSERVERS" ]; then
   bad "J0 could not extract drift::servers"
@@ -544,7 +552,7 @@ else
   fi
   # J4 — negative control, same reasoning as I3: an AdminUser-only route has
   # no reason to bind a caller id into a query at all.
-  if has "$DREPORT" '\.bind\(claims\.sub\)' || has "$DREPORT" '\.bind\(user_id\)'; then
+  if has "$DREPORT" '\b(claims|c)\.Sub\b' || has "$DREPORT" '\buserID\b'; then
     bad "J4 drift::report still binds a caller id into a query — the widening is incomplete"
   else
     ok "J4 no query in drift::report binds a caller id — genuinely fleet-wide"
@@ -557,13 +565,13 @@ fi
 # (§J), which is `AdminUser`-gated — so there is no narrower case to preserve.
 
 DRIFT_SVC_SRC=$(code "$DRIFT_SVC")
-BUILD_REPORT=$(flat "$(fnbody "$DRIFT_SVC_SRC" "build_report")")
+BUILD_REPORT=$(flat "$(fnbody "$DRIFT_SVC_SRC" "DriftBuildReport")")
 
 if [ -z "$BUILD_REPORT" ]; then
   bad "K0 could not extract services::drift::build_report"
 else
   ok "K0 services::drift::build_report extracted"
-  if has "$BUILD_REPORT" 'user_id: *Uuid'; then
+  if has "$BUILD_REPORT" '^func DriftBuildReport\([^)]*\b(userID|ownerID|callerID) +uuid\.UUID'; then
     bad "K1 build_report still takes a user_id parameter — a caller-scoped id has no reason to exist on an AdminUser-only call chain"
   else
     ok "K1 build_report no longer takes a user_id parameter"
@@ -586,7 +594,7 @@ while read -r fn; do
     K_VIOL=$((K_VIOL+1))
     printf '%s\n' "$fn" >> /tmp/.s432_k_viol
   fi
-done < <(printf '%s\n' fetch_server_meta fetch_alert_rules fetch_sites fetch_crons fetch_backup_coverage)
+done < <(printf '%s\n' driftFetchServerMeta driftFetchAlertRules driftFetchSites driftFetchCrons driftFetchBackupCoverage)
 
 if [ "$K_N" -ne 5 ]; then
   bad "K2 censused only $K_N of 5 drift report fetchers — the extractor is broken, not the tree"
@@ -608,7 +616,8 @@ rm -f /tmp/.s432_k_viol
 # role, so the fix is `dashboard::intelligence`'s own conditional-widen idiom
 # (a bound `$N::uuid IS NULL OR` predicate) rather than an unconditional drop.
 
-MHIST=$(flat "$(fnbody "$DASH_SRC" "metrics_history")")
+MHIST=$(flat "$(fnbody "$DASH_SRC" "rtDashboardMetricsHistory")")
+TENANT_FN=$(flat "$(fnbody "$DASH_SRC" "rtDashboardTenant")")
 
 if [ -z "$MHIST" ]; then
   bad "L0 could not extract dashboard::metrics_history"
@@ -621,19 +630,22 @@ else
   else
     bad "L1 metrics_history's server subquery matches neither shape — re-read it"
   fi
-  if has "$MHIST" 'claims\.role == "admin"'; then
+  # Go: the role decision lives in rtDashboardTenant (nil for an admin, the
+  # caller's own id otherwise), so the arm needs BOTH halves: this handler
+  # binds that helper's value, and the helper keys on the admin role.
+  if has "$MHIST" 'rtDashboardTenant\(c\)' && has "$TENANT_FN" 'if c\.Role == "admin" \{ return nil \} return &c\.Sub'; then
     ok "L2 metrics_history's tenant scope is bound to the admin role"
   else
     bad "L2 metrics_history widened without binding the condition to the admin role"
   fi
-  if has "$MHIST" '\.bind\(claims\.sub\)'; then
+  if has "$MHIST" '\b(claims|c)\.Sub\b'; then
     bad "L2b metrics_history still binds claims.sub directly — the widening is incomplete"
   else
     ok "L2b metrics_history binds only the derived tenant value, not claims.sub directly"
   fi
 fi
 
-GHIST=$(flat "$(fnbody "$DASH_SRC" "gpu_metrics_history")")
+GHIST=$(flat "$(fnbody "$DASH_SRC" "rtDashboardGpuMetricsHistory")")
 
 if [ -z "$GHIST" ]; then
   bad "L3 could not extract dashboard::gpu_metrics_history"
@@ -646,20 +658,20 @@ else
   else
     bad "L4 gpu_metrics_history's server subquery matches neither shape — re-read it"
   fi
-  if has "$GHIST" '\.bind\(claims\.sub\)'; then
+  if has "$GHIST" '\b(claims|c)\.Sub\b' || ! has "$GHIST" 'rtDashboardTenant\(c\)'; then
     bad "L4b gpu_metrics_history still binds claims.sub directly — the widening is incomplete"
   else
     ok "L4b gpu_metrics_history binds only the derived tenant value, not claims.sub directly"
   fi
 fi
 
-TIMELINE=$(flat "$(fnbody "$DASH_SRC" "timeline")")
+TIMELINE=$(flat "$(fnbody "$DASH_SRC" "rtDashboardTimeline")")
 
 if [ -z "$TIMELINE" ]; then
   bad "L5 could not extract dashboard::timeline"
 else
   ok "L5 dashboard::timeline extracted"
-  if has "$TIMELINE" 'claims\.role == "admin"'; then
+  if has "$TIMELINE" 'tenant := rtDashboardTenant\(c\)' && has "$TENANT_FN" 'if c\.Role == "admin" \{ return nil \}'; then
     ok "L6 timeline's tenant scope is bound to the admin role"
   else
     bad "L6 timeline widened without binding the condition to the admin role"
@@ -682,7 +694,7 @@ else
   fi
   # L9 — negative control, same reasoning as I3/J4: only the derived `tenant`
   # value may be bound now, never claims.sub directly.
-  if has "$TIMELINE" '\.bind\(claims\.sub\)'; then
+  if has "$TIMELINE" '\b(claims|c)\.Sub\b'; then
     bad "L9 timeline still binds claims.sub directly into a query — the widening is incomplete"
   else
     ok "L9 timeline binds only the derived tenant value, not claims.sub directly"
@@ -700,7 +712,7 @@ fi
 # to defend against exactly this stray row, §K, s432).
 
 ALERTS_SRC=$(code "$ALERTS")
-USRV=$(flat "$(fnbody "$ALERTS_SRC" "update_server_rules")")
+USRV=$(flat "$(fnbody "$ALERTS_SRC" "rtAlertsUpdateServerRules")")
 
 if [ -z "$USRV" ]; then
   bad "M0 could not extract alerts::update_server_rules"
@@ -714,28 +726,28 @@ else
   # M2 — ORDER. The ownership check must precede the write, or a stray row
   # can still be created before the check ever runs.
   CHK_AT=$(grep -bo 'FROM servers WHERE id = \$1 AND user_id = \$2' <<< "$USRV" | head -1 | cut -d: -f1)
-  UPS_AT=$(grep -bo 'upsert_rules(&state' <<< "$USRV" | head -1 | cut -d: -f1)
+  UPS_AT=$(grep -bo 'rtAlertsUpsertRules(st' <<< "$USRV" | head -1 | cut -d: -f1)
   if [ -n "$CHK_AT" ] && [ -n "$UPS_AT" ] && [ "$CHK_AT" -lt "$UPS_AT" ]; then
     ok "M2 the ownership check precedes the write"
   else
     bad "M2 the ownership check does not precede the write (check@${CHK_AT:-none} write@${UPS_AT:-none})"
   fi
-  if has "$USRV" 'owns\.is_none\(\)' && has "$USRV" 'NOT_FOUND'; then
+  if has "$USRV" 'if owns == nil \{ return apiErr\(http\.StatusNotFound'; then
     ok "M3 a non-owned/nonexistent server_id is rejected, not silently accepted"
   else
     bad "M3 update_server_rules performs the ownership lookup but never rejects on failure"
   fi
   # M2b — BIND ORDER for the ownership query specifically ($1=id must bind
-  # server_id, $2=user_id must bind claims.sub). Swapping the two .bind()
-  # calls leaves the pinned SQL string and M1/M2/M3 all unchanged — the
-  # query would compare $1 (id) against the CALLER's own id and $2 (user_id)
-  # against the TARGET server_id, which is not the check this claims to be.
-  BS_AT=$(grep -boF -- '.bind(server_id)' <<< "$USRV" | head -1 | cut -d: -f1)
-  BC_AT=$(grep -boF -- '.bind(claims.sub)' <<< "$USRV" | head -1 | cut -d: -f1)
-  if [ -n "$BS_AT" ] && [ -n "$BC_AT" ] && [ "$BS_AT" -lt "$BC_AT" ]; then
+  # server_id, $2=user_id must bind claims.sub). Swapping the two arguments
+  # leaves the pinned SQL string and M1/M2/M3 all unchanged — the query would
+  # compare $1 (id) against the CALLER's own id and $2 (user_id) against the
+  # TARGET server_id, which is not the check this claims to be. Go binds
+  # positionally, right after the SQL string.
+  BS_AT=$(grep -boF -- 'user_id = $2", serverID, claims.Sub)' <<< "$USRV" | head -1 | cut -d: -f1)
+  if [ -n "$BS_AT" ]; then
     ok "M2b bind order is server_id then claims.sub, matching \$1=id \$2=user_id"
   else
-    bad "M2b bind order is wrong or missing (server_id@${BS_AT:-none} claims.sub@${BC_AT:-none}) — \$1/\$2 would compare the wrong columns"
+    bad "M2b bind order is wrong or missing (the args after the ownership SQL are not serverID, claims.Sub) — \$1/\$2 would compare the wrong columns"
   fi
   # M2c — LIVENESS. A text-presence-and-ordering check (M1-M3, M2b) cannot
   # tell live code from the identical text sitting inside a dead branch —
@@ -751,7 +763,7 @@ else
   fi
 fi
 
-DSRV=$(flat "$(fnbody "$ALERTS_SRC" "delete_server_rules")")
+DSRV=$(flat "$(fnbody "$ALERTS_SRC" "rtAlertsDeleteServerRules")")
 
 if [ -z "$DSRV" ]; then
   bad "M4 could not extract alerts::delete_server_rules"
@@ -769,19 +781,18 @@ else
   else
     bad "M6 the ownership check does not precede the delete (check@${CHK_AT2:-none} delete@${DEL_AT2:-none})"
   fi
-  if has "$DSRV" 'owns\.is_none\(\)' && has "$DSRV" 'NOT_FOUND'; then
+  if has "$DSRV" 'if owns == nil \{ return apiErr\(http\.StatusNotFound'; then
     ok "M7 a non-owned/nonexistent server_id is rejected, not silently answered ok:true"
   else
     bad "M7 delete_server_rules performs the ownership lookup but never rejects on failure"
   fi
   # M6b/M6c — same bind-order and liveness checks as M2b/M2c above, applied
   # to delete_server_rules's own ownership check.
-  BS_AT2=$(grep -boF -- '.bind(server_id)' <<< "$DSRV" | head -1 | cut -d: -f1)
-  BC_AT2=$(grep -boF -- '.bind(claims.sub)' <<< "$DSRV" | head -1 | cut -d: -f1)
-  if [ -n "$BS_AT2" ] && [ -n "$BC_AT2" ] && [ "$BS_AT2" -lt "$BC_AT2" ]; then
+  BS_AT2=$(grep -boF -- 'user_id = $2", serverID, claims.Sub)' <<< "$DSRV" | head -1 | cut -d: -f1)
+  if [ -n "$BS_AT2" ]; then
     ok "M6b bind order is server_id then claims.sub, matching \$1=id \$2=user_id"
   else
-    bad "M6b bind order is wrong or missing (server_id@${BS_AT2:-none} claims.sub@${BC_AT2:-none}) — \$1/\$2 would compare the wrong columns"
+    bad "M6b bind order is wrong or missing (the args after the ownership SQL are not serverID, claims.Sub) — \$1/\$2 would compare the wrong columns"
   fi
   D_CHK2=$(depth_before "$DSRV" 'FROM servers WHERE id = $1 AND user_id = $2')
   if [ "$D_CHK2" = "1" ]; then
@@ -794,8 +805,8 @@ fi
 # M8 — negative control: the GLOBAL list route (no server_id in the URL) is
 # unaffected and stays scoped to the caller's own rows — this fix must not
 # have widened or narrowed it.
-GRULES=$(flat "$(fnbody "$ALERTS_SRC" "get_rules")")
-if has "$GRULES" 'WHERE user_id = \$1 ORDER BY server_id'; then
+GRULES=$(flat "$(fnbody "$ALERTS_SRC" "rtAlertsGetRules")")
+if has "$GRULES" 'WHERE user_id = \$1 ORDER BY server_id NULLS FIRST LIMIT 500", claims\.Sub\)'; then
   ok "M8 alerts::get_rules (the global list) is unchanged — still scoped to the caller's own rows"
 else
   bad "M8 alerts::get_rules no longer matches its known shape — re-read it, this fix should not have touched it"
@@ -807,53 +818,53 @@ fi
 # as §M: a single resource resolved by a caller-supplied ID never widens for
 # admin, admin included.
 
-ON_CALL=panel/backend/src/routes/on_call.rs
+ON_CALL=$API/rt_on_call.go
 [ -f "$ON_CALL" ] || bad "SETUP subject missing: $ON_CALL"
 ON_CALL_SRC=$(code "$ON_CALL")
 
-NLIST=$(flat "$(fnbody "$ON_CALL_SRC" "list_schedules")")
-if has "$NLIST" 'FROM on_call_schedules WHERE user_id = \$1 ORDER BY name ASC' && has "$NLIST" '\.bind\(claims\.sub\)'; then
+NLIST=$(flat "$(fnbody "$ON_CALL_SRC" "rtOnCallListSchedules")")
+if has "$NLIST" 'FROM on_call_schedules WHERE user_id = \$1 ORDER BY name ASC", claims\.Sub\)'; then
   ok "N0 on_call::list_schedules is scoped to the caller's own rows"
 else
   bad "N0 on_call::list_schedules no longer matches its known scoped shape"
 fi
 
-NGET=$(flat "$(fnbody "$ON_CALL_SRC" "get_schedule")")
+NGET=$(flat "$(fnbody "$ON_CALL_SRC" "rtOnCallGetSchedule")")
 if has "$NGET" 'FROM on_call_schedules WHERE id = \$1 AND user_id = \$2'; then
   ok "N1 on_call::get_schedule checks the caller owns the schedule"
 else
   bad "N1 on_call::get_schedule has no ownership check — any admin could fetch any tenant's schedule"
 fi
-BID_AT=$(grep -boF -- '.bind(id)' <<< "$NGET" | head -1 | cut -d: -f1)
-BCS_AT=$(grep -boF -- '.bind(claims.sub)' <<< "$NGET" | head -1 | cut -d: -f1)
-if [ -n "$BID_AT" ] && [ -n "$BCS_AT" ] && [ "$BID_AT" -lt "$BCS_AT" ]; then
+BID_AT=$(grep -boF -- 'user_id = $2", id, claims.Sub)' <<< "$NGET" | head -1 | cut -d: -f1)
+if [ -n "$BID_AT" ]; then
   ok "N1b bind order is id then claims.sub, matching \$1=id \$2=user_id"
 else
-  bad "N1b bind order is wrong or missing (id@${BID_AT:-none} claims.sub@${BCS_AT:-none})"
+  bad "N1b bind order is wrong or missing (the args after the ownership SQL are not id, claims.Sub)"
 fi
 
-NCREATE=$(flat "$(fnbody "$ON_CALL_SRC" "create_schedule")")
+NCREATE=$(flat "$(fnbody "$ON_CALL_SRC" "rtOnCallCreateSchedule")")
 if has "$NCREATE" 'INSERT INTO on_call_schedules \(user_id, name, members, cadence_days, anchor_at\)' \
-   && has "$NCREATE" '\.bind\(claims\.sub\)\s*\.bind\(input\.name\.trim\(\)\)'; then
+   && has "$NCREATE" '", claims\.Sub, strings\.TrimSpace\(input\.Name\),'; then
   ok "N2 on_call::create_schedule stamps the creating admin's own user_id, bound first"
 else
   bad "N2 on_call::create_schedule no longer inserts/binds user_id as \$1"
 fi
 
-NUPDATE=$(flat "$(fnbody "$ON_CALL_SRC" "update_schedule")")
+NUPDATE=$(flat "$(fnbody "$ON_CALL_SRC" "rtOnCallUpdateSchedule")")
 if has "$NUPDATE" 'WHERE id = \$1 AND user_id = \$6' && has "$NUPDATE" 'WHERE id = \$1 AND user_id = \$5'; then
   ok "N3 on_call::update_schedule scopes BOTH the with-anchor and no-anchor branches"
 else
   bad "N3 on_call::update_schedule is missing the ownership scope on one or both branches"
 fi
-CS_COUNT=$(grep -o '\.bind(claims\.sub)' <<< "$NUPDATE" | wc -l)
+# Go: the caller's id is the LAST positional argument of each branch's UPDATE.
+CS_COUNT=$(grep -oE 'input\.CadenceDays, (\*input\.AnchorAt, )?claims\.Sub\)' <<< "$NUPDATE" | wc -l)
 if [ "$CS_COUNT" -eq 2 ]; then
   ok "N3b claims.sub is bound in BOTH update_schedule branches (found $CS_COUNT)"
 else
   bad "N3b expected claims.sub bound exactly twice in update_schedule, found $CS_COUNT — a branch may have lost its scope"
 fi
 
-NDELETE=$(flat "$(fnbody "$ON_CALL_SRC" "delete_schedule")")
+NDELETE=$(flat "$(fnbody "$ON_CALL_SRC" "rtOnCallDeleteSchedule")")
 if has "$NDELETE" 'DELETE FROM on_call_schedules WHERE id = \$1 AND user_id = \$2'; then
   ok "N4 on_call::delete_schedule checks the caller owns the schedule before deleting"
 else
@@ -864,19 +875,18 @@ if has "$NDELETE" 'FROM escalation_policies WHERE user_id = \$1 FOR UPDATE'; the
 else
   bad "N5 the orphan-route sweep scans every tenant's escalation_policies — a delete could rewrite another tenant's policy"
 fi
-BID2_AT=$(grep -boF -- '.bind(id)' <<< "$NDELETE" | head -1 | cut -d: -f1)
-BCS2_AT=$(grep -boF -- '.bind(claims.sub)' <<< "$NDELETE" | head -1 | cut -d: -f1)
-if [ -n "$BID2_AT" ] && [ -n "$BCS2_AT" ] && [ "$BID2_AT" -lt "$BCS2_AT" ]; then
+BID2_AT=$(grep -boF -- 'DELETE FROM on_call_schedules WHERE id = $1 AND user_id = $2", id, claims.Sub)' <<< "$NDELETE" | head -1 | cut -d: -f1)
+if [ -n "$BID2_AT" ]; then
   ok "N4b bind order is id then claims.sub for the delete's ownership check"
 else
-  bad "N4b bind order is wrong or missing (id@${BID2_AT:-none} claims.sub@${BCS2_AT:-none})"
+  bad "N4b bind order is wrong or missing (the args after the ownership SQL are not id, claims.Sub)"
 fi
 
 # N6 — negative control: `whoami` stays intentionally UNSCOPED (a caller
 # checking their OWN membership, not reading another tenant's rotation
 # layout) — this fix must not have widened it into a leak, or narrowed it
 # into a false negative for a legitimate on-call operator.
-NWHOAMI=$(flat "$(fnbody "$ON_CALL_SRC" "whoami")")
+NWHOAMI=$(flat "$(fnbody "$ON_CALL_SRC" "rtOnCallWhoami")")
 if has "$NWHOAMI" 'SELECT id, name, members, cadence_days, anchor_at FROM on_call_schedules "' \
    || has "$NWHOAMI" "SELECT id, name, members, cadence_days, anchor_at FROM on_call_schedules"; then
   if has "$NWHOAMI" 'FROM on_call_schedules WHERE user_id'; then
@@ -890,41 +900,46 @@ fi
 
 # ── §O  escalation_policies.rs: same ZERO-scoping defect, same fix shape (s437) ─
 
-ESCALATION=panel/backend/src/routes/escalation_policies.rs
+ESCALATION=$API/rt_escalation_policies.go
 [ -f "$ESCALATION" ] || bad "SETUP subject missing: $ESCALATION"
 ESCALATION_SRC=$(code "$ESCALATION")
 
-OLIST=$(flat "$(fnbody "$ESCALATION_SRC" "list_policies")")
+OLIST=$(flat "$(fnbody "$ESCALATION_SRC" "rtEscalationPoliciesListPolicies")")
 if has "$OLIST" 'FROM escalation_policies p WHERE p\.user_id = \$1 ORDER BY p\.name ASC'; then
   ok "O0 escalation_policies::list_policies is scoped to the caller's own rows"
 else
   bad "O0 escalation_policies::list_policies no longer matches its known scoped shape"
 fi
 
-OGET=$(flat "$(fnbody "$ESCALATION_SRC" "get_policy")")
+OGET=$(flat "$(fnbody "$ESCALATION_SRC" "rtEscalationPoliciesGetPolicy")")
 if has "$OGET" 'FROM escalation_policies p WHERE p\.id = \$1 AND p\.user_id = \$2'; then
   ok "O1 escalation_policies::get_policy checks the caller owns the policy"
 else
   bad "O1 escalation_policies::get_policy has no ownership check"
 fi
 
-OCREATE=$(flat "$(fnbody "$ESCALATION_SRC" "create_policy")")
+OCREATE=$(flat "$(fnbody "$ESCALATION_SRC" "rtEscalationPoliciesCreatePolicy")")
+# Go: both write handlers validate through rtEscalationPoliciesValidateAll,
+# which passes the caller (ownerID) on to the schedule-route check.
+OVALL=$(flat "$(fnbody "$ESCALATION_SRC" "rtEscalationPoliciesValidateAll")")
 if has "$OCREATE" 'INSERT INTO escalation_policies \(user_id, name, steps\)' \
-   && has "$OCREATE" 'validate_schedule_routes\(&state\.db, &input, claims\.sub\)'; then
+   && has "$OCREATE" 'rtEscalationPoliciesValidateAll\(r\.Context\(\), st\.DB, &input, claims\.Sub\)' \
+   && has "$OVALL" 'rtEscalationPoliciesValidateScheduleRoutes\(ctx, db, input, ownerID\)'; then
   ok "O2 escalation_policies::create_policy stamps user_id AND checks schedule-route ownership"
 else
   bad "O2 escalation_policies::create_policy no longer inserts user_id or passes claims.sub to validate_schedule_routes"
 fi
 
-OUPDATE=$(flat "$(fnbody "$ESCALATION_SRC" "update_policy")")
+OUPDATE=$(flat "$(fnbody "$ESCALATION_SRC" "rtEscalationPoliciesUpdatePolicy")")
 if has "$OUPDATE" 'WHERE id = \$1 AND user_id = \$4' \
-   && has "$OUPDATE" 'validate_schedule_routes\(&state\.db, &input, claims\.sub\)'; then
+   && has "$OUPDATE" 'rtEscalationPoliciesValidateAll\(r\.Context\(\), st\.DB, &input, claims\.Sub\)' \
+   && has "$OVALL" 'rtEscalationPoliciesValidateScheduleRoutes\(ctx, db, input, ownerID\)'; then
   ok "O3 escalation_policies::update_policy is scoped AND checks schedule-route ownership"
 else
   bad "O3 escalation_policies::update_policy is missing its ownership scope or the schedule-route check"
 fi
 
-ODELETE=$(flat "$(fnbody "$ESCALATION_SRC" "delete_policy")")
+ODELETE=$(flat "$(fnbody "$ESCALATION_SRC" "rtEscalationPoliciesDeletePolicy")")
 if has "$ODELETE" 'DELETE FROM escalation_policies WHERE id = \$1 AND user_id = \$2'; then
   ok "O4 escalation_policies::delete_policy checks the caller owns the policy before deleting"
 else
@@ -935,18 +950,17 @@ fi
 # not be storable pointing at a schedule owned by a DIFFERENT tenant. Before
 # s437 this only checked EXISTENCE, so a policy could legitimately reference
 # — and therefore page — another tenant's on-call rotation.
-OVALIDATE=$(flat "$(fnbody "$ESCALATION_SRC" "validate_schedule_routes")")
+OVALIDATE=$(flat "$(fnbody "$ESCALATION_SRC" "rtEscalationPoliciesValidateScheduleRoutes")")
 if has "$OVALIDATE" 'FROM on_call_schedules WHERE id = \$1 AND user_id = \$2'; then
   ok "O5 validate_schedule_routes checks the referenced schedule is owned by the SAME tenant, not just that it exists"
 else
   bad "O5 validate_schedule_routes only checks existence — a policy could still reference another tenant's schedule"
 fi
-BSID_AT=$(grep -boF -- '.bind(schedule_id)' <<< "$OVALIDATE" | head -1 | cut -d: -f1)
-BOWN_AT=$(grep -boF -- '.bind(owner_id)' <<< "$OVALIDATE" | head -1 | cut -d: -f1)
-if [ -n "$BSID_AT" ] && [ -n "$BOWN_AT" ] && [ "$BSID_AT" -lt "$BOWN_AT" ]; then
+BSID_AT=$(grep -boF -- 'user_id = $2", scheduleID, ownerID)' <<< "$OVALIDATE" | head -1 | cut -d: -f1)
+if [ -n "$BSID_AT" ]; then
   ok "O5b bind order is schedule_id then owner_id, matching \$1=id \$2=user_id"
 else
-  bad "O5b bind order is wrong or missing (schedule_id@${BSID_AT:-none} owner_id@${BOWN_AT:-none})"
+  bad "O5b bind order is wrong or missing (the args after the ownership SQL are not scheduleID, ownerID)"
 fi
 
 # ── §P  alerts.rs::attach_escalation_policy had NO ownership check at all (s437) ─
@@ -956,7 +970,7 @@ fi
 # §M proved defeatable two ways (dead-code wrap, bind-order swap), so this
 # gets the same full treatment: liveness AND bind-order, not just presence.
 
-PATTACH=$(flat "$(fnbody "$ALERTS_SRC" "attach_escalation_policy")")
+PATTACH=$(flat "$(fnbody "$ALERTS_SRC" "rtAlertsAttachEscalationPolicy")")
 
 if [ -z "$PATTACH" ]; then
   bad "P0 could not extract alerts::attach_escalation_policy"
@@ -968,7 +982,7 @@ else
   else
     bad "P1 attach_escalation_policy has no ownership check on rule_id — any admin can re-point any tenant's alert rule"
   fi
-  if has "$PATTACH" '\.bind\(rule_id\)\s*\.bind\(claims\.sub\)'; then
+  if has "$PATTACH" 'FROM alert_rules WHERE id = \$1 AND user_id = \$2", ruleID, claims\.Sub\)'; then
     ok "P1b bind order is rule_id then claims.sub for the rule-ownership check"
   else
     bad "P1b the rule-ownership check's bind order is wrong or missing"
@@ -979,7 +993,7 @@ else
   else
     bad "P1c the rule-ownership check is at depth $D_RULE, not 1 — may be wrapped in unreachable code"
   fi
-  if has "$PATTACH" 'owns_rule\.is_none\(\)' && has "$PATTACH" 'NOT_FOUND'; then
+  if has "$PATTACH" 'if ownsRule == nil \{ return apiErr\(http\.StatusNotFound'; then
     ok "P2 a non-owned/nonexistent rule_id is rejected"
   else
     bad "P2 attach_escalation_policy performs the rule-ownership lookup but never rejects on failure"
@@ -990,7 +1004,7 @@ else
   else
     bad "P3 the policy-existence check is unscoped — a rule could still be attached to another tenant's policy"
   fi
-  if has "$PATTACH" '\.bind\(pid\)\s*\.bind\(claims\.sub\)'; then
+  if has "$PATTACH" 'FROM escalation_policies WHERE id = \$1 AND user_id = \$2\)", \*body\.PolicyID, claims\.Sub\)'; then
     ok "P3b bind order is pid then claims.sub for the policy-ownership check"
   else
     bad "P3b the policy-ownership check's bind order is wrong or missing"
@@ -1040,13 +1054,13 @@ fi
 # Without these, a harness that has stopped reading real bytes prints an all-green
 # §A-§G and looks exactly like a clean tree.
 
-if [ "$(grep -c 'pub async fn ' "$SERVERS")" -ge 3 ]; then
+if [ "$(grep -c '^func rtServers[A-Za-z]*(st \*AppState' "$SERVERS")" -ge 3 ]; then
   ok "H1 servers.rs still parses as a route module (control)"
 else
   bad "H1 servers.rs yielded almost no handlers — the reader is broken"
 fi
 
-if has "$(flat "$(code "$SITES")")" 'OWNERSHIP_DENORMALIZED_TABLES'; then
+if has "$(flat "$(code "$SITES")")" 'range rtSitesOwnershipDenormalizedTables'; then
   ok "H2 the transfer constant is still present (control)"
 else
   bad "H2 OWNERSHIP_DENORMALIZED_TABLES is gone — §C is measuring nothing"

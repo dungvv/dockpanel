@@ -22,11 +22,12 @@
 #
 # HOW THE SUBJECTS ARE FOUND. Not from a list — a list grows by one line each
 # time someone is bitten, and the next path added to the codebase is not on it
-# (lesson #100). Instead: every function in the agent that performs a Rust
-# filesystem WRITE is located, and every absolute /etc, /var or /opt literal
+# (lesson #100). Instead: every function in the agent that performs a Go
+# filesystem WRITE (os.WriteFile / MkdirAll / Rename / OpenFile / … or one of the
+# agent's own write helpers) is located, and every absolute /etc, /var or /opt literal
 # ANYWHERE IN THAT FUNCTION is treated as a candidate. Scoping to the function
-# rather than the write line matters — `modify_sshd_config` writes through a
-# `format!`ed temp path, so a line-scoped grep sees no literal at all and would
+# rather than the write line matters — `SecurityModifySshdConfig` writes through a
+# computed temp path, so a line-scoped grep sees no literal at all and would
 # have missed the very bug this pin exists for.
 #
 # EXEMPTIONS ARE JUSTIFIED, NOT ASSUMED. A candidate the agent does not actually
@@ -43,8 +44,8 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-UNIT=panel/agent/dockpanel-agent.service
-AGENT_SRC=panel/agent/src
+UNIT=panel/go/internal/agent/services/dockpanel-agent.service
+AGENT_SRC="panel/go/internal/agent panel/go/cmd/dockpanel-agent"
 [ -f "$UNIT" ] || { echo "missing $UNIT"; exit 1; }
 
 # Paths that reach the discovery but are not agent writes. Each needs a reason.
@@ -54,7 +55,7 @@ is_exempt() {
     /etc/.dockpanel-canary) return 0 ;;
     # Read-only lookups.
     /var/lib/unbound/root.key|/usr/share/*) return 0 ;;
-    # READ (routes/security.rs read_to_string) and a member of command_filter's
+    # READ (routes/security.go os.ReadFile) and a member of command_filter's
     # and the scanner's DENYLISTS. Exempt with prejudice: adding it to
     # ReadWritePaths would grant write access to the account database in order to
     # satisfy a check about a path the agent exists to keep commands away from.
@@ -66,17 +67,15 @@ is_exempt() {
   esac
 }
 
-# Strip the test module to end-of-file before anything else. files.rs's
-# symlink-escape tests reference /etc/passwd and /etc/cron.d/... as ATTACK
-# targets they assert are refused; counting those as things the agent writes
-# would demand the sandbox be widened to exactly the paths it must never allow.
-# (Same trap as #94c, three times now.)
-#
-# Match ANY cfg predicate containing `test`, not the literal `#[cfg(test)]`:
-# files.rs guards its module with `#[cfg(all(test, unix))]`, and a pattern that
-# knows only one spelling silently lets that whole module back in — which is how
-# the three attack-target paths above reached this pin's output on its first run.
-code_of() { awk '/^#\[cfg\(.*\<test\>.*\)\]/ { exit } { print }' "$1"; }
+# Test code never counts. files.rs's symlink-escape tests reference /etc/passwd
+# and /etc/cron.d/... as ATTACK targets they assert are refused; counting those
+# as things the agent writes would demand the sandbox be widened to exactly the
+# paths it must never allow (same trap as #94c, three times now). In Go the
+# tests live in *_test.go, so they are excluded by filename — no cfg-predicate
+# parsing. (The Rust-era stripper used awk's GNU-only `\<test\>`, which mawk
+# does not understand, so on Debian's default awk the test module leaked back in
+# and two attack targets showed up here as "uncovered writes".)
+go_files() { find $AGENT_SRC -name '*.go' ! -name '*_test.go' | sort; }
 
 echo "§1 the unit still declares a sandbox at all"
 
@@ -125,39 +124,39 @@ done
 echo
 echo "§4 every path the agent writes is covered (discovered, not listed)"
 
-WRITE_RE='fs::(write|create_dir_all|copy|rename)|File::create'
+# Bracket classes, not backslashes: awk -v eats `\(` and mawk then rejects the regex.
+WRITE_RE='os[.](WriteFile|MkdirAll|Mkdir|Rename|Create|OpenFile|Symlink|Link)[(]|mailWriteFileAtomic(Mode)?[(]|SslWriteKeyFile[(]|FilesWriteFile[(]'
+WRITERS=$(grep -lE "$WRITE_RE" $(go_files) 2>/dev/null)
 CANDIDATES=$(
-  for f in $(grep -rlE "$WRITE_RE" --include='*.rs' "$AGENT_SRC" 2>/dev/null); do
-    code_of "$f" | awk -v re="$WRITE_RE" '
-      /^[ \t]*(pub )?(async )?fn / { if (body ~ re) print paths; body=""; paths="" }
+  for f in $WRITERS; do
+    awk -v re="$WRITE_RE" '
+      /^func / { if (body ~ re) print paths; body=""; paths="" }
       { body = body $0 "\n"
         if (match($0, /"\/(etc|var|opt)\/[A-Za-z0-9_.\/-]+"/))
           paths = paths substr($0, RSTART+1, RLENGTH-2) "\n" }
       END { if (body ~ re) print paths }
-    '
+    ' "$f"
   done | grep '^/' | sort -u
 )
 # s370 — THE BLIND SPOT THAT LET /etc/msmtprc THROUGH. The discovery above reads
 # path literals that appear INSIDE the writing function, so a path held in a
-# `const` at the top of the file is invisible to it: `smtp.rs` wrote
+# package-level const is invisible to it: `smtp.rs` wrote
 # `fs::write(MSMTP_CONFIG, …)` where `const MSMTP_CONFIG = "/etc/msmtprc"`, a bare
 # file under a read-only `/etc`, and this section — whose entire job is that
-# class — reported a clean sweep for four months. Resolve same-file consts and
-# feed them through the SAME coverage check.
+# class — reported a clean sweep for four months. Resolve same-file consts (both
+# `const x = "…"` and members of a `const ( … )` block) and feed them through the
+# SAME coverage check.
 CONST_CANDIDATES=$(
-  for f in $(grep -rlE "$WRITE_RE" --include='*.rs' "$AGENT_SRC" 2>/dev/null); do
-    src=$(code_of "$f")
-    printf '%s\n' "$src" \
-      | grep -oE 'const [A-Z_][A-Z_0-9]*: &str = "/(etc|var|opt)/[^"]*"' \
-      | sed -E 's/^const ([A-Z_][A-Z_0-9]*): &str = "(.*)"$/\1 \2/' \
+  for f in $WRITERS; do
+    grep -E '^[[:space:]]*(const[[:space:]]+)?[A-Za-z_][A-Za-z_0-9]*[[:space:]]*=[[:space:]]*"/(etc|var|opt)/[^"]*"[[:space:]]*(//.*)?$' "$f" \
+      | sed -E 's/^[[:space:]]*(const[[:space:]]+)?([A-Za-z_][A-Za-z_0-9]*)[[:space:]]*=[[:space:]]*"([^"]*)".*$/\2 \3/' \
       | while read -r cname cpath; do
           [ -n "$cname" ] || continue
           # only if that const is actually handed to a write in this file.
-          # HERE-STRING, never a pipe: under `set -o pipefail` a `grep -q` closes
-          # the pipe on its first match and the writer takes SIGPIPE, so the arm
-          # goes red on correct code — which is what pipefail-sigpipe-pin-e2e.sh
-          # forbids, and what it caught in the first cut of this very block.
-          if grep -qE "(fs::(write|copy|rename)|File::create|\.open)\([[:space:]]*&?${cname}\b" <<< "$src"; then
+          # grep on the FILE, never a pipe into `grep -q`: under `set -o pipefail`
+          # the writer takes SIGPIPE on the first match and the arm goes red on
+          # correct code — what pipefail-sigpipe-pin-e2e.sh forbids.
+          if grep -qE "(os\.(WriteFile|MkdirAll|Rename|Create|OpenFile)|mailWriteFileAtomic(Mode)?|SslWriteKeyFile|FilesWriteFile)\([[:space:]]*${cname}\b" "$f"; then
             printf '%s\n' "$cpath"
           fi
         done

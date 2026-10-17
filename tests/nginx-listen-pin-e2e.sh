@@ -95,10 +95,10 @@ check "update.sh restarts too, for boxes already broken" "$R" "yes"
 
 echo
 echo "── F6: automatic renewal must resolve the ACME contact like issuance does ──"
-SS="$REPO/panel/backend/src/services/security_scanner.rs"
-AH="$REPO/panel/backend/src/services/auto_healer.rs"
-check "security_scanner renewal uses resolve_acme_contact" "$(grep -c 'resolve_acme_contact' "$SS")" "1"
-check "auto_healer renewal uses resolve_acme_contact"      "$(grep -c 'resolve_acme_contact' "$AH")" "1"
+SS="$REPO/panel/go/internal/api/svc_security_scanner.go"
+AH="$REPO/panel/go/internal/api/svc_auto_healer.go"
+check "security_scanner renewal uses rtSslResolveAcmeContact" "$(grep -c "rtSslResolveAcmeContact(" "$SS")" "1"
+check "auto_healer renewal uses rtSslResolveAcmeContact"      "$(grep -c "rtSslResolveAcmeContact(" "$AH")" "1"
 
 echo
 echo "══ $PASS passed, $FAIL failed ══"

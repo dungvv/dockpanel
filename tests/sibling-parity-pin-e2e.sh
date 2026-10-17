@@ -57,20 +57,22 @@ code() {
 has()  { grep -qE -- "$2" <<< "$1"; }
 
 fnbody() {
+  # Go: `func Name(` or a method `func (r T) Name(`, through its column-0 `}`.
   awk -v fn="$2" '
-    index($0, "fn " fn) && !started { started=1 }
-    started {
-      n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
-      if (opened || n>0) opened=1
-      if (opened && depth<=0) exit
-    }
+    !started && (index($0, "func " fn "(") == 1 || $0 ~ ("^func [(][^)]*[)] " fn "[(]")) { started=1 }
+    started { print }
+    started && /^}/ { exit }
   ' <<< "$1"
 }
 
-CRONTAB_SVC=panel/agent/src/services/crontab.rs
-WP_SVC=panel/agent/src/services/wordpress.rs
-PANEL_SITES=panel/backend/src/routes/sites.rs
-PANEL_SSL=panel/backend/src/routes/ssl.rs
+# Go port: agent services/*.rs → panel/go/internal/agent/services/*.go, panel
+# routes/sites.rs + ssl.rs → panel/go/internal/api/rt_sites.go + rt_ssl.go.
+AGENT_GO=panel/go/internal/agent
+API_GO=panel/go/internal/api
+CRONTAB_SVC=$AGENT_GO/services/crontab.go
+WP_SVC=$AGENT_GO/services/wordpress.go
+PANEL_SITES=$API_GO/rt_sites.go
+PANEL_SSL=$API_GO/rt_ssl.go
 
 for f in "$CRONTAB_SVC" "$WP_SVC" "$PANEL_SITES" "$PANEL_SSL"; do
   [ -f "$f" ] || { echo "  FATAL: $f missing — wrong tree?"; exit 1; }
@@ -85,8 +87,8 @@ echo "§A  one fail-closed crontab reader"
 CRON_FILES=""
 while read -r f; do
   [ -n "$f" ] || continue
-  code "$f" | grep -c 'safe_command\(_sync\)\?("crontab")' >/dev/null && CRON_FILES="${CRON_FILES}${f}"$'\n'
-done < <(grep -rl 'safe_command\(_sync\)\?("crontab")' panel/agent/src --include='*.rs' 2>/dev/null)
+  code "$f" | grep -cE 'safecmd\.[A-Za-z]+\([^,]+, "crontab"' >/dev/null && CRON_FILES="${CRON_FILES}${f}"$'\n'
+done < <(grep -rlE 'safecmd\.[A-Za-z]+\([^,]+, "crontab"' $AGENT_GO panel/go/cmd/dockpanel-agent --include='*.go' 2>/dev/null | grep -v '_test\.go$')
 
 CRON_N=$(grep -c . <<< "$CRON_FILES" || true)
 if [ "${CRON_N:-0}" -lt 2 ]; then
@@ -100,48 +102,33 @@ fi
 WRITERS=""
 while read -r f; do
   [ -n "$f" ] || continue
-  if code "$f" | grep -cE '"crontab"\)[^;]*"-"[^;]*\)' >/dev/null \
-     || code "$f" | tr '\n' ' ' | grep -cE 'safe_command\("crontab"\)[^;]{0,200}args\(\["-u", "root", "-"\]\)' >/dev/null; then
+  # A writer hands crontab a `-` (read the new table from stdin).
+  if code "$f" | grep -cE 'safecmd\.[A-Za-z]+\([^,]+, "crontab"[^)]*"-"\)' >/dev/null; then
     WRITERS="${WRITERS}${f}"$'\n'
   fi
 done < <(printf '%s' "$CRON_FILES")
 
 STRAY=$(grep -v "^${CRONTAB_SVC}$" <<< "$WRITERS" | grep -c . || true)
 if [ "${STRAY:-0}" -eq 0 ]; then
-  ok "A1 the only crontab WRITER in the crate is services/crontab.rs"
+  [ -n "$WRITERS" ] || bad "A1 CONTROL: no crontab writer found at all — services/crontab.go's CrontabWrite must match, or the stray check is vacuous"
+  [ -n "$WRITERS" ] && ok "A1 the only crontab WRITER in the agent is services/crontab.go"
 else
   while read -r f; do
     [ -n "$f" ] || continue
-    bad "A1 $f writes the crontab directly instead of via services/crontab.rs — a failed read there deletes every entry on the box"
+    bad "A1 $f writes the crontab directly instead of via services/crontab.go — a failed read there deletes every entry on the box"
   done < <(grep -v "^${CRONTAB_SVC}$" <<< "$WRITERS")
 fi
 
 CT=$(code "$CRONTAB_SVC")
-READER=$(fnbody "$CT" "read_crontab")
-if [ -z "$READER" ]; then
-  bad "A2 could not extract read_crontab — the arms below measure nothing"
-elif has "$READER" 'no crontab for'; then
-  ok "A2 the reader distinguishes 'no crontab for' from every other failure"
-else
-  bad "A2 the reader no longer special-cases the genuinely-absent crontab — it will refuse on a fresh box"
-fi
+# A2 retired: covered by TestCrontabAbsentCrontabIsEmptyNotAnError (panel/go/internal/agent/services/crontab_test.go)
+# A3 retired: covered by TestCrontabEveryOtherFailureRefuses + TestCrontabReaderNeverYieldsEmptyOnAMissingBinary (panel/go/internal/agent/services/crontab_test.go)
 
-if [ -z "$READER" ]; then
-  bad "A3 skipped — no reader"
-elif has "$READER" 'o\.status\.success\(\)'; then
-  ok "A3 the reader inspects the exit status (a non-zero exit is not an empty crontab)"
-else
-  bad "A3 the reader ignores the exit status — the exact collapse this module exists to prevent"
-fi
-
-# A4 is the arm that would have caught the original defect: the vulnerable shape is
-# a crontab read whose failure becomes a default value.
-SETAU=$(fnbody "$(code "$WP_SVC")" "set_auto_update")
+SETAU=$(fnbody "$(code "$WP_SVC")" "WordpressSetAutoUpdate")
 if [ -z "$SETAU" ]; then
-  bad "A4 could not extract set_auto_update — this arm measures nothing"
-elif has "$SETAU" 'unwrap_or_default\(\)'; then
+  bad "A4 could not extract WordpressSetAutoUpdate — this arm measures nothing"
+elif has "$SETAU" '[a-z]+, _ :?= CrontabRead\(\)'; then
   bad "A4 set_auto_update collapses a failed crontab read into an empty string again"
-elif has "$SETAU" 'crontab::read_crontab'; then
+elif has "$SETAU" 'current, err := CrontabRead\(\)' && has "$SETAU" 'if err != nil \{'; then
   ok "A4 set_auto_update reads through the shared fail-closed reader"
 else
   bad "A4 set_auto_update does not use the shared reader — it has its own crontab read again"
@@ -152,20 +139,20 @@ echo
 echo "§B  every SSL write re-renders the full vhost"
 
 SITES=$(code "$PANEL_SITES")
-UPLOAD=$(fnbody "$SITES" "upload_ssl")
+UPLOAD=$(fnbody "$SITES" "rtSitesUploadSsl")
 if [ -z "$UPLOAD" ]; then
-  bad "B0 could not extract upload_ssl — §B measures nothing"
-elif has "$UPLOAD" 'rebuild_vhost_after_ssl'; then
+  bad "B0 could not extract rtSitesUploadSsl — §B measures nothing"
+elif has "$UPLOAD" 'rtSslRebuildVhostAfterSsl\('; then
   ok "B1 upload_ssl re-renders the full vhost after handing the cert to the agent"
 else
   bad "B1 upload_ssl does not rebuild the vhost — uploading a cert strips WAF/CSP and 502s a PHP site"
 fi
 
-REBUILDERS=$(grep -rc 'rebuild_vhost_after_ssl' panel/backend/src --include='*.rs' 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
+REBUILDERS=$(grep -rc 'rtSslRebuildVhostAfterSsl' $API_GO --include='*.go' 2>/dev/null | grep -v '_test\.go:' | awk -F: '{s+=$2} END {print s+0}')
 if [ "$REBUILDERS" -ge 5 ]; then
   ok "B2 the rebuild is referenced $REBUILDERS times (definition + every SSL-writing sibling)"
 else
-  bad "B2 only $REBUILDERS references to rebuild_vhost_after_ssl — a sibling lost its compensation"
+  bad "B2 only $REBUILDERS references to rtSslRebuildVhostAfterSsl — a sibling lost its compensation"
 fi
 
 # ── B3/B4 — the arm B2 could not be ────────────────────────────────────────
@@ -189,8 +176,11 @@ fi
 # definition it was meant to police.
 # `routes/mod.rs` is excluded on purpose: it matches as the ROUTE TABLE
 # (`/api/ssl/{id}/renew`), not as a caller of the agent.
-RENDER_DOORS=$(grep -rlE 'ssl/provision|/ssl/\{[a-z_]*\}/renew|/ssl/\{\}/renew' panel/backend/src --include='*.rs' 2>/dev/null \
-               | grep -vE '/routes/mod\.rs$' | sort || true)
+# Go spells the agent paths "/ssl/provision/"+d, "/ssl/"+d+"/renew" and
+# fmt.Sprintf("/ssl/%s/renew", …). The route table lives inside each rt_*.go
+# (no mod.rs), and "/api/ssl/{id}/renew" there is a door's own file anyway.
+RENDER_DOORS=$(grep -rlE '"/ssl/provision|"/ssl/" ?\+ ?[A-Za-z.]+ ?\+ ?"/renew"|/ssl/%s/renew"' $API_GO --include='*.go' 2>/dev/null \
+               | grep -v '_test\.go$' | sort || true)
 DOOR_N=$(printf '%s\n' "$RENDER_DOORS" | grep -c . || true)
 if [ "${DOOR_N:-0}" -lt 6 ]; then
   bad "B3 only $DOOR_N vhost-rendering SSL doors enumerated — the derivation broke, this arm measures nothing"
@@ -199,11 +189,11 @@ else
   B4_BAD=""
   for f in $RENDER_DOORS; do
     case "$f" in
-      *routes/ssl.rs)                COMP='rebuild_vhost_after_ssl\(' ;;
-      *routes/sites.rs)              COMP='rebuild_vhost_for_site\(' ;;
-      *routes/mail.rs)               COMP='rebuild_vhost_for_domain\(' ;;
-      *services/auto_healer.rs)      COMP='build_nginx_body\(' ;;
-      *services/security_scanner.rs) COMP='build_nginx_body\(' ;;
+      */rt_ssl.go)                   COMP='rtSslRebuildVhostAfterSsl\(' ;;
+      */rt_sites.go)                 COMP='rtSslRebuildVhostForSite\(' ;;
+      */rt_mail.go)                  COMP='rtSslRebuildVhostForDomain\(' ;;
+      */svc_auto_healer.go)          COMP='rtSitesBuildNginxBody\(' ;;
+      */svc_security_scanner.go)     COMP='rtSitesBuildNginxBody\(' ;;
       # ⛔ THE ONE DOOR WHOSE COMPENSATION IS AN ABSENCE, and it is a decision,
       #    not an oversight. Every other door here hands the agent a `runtime`,
       #    which makes it RE-RENDER the vhost from a body that carries none of the
@@ -216,7 +206,7 @@ else
       #    So what this door owes is not a rebuild — it is that its request body
       #    STAYS the two fields below. Grow it a `runtime` and this arm goes red,
       #    which is exactly when the compensation question reopens.
-      *routes/stacks.rs)             COMP='Some\(serde_json::json!\(\{ "email": contact \}\)\)' ;;
+      */rt_stacks.go)                COMP='map\[string\]any\{"email": \*contact\}' ;;
       *) B4_BAD="$B4_BAD $f(UNKNOWN-DOOR)"; continue ;;
     esac
     grep -qE -- "$COMP" "$f" 2>/dev/null || B4_BAD="$B4_BAD $f"
@@ -235,9 +225,9 @@ echo "§C  the pre-delete backup runs before anything destructive"
 # The route is DELETE /api/sites/{id}; the Rust handler is `remove`. Named from
 # SOURCE rather than from the route, because the first draft of this arm asked
 # for `delete_site` and its extraction guard is the only reason that showed up.
-DEL=$(fnbody "$SITES" "remove")
+DEL=$(fnbody "$SITES" "rtSitesRemove")
 if [ -z "$DEL" ]; then
-  bad "C0 could not extract the site-delete handler (fn remove) — §C measures nothing"
+  bad "C0 could not extract the site-delete handler (func rtSitesRemove) — §C measures nothing"
 else
   ok "C0 site-delete handler body extracted ($(wc -l <<< "$DEL") lines)"
   # Ordering, not presence. Presence was never the problem — the call was there
@@ -261,13 +251,13 @@ else
   # not. An ABSENCE arm that cannot match fails SILENTLY. Flatten, then allow the
   # bounded gaps flattening leaves — ' *' only, never '.*'.
   DEL_FLAT=$(tr '\n\t' '  ' <<< "$DEL" | tr -s ' ')
-  if has "$DEL_FLAT" 'let _ = agent *\. *post\( *&format!\( *"/backups'; then
+  if has "$DEL_FLAT" '_, _ = agent *\. *Post\( *ctx, *"/backups'; then
     bad "C2 the pre-delete backup's result is discarded again — a permanent failure would be invisible"
   else
     ok "C2 the pre-delete backup's result is not silently discarded"
   fi
 
-  if has "$DEL" '"databases": predelete_dbs\.specs'; then
+  if has "$DEL" '"databases": dbs\.Specs'; then
     ok "C3 the pre-delete backup includes the site's databases (still alive at that point)"
   else
     bad "C3 the pre-delete backup omits the databases — a files-only snapshot of a site being destroyed"
@@ -292,7 +282,7 @@ fi
 echo
 echo "§E  one wp-cli invocation"
 
-WP_VULN=panel/agent/src/services/wp_vulnerability.rs
+WP_VULN=$AGENT_GO/services/wp_vulnerability.go
 [ -f "$WP_VULN" ] || { echo "  FATAL: $WP_VULN missing — wrong tree?"; exit 1; }
 
 # E0 — the census, printed as its own positive control (#480).
@@ -300,7 +290,7 @@ WPCLI_FILES=""
 while read -r f; do
   [ -n "$f" ] || continue
   WPCLI_FILES="${WPCLI_FILES}${f}"$'\n'
-done < <(grep -rlE 'safe_command(_sync|_unsandboxed)?\((WP_CLI|"wp")\)' panel/agent/src --include='*.rs' 2>/dev/null | sort)
+done < <(grep -rlE 'safecmd\.(Exec|Command)\([^,]+, (wordpressWpCli|"wp"),|safecmd\.NewUnsandboxed\((wordpressWpCli|"wp")\)' $AGENT_GO panel/go/cmd/dockpanel-agent --include='*.go' 2>/dev/null | grep -v '_test\.go$' | sort)
 
 WPCLI_N=$(grep -c . <<< "$WPCLI_FILES" || true)
 if [ "${WPCLI_N:-0}" -lt 1 ]; then
@@ -312,26 +302,29 @@ fi
 # E1 — only the owning module may invoke it.
 WP_STRAY=$(grep -v "^${WP_SVC}$" <<< "$WPCLI_FILES" | grep -c . || true)
 if [ "${WP_STRAY:-0}" -eq 0 ]; then
-  ok "E1 services/wordpress.rs is the only module invoking wp-cli"
+  ok "E1 services/wordpress.go is the only module invoking wp-cli"
 else
   while read -r f; do
     [ -n "$f" ] || continue
-    bad "E1 $f invokes wp-cli directly instead of through services/wordpress.rs — a second copy is how the last one drifted onto a binary that does not exist"
+    bad "E1 $f invokes wp-cli directly instead of through services/wordpress.go — a second copy is how the last one drifted onto a binary that does not exist"
   done < <(grep -v "^${WP_SVC}$" <<< "$WPCLI_FILES")
 fi
 
 # E2 — EVERY invocation carries --allow-root, asserted in both directions.
 # Each call site is bounded by the code's own punctuation — from the
 # `safe_command(...)` to that statement's `.output()` — never a fixed -A n (#172).
+# Go: wp-cli is exec'd as `safecmd.Exec(ctx, wordpressWpCli, argv...)`, so the
+# "statement" is every `argv = append(…)`/`argv := append(…)` that builds the
+# spread slice, from the start of the enclosing func (or closure) to the call.
 WP_TOTAL=0; WP_ROOTED=0
 while read -r stmt; do
   [ -n "$stmt" ] || continue
   WP_TOTAL=$((WP_TOTAL+1))
   case "$stmt" in *'--allow-root'*) WP_ROOTED=$((WP_ROOTED+1));; esac
-done < <(code "$WP_SVC" | perl -0777 -ne 'while (/safe_command(?:_sync|_unsandboxed)?\((?:WP_CLI|"wp")\)(.*?)\.output\(\)/gs) { my $s=$1; $s =~ s/\s+/ /g; print "$s\n" }')
+done < <(code "$WP_SVC" | perl -0777 -ne 'while (/safecmd\.(?:Exec|Command)\([^,]+, wordpressWpCli, (\w+)\.\.\.\)/g) { my ($v,$pre)=($1, substr($_,0,$-[0])); my $st=0; while ($pre =~ /^func |:= func\(/mg) { $st=$-[0] } my $win=substr($pre,$st); my @a = ($win =~ /^[^\n]*\b\Q$v\E :?= append\([^\n]*$/mg); my $s = @a ? join(" ", @a) : "UNBUILT:$v"; $s =~ s/\s+/ /g; print "$s\n" }')
 
 if [ "$WP_TOTAL" -eq 0 ]; then
-  bad "E2 extracted no wp-cli call statements from services/wordpress.rs — this arm measures nothing"
+  bad "E2 extracted no wp-cli call statements from services/wordpress.go — this arm measures nothing"
 elif [ "$WP_ROOTED" -eq "$WP_TOTAL" ]; then
   ok "E2 all $WP_TOTAL wp-cli call site(s) pass --allow-root (the agent runs as root; wp-cli refuses without it)"
 else
@@ -340,9 +333,11 @@ fi
 
 # E3 — nothing anywhere runs a phar through the php interpreter. Anchored on the
 # INVOCATION, not on the filename, so `ensure_cli`'s download URL is not a hit.
-PHAR_HITS=$(for f in $(grep -rl 'safe_command' panel/agent/src --include='*.rs'); do
-  code "$f" | perl -0777 -ne 'while (/safe_command(?:_sync|_unsandboxed)?\("php"\)(.*?)\.output\(\)/gs) { print "HIT\n" if $1 =~ /\.phar/ }'
-done | grep -c . || true)
+PHP_CALLS=$(for f in $(grep -rl 'safecmd\.' $AGENT_GO --include='*.go' | grep -v '_test\.go$'); do
+  code "$f" | grep -E 'safecmd\.(Exec|Command)\([^,]+, "php"|safecmd\.NewUnsandboxed\("php"\)'
+done)
+PHAR_HITS=$(grep -c '\.phar' <<< "$PHP_CALLS" || true)
+[ -n "$PHP_CALLS" ] || bad "E3 CONTROL: no php interpreter invocation found in the agent — the absence arm below is vacuous"
 if [ "${PHAR_HITS:-0}" -eq 0 ]; then
   ok "E3 no agent code runs a .phar through the php interpreter"
 else
@@ -351,12 +346,12 @@ fi
 
 # E4 — the arm that would have caught the original defect: the scanner takes its
 # plugin list from the shared entry point and PROPAGATES the failure.
-SCAN=$(fnbody "$(code "$WP_VULN")" "scan_site")
+SCAN=$(fnbody "$(code "$WP_VULN")" "WpVulnerabilityScanSite")
 if [ -z "$SCAN" ]; then
-  bad "E4 could not extract scan_site — this arm measures nothing"
-elif ! has "$SCAN" 'wp_at_root'; then
+  bad "E4 could not extract WpVulnerabilityScanSite — this arm measures nothing"
+elif ! has "$SCAN" 'WordpressWpAtRoot\('; then
   bad "E4 scan_site no longer goes through the shared wp-cli entry point — it has its own invocation again"
-elif has "$SCAN" 'status\.success\(\)'; then
+elif has "$SCAN" '\.Success\(\)'; then
   bad "E4 scan_site branches on an exit status again — the shape whose missing else recorded an unrun scan as total_vulns: 0"
 else
   ok "E4 scan_site lists plugins through the shared entry point and propagates a failure instead of reporting zero"
@@ -365,7 +360,7 @@ fi
 # E5 — wp-cli's `update` field is a STATUS; the version lives in `update_version`.
 if [ -z "$SCAN" ]; then
   bad "E5 skipped — no scan_site"
-elif has "$SCAN" 'update_version'; then
+elif has "$SCAN" 'str\(p, "update_version"\)'; then
   ok "E5 the reported latest_version comes from update_version, not from the update status word"
 else
   bad "E5 scan_site reports a version taken from the update STATUS again — 'available' is not a version, and the outdated test inverts"
@@ -378,15 +373,17 @@ fi
 # collapse that had never been observed (#506). The count is printed, not
 # asserted, because the other routes in that file are a pre-existing carry —
 # but it is printed so the size stays visible on every run.
-WP_ROUTES=panel/agent/src/routes/wordpress.rs
+WP_ROUTES=$AGENT_GO/routes/wordpress.go
 if [ ! -f "$WP_ROUTES" ]; then
   bad "E6 $WP_ROUTES missing — this arm measures nothing"
 else
-  SCAN_ARM=$(fnbody "$(code "$WP_ROUTES")" "vuln_scan")
-  COLLAPSING=$(awk '/^async fn |^pub async fn /{fn=$0; sub(/^.*fn /,"",fn); sub(/\(.*/,"",fn)} /StatusCode::INTERNAL_SERVER_ERROR/{print fn}' "$WP_ROUTES" | sort -u | grep -c . || true)
+  SCAN_ARM=$(fnbody "$(code "$WP_ROUTES")" "wordpressVulnScan")
+  COLLAPSING=$(awk '/^func /{fn=$0; sub(/^func /,"",fn); sub(/\(.*/,"",fn)} /http\.StatusInternalServerError/{print fn}' "$WP_ROUTES" | sort -u | grep -c . || true)
   if [ -z "$SCAN_ARM" ]; then
-    bad "E6 could not extract vuln_scan — this arm measures nothing"
-  elif has "$SCAN_ARM" 'INTERNAL_SERVER_ERROR'; then
+    bad "E6 could not extract wordpressVulnScan — this arm measures nothing"
+  elif ! has "$SCAN_ARM" 'http\.Status[A-Za-z]+'; then
+    bad "E6 wordpressVulnScan names no status at all — this arm measures nothing"
+  elif has "$SCAN_ARM" 'http\.StatusInternalServerError'; then
     bad "E6 vuln_scan returns a 5xx again — the panel replaces it with 'Operation failed. Reference: <uuid>', so a scan that could not run is opaque instead of merely wrong"
   else
     ok "E6 a scan that cannot run reports its reason as a 4xx, so the sentence survives the panel boundary (${COLLAPSING} other route(s) in that file still collapse — pre-existing carry)"
@@ -402,15 +399,15 @@ fi
 # Subject is the extracted helper, not `apply_hardening` — extracting a helper
 # moves the subject of every pin that measured it (#555), and this arm was
 # written against the inline version one commit earlier.
-UPLOADS=$(fnbody "$(code "$WP_VULN")" "block_php_uploads")
+UPLOADS=$(fnbody "$(code "$WP_VULN")" "wpVulnerabilityBlockPhpUploads")
 # Flattened, because the chown spans four source lines and `has` is line-based —
 # a multi-line pattern in a line-based grep can never fire (#409).
 UPLOADS_FLAT=$(tr '\n' ' ' <<< "$UPLOADS" | tr -s ' ')
 if [ -z "$UPLOADS" ]; then
-  bad "E7 could not extract block_php_uploads — this arm measures nothing"
-elif ! has "$UPLOADS" 'create_dir_all'; then
+  bad "E7 could not extract wpVulnerabilityBlockPhpUploads — this arm measures nothing"
+elif ! has "$UPLOADS" 'os\.MkdirAll\(uploadsDir'; then
   bad "E7 the uploads hardening writes .htaccess without creating wp-content/uploads — ENOENT on every fresh install, which is exactly when a site is hardened"
-elif ! has "$UPLOADS_FLAT" 'safe_command\("chown"\)[^;]*uploads_dir'; then
+elif ! has "$UPLOADS_FLAT" 'safecmd\.Exec\([^,]+, "chown", "www-data:www-data", uploadsDir\)'; then
   # Anchored on the invocation AND its argument, not on the bare word: `chown`
   # as a substring survives a rename to `chownX` and the arm reads green (#564).
   bad "E7 the uploads directory is created but never handed to the web user — a root-owned uploads dir stops WordPress writing media, which is worse than skipping the hardening"
@@ -425,25 +422,28 @@ fi
 # writes exactly those literals, so ONE hardening run pinned three of the four
 # green for ever: the fix disarmed the verifier. Population is DERIVED from what
 # apply_hardening actually manages, never from a list written here (#551).
-HARDEN=$(fnbody "$(code "$WP_VULN")" "apply_hardening")
-CHECKFN=$(fnbody "$(code "$WP_VULN")" "check_security")
-MANAGED=$(grep -oE 'set_wp_constant\(&root, "[A-Z_0-9]+"' <<< "$HARDEN" | grep -oE '"[A-Z_0-9]+"' | tr -d '"' | sort -u)
+HARDEN=$(fnbody "$(code "$WP_VULN")" "WpVulnerabilityApplyHardening")
+CHECKFN=$(fnbody "$(code "$WP_VULN")" "WpVulnerabilityCheckSecurity")
+# Go: each fix goes through the local `constant(fix, "KEY", …)` closure, which
+# calls wpVulnerabilitySetWpConstant(root, key, val).
+MANAGED=$(grep -oE 'constant\(fix, "[A-Z_0-9]+"' <<< "$HARDEN" | grep -oE '"[A-Z_0-9]+"' | tr -d '"' | sort -u)
+has "$HARDEN" 'wpVulnerabilitySetWpConstant\(root, key, val\)' || bad "E8 the constant() closure no longer writes through wpVulnerabilitySetWpConstant — MANAGED is derived from the wrong thing"
 MANAGED_N=$(grep -c . <<< "$MANAGED" || true)
 
 if [ -z "$HARDEN" ] || [ -z "$CHECKFN" ]; then
-  bad "E8 could not extract apply_hardening or check_security — this arm measures nothing"
+  bad "E8 could not extract WpVulnerabilityApplyHardening or WpVulnerabilityCheckSecurity — this arm measures nothing"
 elif [ "${MANAGED_N:-0}" -eq 0 ]; then
-  bad "E8 derived no wp-config constants from apply_hardening — this arm measures nothing"
+  bad "E8 derived no wp-config constants from WpVulnerabilityApplyHardening — this arm measures nothing"
 else
   E8_BAD=0
   while read -r c; do
     [ -n "$c" ] || continue
-    if ! has "$CHECKFN" "wp_constant\(&code, \"$c\"\)"; then
-      bad "E8 check_security does not read $c through wp_constant — a check that does not read its own constant's value grades something else"
+    if ! has "$CHECKFN" "(wpVulnerabilityWpConstant\(code, |truthyTrue\()\"$c\"\)"; then
+      bad "E8 WpVulnerabilityCheckSecurity does not read $c through wpVulnerabilityWpConstant — a check that does not read its own constant's value grades something else"
       E8_BAD=$((E8_BAD+1))
     fi
-    if has "$CHECKFN" "wp_config\.contains\(\"$c\""; then
-      bad "E8 check_security tests the whole file for $c again — any occurrence of the value literal anywhere satisfies it, and apply_hardening writes that literal"
+    if has "$CHECKFN" "strings\.Contains\((wpConfig|code), \"[^\"]*$c"; then
+      bad "E8 WpVulnerabilityCheckSecurity tests the whole file for $c again — any occurrence of the value literal anywhere satisfies it, and apply_hardening writes that literal"
       E8_BAD=$((E8_BAD+1))
     fi
   done <<< "$MANAGED"
@@ -472,16 +472,16 @@ fi
 echo
 echo "§D  context (green at both tags)"
 
-if has "$SITES" 'pub async fn remove\('; then
+if has "$SITES" '^func rtSitesRemove\('; then
   ok "D1 the site-delete handler still exists"
 else
   bad "D1 the site-delete handler is gone — §C measures a deleted feature"
 fi
 
-if has "$(code "$PANEL_SSL")" 'fn rebuild_vhost_after_ssl'; then
-  ok "D2 the canonical rebuild helper still exists in routes/ssl.rs"
+if has "$(code "$PANEL_SSL")" '^func rtSslRebuildVhostAfterSsl\('; then
+  ok "D2 the canonical rebuild helper still exists in rt_ssl.go"
 else
-  bad "D2 rebuild_vhost_after_ssl is gone — §B cannot be satisfied"
+  bad "D2 rtSslRebuildVhostAfterSsl is gone — §B cannot be satisfied"
 fi
 
 echo

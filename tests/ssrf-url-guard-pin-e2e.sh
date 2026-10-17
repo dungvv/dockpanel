@@ -40,6 +40,15 @@
 #       synchronous blocking check stays — it is the only thing that catches a
 #       redirect `Location` that is already a literal internal IP, which never
 #       reaches a `Resolve` impl at all.
+#
+# Go port (panel/go/internal/api): helpers → core_helpers.go (urlAuthority /
+# parseAuthority over net/url, validateURLNotInternal, validateHostNotInternal,
+# resolveAllValidated, resolveValidated); ValidatingResolver's job is done by
+# validatingDialContext, installed via pinnedTransport's DialContext; the uptime
+# client is built in svc_uptime.go::uptimeCheckHTTP with CheckRedirect:
+# uptimeCheckRedirect (the synchronous per-hop hostResolvesInternalBlocking).
+# The userinfo-spoof behaviour itself is also pinned by
+# TestUserinfoSpoofedInternalHostIsRejected (core_helpers_test.go).
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
@@ -54,151 +63,150 @@ PASS=0; FAIL=0; SKIP=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-# Strip block, line and doc comments so an arm cannot match the prose that
+# Strip block and line comments so an arm cannot match the prose that
 # documents the very code it forbids.
 code() {
   perl -0777 -pe '
     s{/\*.*?\*/}{}gs;
     s{^\s*//.*$}{}gm;
-    s{^\s*///.*$}{}gm;
   ' "$1"
 }
-# Collapse ALL whitespace so rustfmt line-wrapping cannot hide a token sequence.
-flat() { code "$1" | tr -d ' \t\n'; }
+# One top-level Go func's body.
+fnbody() { code "$1" | perl -0777 -ne 'print $1 if /\n(func (?:\([^)]*\) )?\Q'"$2"'\E\(.*?\n\})\n/s'; }
 
-HELPERS=panel/backend/src/helpers.rs
-EXT=panel/backend/src/routes/extensions.rs
-MON=panel/backend/src/routes/monitors.rs
-UPT=panel/backend/src/services/uptime.rs
+HELPERS=panel/go/internal/api/core_helpers.go
+EXT=panel/go/internal/api/rt_extensions.go
+MON=panel/go/internal/api/rt_monitors.go
+UPT=panel/go/internal/api/svc_uptime.go
 
 for f in "$HELPERS" "$EXT" "$MON" "$UPT"; do
   [ -f "$f" ] || { echo "  FATAL: $f missing — wrong tree?"; exit 1; }
 done
 
-# The retired shape's actual fingerprint: split('/').next() to strip the path,
-# THEN — chained in the SAME statement, no ';' between — split(':').next() to
-# strip the port, in that exact order (the doc comment above names it: "strip the
-# scheme … split('/').next() … split(':').next()"). Matching the two substrings
-# ANYWHERE in the file, independent of order or statement boundary, over-fires on
-# a legitimate LATER use of the same two calls for something that isn't URL-authority
-# extraction at all — e.g. parsing the scp-like `git@host:path` git-remote shorthand
-# (s417's git-deploy repo_url SSRF guard), which is not a URI, has no userinfo
-# ambiguity to get wrong, and genuinely cannot go through `url::Url::parse`. Per the
-# s416 pin lesson (project_dockpanel_lessons_p153 #862): when a pin fires on a
-# legitimate new shape, tighten the pin to the ACTUAL invariant instead of loosening
-# the code to dodge it.
-OLD_CHAIN='split\(\x27/\x27\)\.next\(\)[^;]*split\(\x27:\x27\)\.next\(\)'
+# The retired shape's actual fingerprint: cut the PATH at '/' and THEN — within
+# the same few statements — cut the PORT at ':', in that exact order (Go:
+# strings.Cut/Split/SplitN). Matching the two cuts ANYWHERE, independent of
+# order, over-fires on a legitimate use of the same calls for something that
+# isn't URL-authority extraction — the scp-like `git@host:path` git-remote
+# shorthand (repoURLAuthority), which cuts ':' FIRST, has no userinfo
+# ambiguity to get wrong, and genuinely cannot go through net/url. Per the s416
+# pin lesson: when a pin fires on a legitimate new shape, tighten the pin to the
+# ACTUAL invariant instead of loosening the code to dodge it.
+OLD_CHAIN='strings\.(?:Cut|SplitN?)\([^)]*"/"[^)]*\).{0,200}?strings\.(?:Cut|SplitN?)\([^)]*":"'
+REV_CHAIN='strings\.(?:Cut|SplitN?)\([^)]*":"[^)]*\).{0,200}?strings\.(?:Cut|SplitN?)\([^)]*"/"'
+
+# Exit 0 = match, 1 = no match, anything else = the matcher itself broke (which
+# must never read as "absent"). The pattern travels in the environment so no
+# '/' or quote in it can be mangled by the shell or perl's own delimiters.
+matches() { code "$1" | RE="$2" perl -0777 -ne 'BEGIN { $re = qr/$ENV{RE}/s } exit(/$re/ ? 0 : 1)'; }
 
 echo "§A  the hand-rolled host extraction is absent in both parsers"
 for f in "$HELPERS" "$EXT"; do
-  F=$(flat "$f")
-  if grep -qP "$OLD_CHAIN" <<< "$F"; then
-    bad "§A $f: hand-rolled 'split('/')…split(':')' host extraction is back"
-  else
+  matches "$f" "$OLD_CHAIN"; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    bad "§A $f: hand-rolled cut-at-'/'…cut-at-':' host extraction is back"
+  elif [ "$rc" -eq 1 ]; then
     ok "§A $f: no substring host extraction"
+  else
+    bad "§A $f: the detector itself failed (rc=$rc) — this arm examined nothing"
   fi
 done
+# Positive control: the same detector, order reversed, still sees the git@ shorthand.
+if matches "$HELPERS" "$REV_CHAIN"; then
+  ok "§A [control] the detector still sees the legitimate git@host:path cuts (':' then '/')"
+else
+  bad "§A [control] the detector cannot see repoURLAuthority's git@ cuts — the absence arms above may be blind"
+fi
 
 echo
 echo "§B  the one real parser is present (positive control)"
-if grep -qF "url::Url::parse" <<< "$(flat "$HELPERS")"; then
-  ok "§B helpers.rs parses with url::Url::parse"
+UA=$(fnbody "$HELPERS" urlAuthority)
+if grep -qF "parseAuthority(rawURL, true)" <<< "$UA" && grep -qF "url.Parse(rawURL)" <<< "$(fnbody "$HELPERS" parseAuthority)"; then
+  ok "§B core_helpers.go parses with net/url (urlAuthority → parseAuthority → url.Parse)"
 else
-  bad "§B helpers.rs no longer parses with url::Url — the guard may have been gutted"
+  bad "§B core_helpers.go no longer parses with net/url — the guard may have been gutted"
 fi
-# extensions.rs must DELEGATE, not re-implement: it calls the shared helper and
-# does NOT itself call url::Url::parse or lookup_host for the webhook URL.
-EXTF=$(flat "$EXT")
-if grep -qF "helpers::validate_url_not_internal" <<< "$EXTF"; then
-  ok "§B extensions.rs delegates to the shared helper"
+# rt_extensions.go must DELEGATE, not re-implement: it calls the shared helper
+# and does NOT itself parse or resolve the webhook URL.
+EXTC=$(code "$EXT")
+if grep -qF "validateURLNotInternal(ctx, url)" <<< "$EXTC"; then
+  ok "§B rt_extensions.go delegates to the shared validateURLNotInternal"
 else
-  bad "§B extensions.rs no longer delegates to helpers::validate_url_not_internal"
+  bad "§B rt_extensions.go no longer delegates to validateURLNotInternal"
 fi
-if grep -qF "tokio::net::lookup_host" <<< "$EXTF"; then
-  bad "§B extensions.rs resolves a host itself again — the weak second copy is regrowing"
+if grep -qE "Lookup(Host|IP|NetIP|IPAddr)\(|lookupValidated\(|url\.Parse\(" <<< "$EXTC"; then
+  bad "§B rt_extensions.go parses/resolves a host itself again — the weak second copy is regrowing"
 else
-  ok "§B extensions.rs does not resolve a webhook host itself"
+  ok "§B rt_extensions.go does not resolve a webhook host itself"
 fi
 
 echo
 echo "§C  the tcp/ping lane is guarded (bare-host SSRF check exists and is wired)"
-if grep -qF "fn validate_host_not_internal" <<< "$(code "$HELPERS")"; then
-  ok "§C helpers.rs defines validate_host_not_internal"
+if grep -qF "func validateHostNotInternal(" <<< "$(code "$HELPERS")"; then
+  ok "§C core_helpers.go defines validateHostNotInternal"
 else
-  bad "§C helpers.rs no longer defines the bare-host guard"
+  bad "§C core_helpers.go no longer defines the bare-host guard"
 fi
-# Write time (monitors.rs, create+update) still calls validate_host_not_internal
-# directly — nothing to connect to yet, so there is nothing to pin.
-#
-# Check time (uptime.rs, check_tcp/check_ping) was rewritten at s414 to call
-# `resolve_validated` instead: the SAME internal-address check
-# (ip_is_internal over a literal IP or every resolved address), but returning
-# the one validated SocketAddr so the connect below dials THAT address rather
-# than asking the OS to resolve the hostname a second, independent time (the
-# TOCTOU a rebinding DNS server could exploit between the old validate-then-
-# reconnect pair). Count either name at check time — both are the real guard;
-# only the identifier changed.
-UPT_CALLS=$(grep -cE "validate_host_not_internal|resolve_validated" <<< "$(code "$UPT")")
-MON_CALLS=$(grep -cF "validate_host_not_internal" <<< "$(code "$MON")")
+# Write time (rt_monitors.go, create+update) calls validateHostNotInternal.
+# Check time (svc_uptime.go, tcp/ping) calls resolveValidated: the SAME
+# internal-address check, returning the one validated address so the connect
+# dials THAT address rather than resolving again (s414). Count either name.
+UPT_CALLS=$(grep -cE "validateHostNotInternal\(|resolveValidated\(" <<< "$(code "$UPT")")
+MON_CALLS=$(grep -cF "validateHostNotInternal(" <<< "$(code "$MON")")
 if [ "${UPT_CALLS:-0}" -ge 2 ]; then
-  ok "§C uptime.rs re-validates the host in check_tcp and check_ping ($UPT_CALLS calls)"
+  ok "§C svc_uptime.go re-validates the host in the tcp and ping checks ($UPT_CALLS calls)"
 else
-  bad "§C uptime.rs check-time host validation missing ($UPT_CALLS calls, want ≥2)"
+  bad "§C svc_uptime.go check-time host validation missing ($UPT_CALLS calls, want ≥2)"
 fi
 if [ "${MON_CALLS:-0}" -ge 2 ]; then
-  ok "§C monitors.rs validates the tcp/ping host at create and update ($MON_CALLS calls)"
+  ok "§C rt_monitors.go validates the tcp/ping host at create and update ($MON_CALLS calls)"
 else
-  bad "§C monitors.rs write-time host validation missing ($MON_CALLS calls, want ≥2)"
+  bad "§C rt_monitors.go write-time host validation missing ($MON_CALLS calls, want ≥2)"
 fi
 
 echo
 echo "§E  the uptime redirect-hop resolver closes the check-then-reconnect gap"
 
-# Isolate http_check_client_builder()'s own body (start of its signature to the
-# closing brace at column 0 that ends the function) rather than grepping the
-# whole file — a bare '.dns_resolver(' or 'ValidatingResolver' match anywhere
-# else (e.g. this very comment block) would be vacuous. `code()` strips
-# comments FIRST so the header text above can never satisfy the co-occurrence
-# it is itself describing.
-BUILDER_FN=$(code "$UPT" | perl -0777 -ne 'print $1 if /(fn http_check_client_builder\(\).*?\n\}\n)/s')
-if [ -z "$BUILDER_FN" ]; then
-  bad "§E could not isolate http_check_client_builder() body — function renamed or removed?"
-elif grep -qF '.dns_resolver(' <<< "$BUILDER_FN" && grep -qF 'ValidatingResolver' <<< "$BUILDER_FN"; then
-  ok "§E http_check_client_builder() installs .dns_resolver(...ValidatingResolver...)"
+# Isolate the functions' own bodies rather than grepping whole files — a bare
+# 'validatingDialContext' match anywhere else (e.g. a comment) would be vacuous.
+CHECK_FN=$(fnbody "$UPT" uptimeCheckHTTP)
+PINNED_FN=$(fnbody "$HELPERS" pinnedTransport)
+if [ -z "$CHECK_FN" ] || [ -z "$PINNED_FN" ]; then
+  bad "§E could not isolate uptimeCheckHTTP()/pinnedTransport() — function renamed or removed?"
+elif grep -qF 'tr, err := pinnedTransport(ctx, host, port)' <<< "$CHECK_FN" && grep -qF 'Transport: tr' <<< "$CHECK_FN" \
+     && grep -qF 'tr.DialContext = func(' <<< "$PINNED_FN" && grep -qF 'return validatingDialContext(ctx, network, addr)' <<< "$PINNED_FN"; then
+  ok "§E the uptime HTTP client's transport dials every redirect hop through validatingDialContext"
 else
-  bad "§E http_check_client_builder() no longer wires a custom dns_resolver"
+  bad "§E the uptime HTTP client no longer wires validatingDialContext into its DialContext"
 fi
-# Positive control: the pre-existing synchronous blocking check is STILL in the
-# SAME function — proves the resolver was ADDED, not swapped in to replace the
-# only thing that can catch a literal-IP redirect target (a Resolve impl is
-# never consulted for one; hyper's connector dials a literal IP directly).
-if grep -qF 'host_resolves_internal_blocking' <<< "$BUILDER_FN"; then
-  ok "§E http_check_client_builder() still runs the synchronous per-hop block too"
+# Positive control: the pre-existing synchronous blocking check is STILL on the
+# SAME client — proves the dial-time resolver was ADDED, not swapped in to
+# replace the only thing that can catch a literal-IP redirect target.
+if grep -qF 'CheckRedirect: uptimeCheckRedirect' <<< "$CHECK_FN" \
+   && grep -qF 'hostResolvesInternalBlocking(' <<< "$(fnbody "$UPT" uptimeCheckRedirect)"; then
+  ok "§E uptimeCheckHTTP's client still runs the synchronous per-hop block too"
 else
-  bad "§E the synchronous redirect-hop check is gone from http_check_client_builder()"
+  bad "§E the synchronous redirect-hop check is gone from the uptime HTTP client"
 fi
 
-# ValidatingResolver's OWN resolve() body must call the real validator, not a
-# stub — isolate the impl block specifically, not the whole file.
-RESOLVER_IMPL=$(code "$HELPERS" | perl -0777 -ne 'print $1 if /(impl reqwest::dns::Resolve for ValidatingResolver \{.*?\n\}\n)/s')
-if [ -z "$RESOLVER_IMPL" ]; then
-  bad "§E could not isolate ValidatingResolver's Resolve impl — renamed or removed?"
-elif grep -qF 'resolve_all_validated(' <<< "$RESOLVER_IMPL"; then
-  ok "§E ValidatingResolver::resolve() calls the real validator, not a stub"
+# validatingDialContext's OWN body must call the real validator, not a stub.
+VDC=$(fnbody "$HELPERS" validatingDialContext)
+if [ -z "$VDC" ]; then
+  bad "§E could not isolate validatingDialContext — renamed or removed?"
+elif grep -qF 'resolveAllValidated(' <<< "$VDC"; then
+  ok "§E validatingDialContext() calls the real validator, not a stub"
 else
-  bad "§E ValidatingResolver::resolve() no longer calls resolve_all_validated"
+  bad "§E validatingDialContext() no longer calls resolveAllValidated"
 fi
 
 # The structural security property: the redirect-hop guard and the
-# INITIAL-request guard (resolve_validated, already pinned by §B/§C's siblings)
-# share ONE classifier rather than two that could quietly drift apart — count
-# resolve_all_validated( call sites across the whole file; both callers plus
-# its own `fn` line is 3.
-CALLS=$(grep -coF 'resolve_all_validated(' <<< "$(code "$HELPERS")")
+# INITIAL-request guard (resolveValidated) share ONE classifier rather than two
+# that could quietly drift apart — both callers plus its own `func` line is 3.
+CALLS=$(grep -coF 'resolveAllValidated(' <<< "$(code "$HELPERS")")
 if [ "${CALLS:-0}" -ge 3 ]; then
-  ok "§E resolve_all_validated is the SHARED core for both the initial request and every redirect hop ($CALLS occurrences)"
+  ok "§E resolveAllValidated is the SHARED core for both the initial request and every redirect hop ($CALLS occurrences)"
 else
-  bad "§E resolve_all_validated is not shared by both guards ($CALLS occurrences, want ≥3 — declaration + 2 callers)"
+  bad "§E resolveAllValidated is not shared by both guards ($CALLS occurrences, want ≥3 — declaration + 2 callers)"
 fi
 
 echo

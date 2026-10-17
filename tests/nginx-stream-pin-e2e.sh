@@ -21,15 +21,15 @@ assert_contains() {
 }
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-AGENT_STREAM_SVC="$REPO/panel/agent/src/services/nginx_stream.rs"
-AGENT_STREAM_ROUTE="$REPO/panel/agent/src/routes/nginx_stream.rs"
-BACKEND_TCP="$REPO/panel/backend/src/routes/tcp_proxies.rs"
-BACKEND_DB="$REPO/panel/backend/src/routes/databases.rs"
-AGENT_DB_SVC="$REPO/panel/agent/src/services/database.rs"
-MIGRATION="$(ls "$REPO"/panel/backend/migrations/*_tcp_proxies.sql 2>/dev/null | head -1)"
+AGENT_STREAM_SVC="$REPO/panel/go/internal/agent/services/nginx_stream.go"
+AGENT_STREAM_ROUTE="$REPO/panel/go/internal/agent/routes/nginx_stream.go"
+BACKEND_TCP="$REPO/panel/go/internal/api/rt_tcp_proxies.go"
+BACKEND_DB="$REPO/panel/go/internal/api/rt_databases.go"
+AGENT_DB_SVC="$REPO/panel/go/internal/agent/services/database.go"
+MIGRATION="$(ls "$REPO"/panel/go/internal/api/migrations/*_tcp_proxies.sql 2>/dev/null | head -1)"
 
 echo "── S0: files exist ──"
-for f in "$AGENT_STREAM_SVC" "$AGENT_STREAM_ROUTE" "$BACKEND_TCP" "$MIGRATION"; do
+for f in "$AGENT_STREAM_SVC" "$AGENT_STREAM_ROUTE" "$BACKEND_TCP" "$BACKEND_DB" "$AGENT_DB_SVC" "$MIGRATION"; do
     [ -n "$f" ] && [ -f "$f" ] && ok "$(basename "$f") exists" || bad "missing: $f"
 done
 
@@ -145,44 +145,44 @@ check "no http anchor: block appended" \
 
 echo
 echo "── S3: agent service contract ──"
-assert_contains "$AGENT_STREAM_SVC" 'STREAM_DIR: &str = "/etc/nginx/dockpanel-streams"' \
+assert_contains "$AGENT_STREAM_SVC" 'NginxStreamDir = "/etc/nginx/dockpanel-streams"' \
     "agent writes into the managed stream dir"
-assert_contains "$AGENT_STREAM_SVC" 'restore_or_remove' \
+assert_contains "$AGENT_STREAM_SVC" 'NginxRestoreOrRemove(' \
     "stream writes roll back through the vhost rollback path"
-assert_contains "$AGENT_STREAM_SVC" 'test_config' \
+assert_contains "$AGENT_STREAM_SVC" 'NginxTestConfig()' \
     "stream writes are gated by nginx -t"
-assert_contains "$AGENT_STREAM_SVC" 'container_loopback_port' \
+assert_contains "$AGENT_STREAM_SVC" 'func NginxStreamContainerLoopbackPort(' \
     "database upstreams are read off the container, not the wire"
-assert_contains "$AGENT_STREAM_SVC" 'dockpanel.managed' \
+assert_contains "$AGENT_STREAM_SVC" 'Labels["dockpanel.managed"] != "true"' \
     "container upstreams require the managed label"
-assert_contains "$AGENT_STREAM_SVC" 'std::fs::hard_link(&tmp, &path)' \
+assert_contains "$AGENT_STREAM_SVC" 'os.Link(tmp, path)' \
     "create never overwrites an existing proxy file"
 assert_contains "$BACKEND_TCP" 'check tcp proxy name' \
     "backend refuses a taken name before calling the agent"
 assert_contains "$AGENT_STREAM_SVC" 'deny all;' \
     "allow-listed listeners deny everyone else"
-assert_contains "$AGENT_STREAM_SVC" 'normalize_allow_entry' \
+assert_contains "$AGENT_STREAM_SVC" 'NginxStreamNormalizeAllowEntry(a)' \
     "allow entries are re-parsed before reaching the config"
 # The render must never be reachable from the route file — routes delegate.
 check "route file has no inline server block" \
       "$(grep -c 'server {' "$AGENT_STREAM_ROUTE")" "0"
-assert_contains "$AGENT_STREAM_ROUTE" 'write_stream_proxy' "route delegates writes"
-assert_contains "$AGENT_STREAM_ROUTE" 'firewall::add_port' "create opens the firewall port"
-assert_contains "$AGENT_STREAM_ROUTE" 'firewall::remove_port' "delete closes the firewall port"
+assert_contains "$AGENT_STREAM_ROUTE" 'services.NginxStreamWriteProxy(' "route delegates writes"
+assert_contains "$AGENT_STREAM_ROUTE" 'services.FirewallAddPort(' "create opens the firewall port"
+assert_contains "$AGENT_STREAM_ROUTE" 'services.FirewallRemovePort(' "delete closes the firewall port"
 
 echo
 echo "── S4: database remote access contract ──"
-assert_contains "$AGENT_DB_SVC" 'host_ip: Some("127.0.0.1".to_string())' \
+assert_contains "$AGENT_DB_SVC" 'HostIP: netip.MustParseAddr("127.0.0.1")' \
     "db containers keep loopback-only port bindings"
 check "no public host_ip publish added for databases" \
-      "$(cat "$AGENT_DB_SVC" "$BACKEND_DB" | grep -cE 'host_ip: Some\("0\.0\.0\.0"')" "0"
-assert_contains "$BACKEND_DB" 'remote_access_enable' "backend exposes the enable endpoint"
-assert_contains "$BACKEND_DB" 'remote_access_disable' "backend exposes the disable endpoint"
-assert_contains "$BACKEND_DB" 'tcp_proxies' "database delete cleans up its stream proxy"
+      "$(cat "$AGENT_DB_SVC" "$BACKEND_DB" | grep -E 'HostIP:' | grep -cvF 'HostIP: netip.MustParseAddr("127.0.0.1")')" "0"
+assert_contains "$BACKEND_DB" 'h(rtDatabasesRemoteAccessEnable)' "backend exposes the enable endpoint"
+assert_contains "$BACKEND_DB" 'h(rtDatabasesRemoteAccessDisable)' "backend exposes the disable endpoint"
+assert_contains "$BACKEND_DB" 'DELETE FROM tcp_proxies WHERE database_id' "database delete cleans up its stream proxy"
 assert_contains "$MIGRATION" 'kind' "tcp_proxies records the proxy kind"
 assert_contains "$MIGRATION" 'database_id' "tcp_proxies links proxies to databases"
 assert_contains "$MIGRATION" 'ON DELETE CASCADE' "db delete cascades its proxy row"
-assert_contains "$BACKEND_TCP" '40000' "backend enforces the managed port range"
+assert_contains "$BACKEND_TCP" 'rtTcpProxiesListenPortMin int32 = 40000' "backend enforces the managed port range"
 
 echo
 echo "── S5: TLS termination contract ──"
@@ -190,7 +190,7 @@ assert_contains "$AGENT_STREAM_ROUTE" '/etc/dockpanel/ssl-registry/' \
     "agent restricts cert paths to the managed roots"
 assert_contains "$AGENT_STREAM_ROUTE" 'tls requires cert_path' \
     "tls=true refuses without certificate paths"
-assert_contains "$AGENT_STREAM_SVC" 'listen {listen_port} ssl;' \
+assert_contains "$AGENT_STREAM_SVC" 'listen %d ssl;\n", listenPort' \
     "TLS listeners render the ssl flag on listen"
 assert_contains "$AGENT_STREAM_SVC" 'ssl_certificate_key' \
     "TLS listeners reference the registry key in place"
@@ -198,13 +198,17 @@ assert_contains "$BACKEND_TCP" 'tls_certificates' \
     "backend resolves certs from the registry table"
 assert_contains "$BACKEND_TCP" 'user_id = $3 OR $4' \
     "certificate lookup is caller-scoped (or admin)"
-assert_contains "$REPO/panel/backend/src/routes/tls_certificates.rs" 'tcp_proxies' \
+assert_contains "$REPO/panel/go/internal/api/rt_tls_certificates.go" 'tcp_proxies' \
     "cert delete refuses while a stream proxy references it"
 # Private key material must never be on the wire or in a log line.
 check "agent never logs key paths" \
-      "$(cat "$AGENT_STREAM_ROUTE" "$AGENT_STREAM_SVC" | grep -cE 'tracing::(info|warn|error)!\([^)]*key')" "0"
+      "$(cat "$AGENT_STREAM_ROUTE" "$AGENT_STREAM_SVC" | grep -ciE 'slog\.(Debug|Info|Warn|Error)\(.*key')" "0"
+check "…and the log-call detector can see the agent's slog calls (positive control)" \
+      "$(cat "$AGENT_STREAM_ROUTE" "$AGENT_STREAM_SVC" | grep -cE 'slog\.(Debug|Info|Warn|Error)\(' | awk '{print ($1>0)?"yes":"no"}')" "yes"
 check "backend never sends key material to the agent" \
       "$(grep -c '"private_key"' "$BACKEND_TCP")" "0"
+assert_contains "$BACKEND_TCP" 'SELECT cert_path, key_path FROM tls_certificates' \
+    "…the agent gets registry PATHS instead (positive anchor)"
 
 echo
 echo "── S6: documentation contract ──"

@@ -31,9 +31,18 @@
 #
 # ⚠ EVERY ARM READS COMMENT-STRIPPED SOURCE, and this suite is why that rule
 # exists (lesson #469 — a census keyed on a hazard counts its own documentation).
-# `services/domain_claim.rs` carries a doc comment reading "the four `INSERT INTO
-# sites` sites", which is textually identical to the thing §B counts. Counted raw,
-# §B finds five doors in four files and reports a defect in a comment.
+# `services/domain_claim.rs` (now panel/go/internal/api/svc_domain_claim.go)
+# carries a doc comment naming "the `INSERT INTO sites` paths", which is
+# textually identical to the thing §B counts. Counted raw, §B finds a door in a
+# comment and reports a defect in prose.
+#
+# GO PORT: every subject is now panel/go/internal/api (flat package). Handlers
+# are `func rtX(st *AppState, w http.ResponseWriter, r *http.Request) error`;
+# names below are the ported ones (exec_command -> rtDockerAppsExecCommand,
+# terminals_locked_down -> rtTerminalTerminalsLockedDown, site_rate_limit ->
+# rtSitesSiteRateLimit, is_locked_down -> SecurityHardeningIsLockedDown). The
+# migration import's INSERT lives in its background worker rtMigrationRunImport,
+# so §B attributes a non-handler door to the handler in its file that calls it.
 #
 # Pure source analysis: no box, no network, no build.
 #
@@ -74,13 +83,14 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-APPS=panel/backend/src/routes/docker_apps.rs
-TERM=panel/backend/src/routes/terminal.rs
-SITES=panel/backend/src/routes/sites.rs
-STAGING=panel/backend/src/routes/staging.rs
-MIGR=panel/backend/src/routes/migration.rs
-SET=panel/backend/src/routes/settings.rs
-NOTIF=panel/backend/src/services/notifications.rs
+API=panel/go/internal/api
+APPS=$API/rt_docker_apps.go
+TERM=$API/rt_terminal.go
+SITES=$API/rt_sites.go
+STAGING=$API/rt_staging.go
+MIGR=$API/rt_migration.go
+SET=$API/rt_settings.go
+NOTIF=$API/svc_notifications.go
 SETTINGS_TSX=panel/frontend/src/pages/Settings.tsx
 
 for f in "$APPS" "$TERM" "$SITES" "$STAGING" "$MIGR" "$SET" "$NOTIF" "$SETTINGS_TSX"; do
@@ -101,12 +111,12 @@ code() {
 
 subj() { local t; t=$(code "$1"); [ -n "$t" ] || return 1; printf '%s' "$t"; }
 
-# The body of one top-level fn, bounded by the NEXT top-level fn. A fixed
-# `grep -A n` window is not a function (lessons #131/#172).
+# The body of one top-level Go func (or method), bounded by the NEXT top-level
+# declaration. A fixed `grep -A n` window is not a function (lessons #131/#172).
 fnbody() {
   awk -v name="$2" '
-    /^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn / {
-      if ($0 ~ "(pub |pub\\(crate\\) )?(async )?fn " name "\\(") { inside=1; next }
+    /^(func|type|var|const) / {
+      if (index($0, "func " name "(") == 1 || $0 ~ ("^func \\([^)]*\\) " name "\\(")) { inside=1; next }
       inside=0
     }
     inside { print }
@@ -118,10 +128,11 @@ fnbody() {
 # censuses rather than lists.
 fns_matching() {
   awk -v pat="$2" '
-    /^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn / {
+    /^(type|var|const) / { cur="" }
+    /^func / {
       cur=$0
-      sub(/^.*fn[[:space:]]+/, "", cur)
-      sub(/[(<].*$/, "", cur)
+      sub(/^func[[:space:]]+(\([^)]*\)[[:space:]]+)?/, "", cur)
+      sub(/[(\[].*$/, "", cur)
     }
     $0 ~ pat { if (cur != "" && !seen[cur]++) print cur }
   ' <<< "$1"
@@ -135,7 +146,9 @@ if A=$(subj "$APPS"); then
   # it is execution on the host and it is the step the console takes immediately
   # before opening a shell, so closing the exec and leaving its probe open would
   # be hardening that stops one step short (lesson #449).
-  EXEC_DOORS=$(fns_matching "$A" '/apps/[{][a-z_]+[}]/(exec|shell-info)')
+  # Go builds the path as "/apps/"+cid+"/exec"; the route table lines are
+  # inside a register func, so only agent calls count (`agent.Get/Post(`).
+  EXEC_DOORS=$(fns_matching "$A" 'agent[.](Get|Post)[(].*"/(exec|shell-info)"')
   DOOR_N=$(grep -c . <<< "$EXEC_DOORS")
 
   if [ "$DOOR_N" -eq 2 ]; then
@@ -149,7 +162,7 @@ if A=$(subj "$APPS"); then
     [ -n "$fn" ] || continue
     B=$(fnbody "$A" "$fn")
 
-    if grep -qE 'terminals_locked_down\(&state\.db\)' <<< "$B"; then
+    if grep -qE 'rtTerminalTerminalsLockedDown\(r\.Context\(\), st\.DB\)' <<< "$B"; then
       ok "A1 $fn consults the lockdown"
     else
       bad "A1 $fn consults the lockdown"
@@ -159,9 +172,10 @@ if A=$(subj "$APPS"); then
     # as a deliberate "this handler needs no database", and is the exact form in
     # which this defect shipped — so a future edit that reverts the binding puts
     # the door back structurally, and the arm above would go red for a reason
-    # that looks like a missing call rather than a missing capability.
-    SIG=$(awk -v n="$fn" '$0 ~ "fn " n "\\(" {f=1} f {print} f && /^\) ->/ {exit}' <<< "$A")
-    if grep -qE 'State\(state\): State<AppState>' <<< "$SIG"; then
+    # that looks like a missing call rather than a missing capability. In Go the
+    # same shape is `func rtX(_ *AppState, ...)`.
+    SIG=$(grep -E "^func $fn\(" <<< "$A")
+    if grep -qE "^func $fn\(st \*AppState," <<< "$SIG"; then
       ok "A2 $fn binds State so it can consult it"
     else
       bad "A2 $fn binds State so it can consult it"
@@ -169,8 +183,8 @@ if A=$(subj "$APPS"); then
 
     # Order: the refusal must precede the call it is refusing. A guard below the
     # agent call is not a guard.
-    GLINE=$(grep -nE 'terminals_locked_down' <<< "$B" | head -1 | cut -d: -f1)
-    CLINE=$(grep -nE '\.(get|post)\(&format!\("/apps/' <<< "$B" | head -1 | cut -d: -f1)
+    GLINE=$(grep -nE 'rtTerminalTerminalsLockedDown' <<< "$B" | head -1 | cut -d: -f1)
+    CLINE=$(grep -nE 'agent\.(Get|Post)\(r\.Context\(\), "/apps/' <<< "$B" | head -1 | cut -d: -f1)
     if [ -n "$GLINE" ] && [ -n "$CLINE" ] && [ "$GLINE" -lt "$CLINE" ]; then
       ok "A3 $fn refuses before it dispatches (gate@$GLINE < agent@$CLINE)"
     else
@@ -185,13 +199,15 @@ fi
 # down" from two different expressions is how the page and the gate drift apart,
 # which is the condition this whole suite exists to prevent.
 if A=$(subj "$APPS") && T=$(subj "$TERM"); then
-  if grep -qE 'pub async fn terminals_locked_down' <<< "$T"; then
+  if grep -qE '^func rtTerminalTerminalsLockedDown\(' <<< "$T" &&
+     [ "$(grep -rhE '^func rtTerminalTerminalsLockedDown\(' "$API"/*.go | wc -l)" -eq 1 ]; then
     ok "A4 the shared predicate is defined once, in $(basename $TERM)"
   else
     bad "A4 the shared predicate is defined once, in $(basename $TERM)"
   fi
   # No local re-derivation of the predicate in the apps module.
-  if ! grep -qE 'lockdown_state|lockdown_terminal_state' <<< "$A"; then
+  if grep -qE 'rtTerminalTerminalsLockedDown' <<< "$A" &&
+     ! grep -qE 'lockdown_state|rtTerminalLockdownTerminalState' <<< "$A"; then
     ok "A5 $(basename $APPS) does not re-derive the predicate"
   else
     bad "A5 $(basename $APPS) does not re-derive the predicate"
@@ -204,7 +220,18 @@ SITE_DOORS=""
 for f in "$SITES" "$STAGING" "$MIGR"; do
   if S=$(subj "$f"); then
     for fn in $(fns_matching "$S" 'INSERT INTO sites'); do
-      SITE_DOORS="${SITE_DOORS}${f}:${fn}"$'\n'
+      # A door is a HANDLER. An INSERT in a helper (the migration's background
+      # worker) is attributed to the handler(s) in the same file that call it,
+      # so the guard is judged where the request enters.
+      if grep -qE "^func $fn\(st \*AppState, w http\.ResponseWriter" <<< "$S"; then
+        SITE_DOORS="${SITE_DOORS}${f}:${fn}"$'\n'
+      else
+        for h in $(fns_matching "$S" "[^A-Za-z0-9_]$fn[(]"); do
+          [ "$h" = "$fn" ] && continue
+          grep -qE "^func $h\(st \*AppState, w http\.ResponseWriter" <<< "$S" || continue
+          SITE_DOORS="${SITE_DOORS}${f}:${h}"$'\n'
+        done
+      fi
     done
   else
     bad "B- could not read $f"
@@ -226,7 +253,7 @@ while read -r entry; do
   f=${entry%%:*}; fn=${entry##*:}
   B=$(fnbody "$(subj "$f")" "$fn")
 
-  if grep -qE 'is_locked_down\(&state\.db\)' <<< "$B"; then
+  if grep -qE 'SecurityHardeningIsLockedDown\(ctx, st\.DB\)' <<< "$B"; then
     ok "B1 $(basename $f)::$fn refuses during a lockdown"
   else
     bad "B1 $(basename $f)::$fn refuses during a lockdown"
@@ -243,10 +270,11 @@ while read -r entry; do
   [ -n "$entry" ] || continue
   f=${entry%%:*}; fn=${entry##*:}
   B=$(fnbody "$(subj "$f")" "$fn")
-  if grep -qE 'site_rate_limit\(&state\.db\)' <<< "$B"; then
+  if grep -qE 'rtSitesSiteRateLimit\(ctx, st\.DB\)' <<< "$B"; then
     CEIL=$((CEIL+1))
-  elif [ "$(basename $f)" = "migration.rs" ]; then
-    if grep -qE 'ceiling|per-hour' <<< "$(sed -n '/pub async fn import(/,/^}/p' "$f")"; then
+  elif [ "$(basename $f)" = "rt_migration.go" ]; then
+    # Read RAW on purpose: the recorded reason IS a comment.
+    if grep -qE 'ceiling|per-hour' <<< "$(sed -n '/^func rtMigrationImport(/,/^}/p' "$f")"; then
       ok "B2 $(basename $f)::$fn is the recorded exclusion from the ceiling"
     else
       bad "B2 $(basename $f)::$fn omits the ceiling with no recorded reason"
@@ -264,23 +292,23 @@ fi
 # differently, and it is why the helper became crate-visible instead of being
 # duplicated into the module that could not reach it.
 if S=$(subj "$SITES"); then
-  DEFS=$(grep -cE '^(pub\(crate\) )?async fn site_rate_limit' <<< "$S")
-  if [ "$DEFS" -eq 1 ]; then
+  # Counted across the whole (flat) package: a second copy in another file is
+  # the drift this arm exists to catch.
+  DEFS=$(grep -hcE '^func rtSitesSiteRateLimit\(' "$API"/*.go | awk '{n+=$1} END{print n+0}')
+  if [ "$DEFS" -eq 1 ] && grep -qE '^func rtSitesSiteRateLimit\(' <<< "$S"; then
     ok "B4 the ceiling has exactly one definition"
   else
     bad "B4 the ceiling has $DEFS definitions"
   fi
-  if grep -qE 'pub\(crate\) async fn site_rate_limit' <<< "$S"; then
-    ok "B5 the ceiling is reachable from other modules"
-  else
-    bad "B5 the ceiling is reachable from other modules"
-  fi
 fi
+# B5 retired (obsolete in Go): visibility — internal/api is one flat package, so
+# the ceiling is reachable from every handler file by construction (B3 proves the
+# staging file calls it).
 
 echo "== §C  the panel's own URL is settable by an operator =="
 
 if S=$(subj "$SET"); then
-  ALLOWED=$(awk '/pub const ALLOWED_KEYS/,/\];/' <<< "$S")
+  ALLOWED=$(awk '/^var rtSettingsAllowedKeys = /,/^}/' <<< "$S")
   if grep -qE '"base_url"' <<< "$ALLOWED"; then
     ok "C1 base_url is in the settings allow-list"
   else
@@ -300,7 +328,7 @@ fi
 # the same severed pair pointing the other way, and it would leave §C green over
 # a control that configures nothing.
 if N=$(subj "$NOTIF"); then
-  if grep -qE "key = 'base_url'" <<< "$N"; then
+  if grep -qE 'notificationsSetting\(ctx, db, "base_url"\)' <<< "$N"; then
     ok "C3 the reader that makes the setting mean something is still there"
   else
     bad "C3 the reader that makes the setting mean something is still there"

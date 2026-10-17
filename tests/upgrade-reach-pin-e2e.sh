@@ -35,7 +35,7 @@
 # ⚠ NO PIPES INTO `grep -q`: under pipefail the upstream dies of SIGPIPE and the
 # pipeline reports failure, turning an arm red on correct code. Here-strings only.
 #
-# ⚠ Rust arms are scoped to their subject's OWN function body, never file-wide —
+# ⚠ Go arms are scoped to their subject's OWN function body, never file-wide —
 # an s330 arm grepped setup.sh file-wide for `umask 077` and printed GREEN at the
 # previous tag off three unrelated mktemp calls (lesson #330).
 
@@ -48,13 +48,12 @@ bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
 UPD=scripts/update.sh
 SET=scripts/setup.sh
-ORCH=panel/backend/src/routes/backup_orchestrator.rs
-MAIN=panel/backend/src/main.rs
-RMOD=panel/backend/src/routes/mod.rs
-GITD=panel/backend/src/routes/git_deploys.rs
-DEPL=panel/backend/src/routes/deploy.rs
+ORCH=panel/go/internal/api/rt_backup_orchestrator.go
+RMOD=panel/go/internal/api/core_router.go
+GITD=panel/go/internal/api/rt_git_deploys.go
+DEPL=panel/go/internal/api/rt_deploy.go
 
-for f in "$UPD" "$SET" "$ORCH" "$MAIN" "$RMOD" "$GITD" "$DEPL"; do
+for f in "$UPD" "$SET" "$ORCH" "$RMOD" "$GITD" "$DEPL"; do
   [ -f "$f" ] || bad "MISSING SUBJECT FILE: $f"
 done
 
@@ -80,7 +79,7 @@ shcode() {
   ' "$1"
 }
 
-# Rust/TSX comment stripper — the FIXED one (a `/*` mid-line is data, not the
+# Go/TSX comment stripper — the FIXED one (a `/*` mid-line is data, not the
 # start of a block comment; the naive version deleted real code in four suites).
 code() {
   perl -0777 -pe '
@@ -95,16 +94,10 @@ subj()   { local t; t=$("$1" "$2"); [ -n "$t" ] || return 1; printf '%s' "$t"; }
 has()    { grep -qE -- "$2" <<< "$1"; }
 count()  { grep -cE -- "$2" <<< "$1" || true; }
 
-# Extract one Rust fn body, bounded by the NEXT top-level `pub async fn` — not a
-# fixed -A window, which bleeds into the next function and can match the very
-# token it searches for (lesson #172).
-fnbody() {
-  awk -v start="$2" '
-    $0 ~ start {inside=1}
-    inside && /^pub async fn / && $0 !~ start {exit}
-    inside {print}
-  ' <<< "$1"
-}
+# Extract one top-level Go func body, bounded by its OWN closing brace in
+# column 0 — not a fixed -A window, which bleeds into the next function and can
+# match the very token it searches for (lesson #172).
+fnbody() { sed -n "/^func $2(/,/^}/p" <<< "$1"; }
 
 echo "== §A  update.sh: the umask is scoped to the dump, not to the rest of the upgrade =="
 if S=$(subj shcode "$UPD"); then
@@ -188,13 +181,16 @@ fi
 
 echo "== §C  volume restore: the body, and the scope that body arms =="
 if S=$(subj code "$ORCH"); then
-  BODY=$(fnbody "$S" 'pub async fn restore_volume_backup')
+  BODY=$(fnbody "$S" rtBackupOrchestratorRestoreVolumeBackup)
+  POSTCALL=$(awk '/result, err := agent\.Post\(/{inside=1} inside && /^[[:space:]]*if err != nil/{exit} inside{print}' <<< "$BODY")
   if [ -z "$BODY" ]; then
-    bad "restore_volume_backup not found — §C is measuring nothing"
+    bad "rtBackupOrchestratorRestoreVolumeBackup not found — §C is measuring nothing"
   else
-    # C1 — the call must carry a body. `None` is a guaranteed 415 at the agent's
-    # required Json extractor, which is why this route never worked.
-    if has "$BODY" 'agent\.post\(\s*&agent_path,\s*None'; then
+    # C1 — the call must carry a body. A nil body is a guaranteed 415 at the
+    # agent's required Json extractor, which is why this route never worked.
+    if [ -z "$POSTCALL" ]; then
+      bad "the volume restore POST call was not found — C1 is measuring nothing"
+    elif has "$(tr '\n' ' ' <<< "$POSTCALL")" ',[[:space:]]*nil\)[[:space:]]*$'; then
       bad "the volume restore still posts None — the agent answers 415 before any handler runs"
     else
       ok "the volume restore no longer posts an empty body"
@@ -206,12 +202,12 @@ if S=$(subj code "$ORCH"); then
     # ⚠ Scoped to the POST CALL, not to the function. The first draft grepped the
     # whole fn body for `volume_name` and printed GREEN at v2.88.0 — because the
     # function already spells `backup.volume_name` in the label it passes to
-    # `agent_for_site_server`, an unrelated use. That false green sat inside a
-    # batch of twelve reds, which is precisely where one hides (lesson #330).
-    POSTCALL=$(awk '/let result = agent\.post\(/{inside=1} inside{print} inside && /\.await/{exit}' <<< "$BODY")
+    # `agent_for_site_server` (Go: agentForSiteServer), an unrelated use. That
+    # false green sat inside a batch of twelve reds, which is precisely where
+    # one hides (lesson #330).
     if [ -z "$POSTCALL" ]; then
       bad "the volume restore POST call was not found — C2 is measuring nothing"
-    elif has "$POSTCALL" 'volume_name'; then
+    elif has "$POSTCALL" '"volume_name":'; then
       ok "the restore body carries volume_name, the agent's required field"
     else
       bad "the restore body omits volume_name — the agent rejects it"
@@ -238,48 +234,18 @@ else
   echo "  - skipped §C (subject unreadable)"
 fi
 
-echo "== §D  the webhook limiter's window matches the one its handlers roll =="
-if S=$(subj code "$MAIN"); then
-  # D1 — the webhook map must NOT be evicted on the 2FA window. At v2.88.0 both
-  # sat on window_5m and this arm is RED.
-  WEBHOOK_BLOCK=$(awk '/if let Ok\(mut map\) = webhook\.lock\(\)/{inside=1} inside{print} inside && /^            }/{exit}' <<< "$S")
-  if [ -z "$WEBHOOK_BLOCK" ]; then
-    bad "webhook cleanup block not found in main.rs — §D is measuring nothing"
-  elif has "$WEBHOOK_BLOCK" 'window_1h'; then
-    ok "webhook attempts are retained for the hour their handlers promise"
-  else
-    bad "webhook attempts are evicted on a shorter window — the 10/hour limit resets early"
-  fi
-
-  # D2 — the longer retention is bounded, because entries are inserted on an
-  # UNAUTHENTICATED route keyed on a caller-supplied UUID.
-  if has "$WEBHOOK_BLOCK" 'map\.len\(\) >'; then
-    ok "the longer retention is paired with a size cap"
-  else
-    bad "no size cap — a flood of invented deploy ids now parks in memory for an hour"
-  fi
-
-  # D3 — control: the 2FA sibling is CORRECT and must stay on the short window.
-  # Its handler rolls at 300s, so widening it here would be a regression in the
-  # other direction. This arm is what stops D1 being applied by search-replace.
-  TWOFA_BLOCK=$(awk '/if let Ok\(mut map\) = twofa\.lock\(\)/{inside=1} inside{print} inside && /^            }/{exit}' <<< "$S")
-  if [ -z "$TWOFA_BLOCK" ]; then
-    bad "twofa cleanup block not found — D3 is measuring nothing"
-  elif has "$TWOFA_BLOCK" 'window_5m'; then
-    ok "control: the 2FA limiter still uses its own matching 5-minute window"
-  else
-    bad "the 2FA limiter's window changed — its handler rolls at 300s"
-  fi
-else
-  echo "  - skipped §D (subject unreadable)"
-fi
+# §D (webhook janitor window) — the cleanup is st.cleanupOnce in
+# panel/go/internal/api/core_state.go, which a test can call directly:
+# D1 retired: covered by TestPinUpgradeReachWebhookJanitorWindow (panel/go/internal/api/pin_upgrade_reach_test.go)
+# D2 retired: covered by TestPinUpgradeReachWebhookJanitorCap (panel/go/internal/api/pin_upgrade_reach_test.go)
+# D3 retired: covered by TestPinUpgradeReachWebhookJanitorWindow (panel/go/internal/api/pin_upgrade_reach_test.go)
 
 echo "== §E  the attempt limit has ONE definition, not three literals =="
 if S=$(subj code "$RMOD"); then
-  if has "$S" 'pub const WEBHOOK_ATTEMPT_LIMIT'; then
-    ok "WEBHOOK_ATTEMPT_LIMIT is defined once in routes/mod.rs"
+  if has "$S" '^const WebhookAttemptLimit '; then
+    ok "WebhookAttemptLimit is defined once in core_router.go"
   else
-    bad "WEBHOOK_ATTEMPT_LIMIT is gone — the limit is a literal again"
+    bad "WebhookAttemptLimit is gone — the limit is a literal again"
   fi
 else
   echo "  - skipped §E/def (subject unreadable)"
@@ -290,13 +256,13 @@ fi
 READERS=0
 for f in "$GITD" "$DEPL"; do
   if T=$(subj code "$f"); then
-    has "$T" 'WEBHOOK_ATTEMPT_LIMIT' && READERS=$((READERS+1))
+    has "$T" 'Count >= WebhookAttemptLimit' && READERS=$((READERS+1))
   fi
 done
 if [ "$READERS" -eq 2 ]; then
   ok "both webhook handlers read the shared constant ($READERS/2)"
 else
-  bad "only $READERS/2 webhook handlers read WEBHOOK_ATTEMPT_LIMIT — the literal has drifted back"
+  bad "only $READERS/2 webhook handlers read WebhookAttemptLimit — the literal has drifted back"
 fi
 
 echo

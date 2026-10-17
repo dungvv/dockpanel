@@ -36,17 +36,21 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-MIGRATION=panel/backend/migrations/20260908110000_sftp_accounts.sql
-AGENT_SVC=panel/agent/src/services/sftp_accounts.rs
-AGENT_ROUTE=panel/agent/src/routes/sftp.rs
-AGENT_OWNERSHIP=panel/agent/src/services/ownership.rs
-BACKEND=panel/backend/src/routes/sites.rs
-MODELS=panel/backend/src/models.rs
+# Go port: sftp_accounts.rs → panel/go/internal/agent/services/sftp_accounts.go
+# (SftpAccounts* / sftpAccounts*), ownership::sftp_user → OwnershipSftpUser,
+# sites.rs → api/rt_sites.go (rtSitesEnableSftp/rtSitesDisableSftp/
+# rtSitesRemove/rtSitesBuildNginxBody), safe_cmd.rs → agent/safecmd.
+MIGRATION=panel/go/internal/api/migrations/20260908110000_sftp_accounts.sql
+AGENT_SVC=panel/go/internal/agent/services/sftp_accounts.go
+AGENT_ROUTE=panel/go/internal/agent/routes/sftp.go
+AGENT_OWNERSHIP=panel/go/internal/agent/services/ownership.go
+BACKEND=panel/go/internal/api/rt_sites.go
 FRONTEND=panel/frontend/src/pages/SiteDetail.tsx
-AGENT_UNIT=panel/agent/dockpanel-agent.service
-SAFE_CMD=panel/agent/src/safe_cmd.rs
+AGENT_UNIT=panel/go/internal/agent/services/dockpanel-agent.service
+SAFE_CMD=panel/go/internal/agent/safecmd/safecmd.go
+NGINX_SVC=panel/go/internal/agent/services/nginx.go
 
-for f in "$MIGRATION" "$AGENT_SVC" "$AGENT_ROUTE" "$AGENT_OWNERSHIP" "$BACKEND" "$MODELS" "$FRONTEND" "$AGENT_UNIT" "$SAFE_CMD"; do
+for f in "$MIGRATION" "$AGENT_SVC" "$AGENT_ROUTE" "$AGENT_OWNERSHIP" "$BACKEND" "$FRONTEND" "$AGENT_UNIT" "$SAFE_CMD" "$NGINX_SVC"; do
   [ -f "$f" ] || { echo "missing $f"; exit 1; }
 done
 
@@ -54,13 +58,14 @@ done
 # lines of real code until s294; this deliberately does the narrow, safe thing.
 code() { sed 's://.*$::' "$1"; }
 flat() { code "$1" | tr -d ' \t\n'; }
+# One Go function, `func Name(` through its column-0 closing brace, flattened.
+fnflat() { awk -v fn="$2" 'index($0, "func " fn "(") == 1 {f=1} f {print} f && /^}/ {exit}' "$1" | sed 's://.*$::' | tr -d ' \t\n'; }
 
 MIG_FLAT=$(flat "$MIGRATION")
 SVC_FLAT=$(flat "$AGENT_SVC")
-ROUTE_FLAT=$(flat "$AGENT_ROUTE")
 OWNERSHIP_FLAT=$(flat "$AGENT_OWNERSHIP")
 BACKEND_FLAT=$(flat "$BACKEND")
-SAFE_CMD_FLAT=$(flat panel/agent/src/safe_cmd.rs)
+SAFE_CMD_FLAT=$(flat "$SAFE_CMD")
 
 must_contain() {
   local flat="$1" needle="$2" desc="$3"
@@ -72,42 +77,59 @@ must_contain() {
   esac
 }
 
+# Run Go tests and require each named one to PASS (not merely exist).
+gotest() {
+  local pkg=$1; shift
+  local re out t
+  re="^($(IFS='|'; echo "$*"))\$"
+  if ! command -v go >/dev/null 2>&1; then bad "go toolchain not found — cannot run $*"; return; fi
+  out=$(cd panel/go && go test "$pkg" -run "$re" -count=1 -v 2>&1)
+  for t in "$@"; do
+    if grep -q -- "--- PASS: $t " <<< "$out"; then
+      ok "$t runs and passes"
+    else
+      bad "$t is missing or failing: $(tail -3 <<< "$out" | tr '\n' ' ')"
+    fi
+  done
+}
+
 echo "── A: uid/gid allocation is a real sequence, not MAX()+1 ──"
 must_contain "$MIG_FLAT" 'CREATE SEQUENCE IF NOT EXISTS sftp_id_seq' \
   "migration creates a real sequence for uid/gid allocation"
-must_contain "$BACKEND_FLAT" "SELECT nextval('sftp_id_seq')" \
-  "enable_sftp allocates via nextval(), not a MAX(sftp_uid)+1 read"
+must_contain "$(fnflat "$BACKEND" rtSitesEnableSftp)" "SELECT nextval('sftp_id_seq')" \
+  "rtSitesEnableSftp allocates via nextval(), not a MAX(sftp_uid)+1 read"
 case "$BACKEND_FLAT" in
-  *'MAX(sftp_uid)'*) bad "a MAX(sftp_uid) read exists somewhere in sites.rs — the race this pin exists to prevent" ;;
-  *) ok "no MAX(sftp_uid) read anywhere in sites.rs" ;;
+  *'MAX(sftp_uid)'*) bad "a MAX(sftp_uid) read exists somewhere in rt_sites.go — the race this pin exists to prevent" ;;
+  *'sftp_uid'*) ok "no MAX(sftp_uid) read anywhere in rt_sites.go (sftp_uid is still referenced — non-vacuous)" ;;
+  *) bad "rt_sites.go never mentions sftp_uid — the absence check above is vacuous" ;;
 esac
 
 echo
 echo "── B: sshd drop-in is validated before reload, never bare-restarted ──"
-must_contain "$SVC_FLAT" 'fnreload_sshd_validated' \
+must_contain "$SVC_FLAT" 'func sftpAccountsReloadSshdValidated() error' \
   "a dedicated validated-reload function exists"
-must_contain "$SVC_FLAT" 'safe_command("sshd").args(["-t"])' \
+must_contain "$SVC_FLAT" 'sftpAccountsExec("sshd", "-t")' \
   "sshd -t runs before any reload this module triggers"
-must_contain "$SVC_FLAT" 'safe_command("systemctl").args(["reload","sshd"])' \
+must_contain "$SVC_FLAT" 'sftpAccountsExec("systemctl", "reload", "sshd")' \
   "sshd is reloaded, not restarted (a restart would drop live SSH sessions for an unrelated change)"
 case "$SVC_FLAT" in
-  *'restart_sshd'*) bad "sftp_accounts.rs calls the existing no-validation restart_sshd path" ;;
-  *) ok "sftp_accounts.rs never calls the existing no-validation restart_sshd path" ;;
+  *[Rr]'estartSshd'*|*'"restart","sshd"'*) bad "sftp_accounts.go calls the existing no-validation restart-sshd path" ;;
+  *) ok "sftp_accounts.go never calls the existing no-validation securityRestartSshd path" ;;
 esac
-must_contain "$SVC_FLAT" 'letblock=format!(' \
+must_contain "$SVC_FLAT" 'block := "# Managed by DockPanel' \
   "the Match block is written to its own drop-in file"
-must_contain "$SVC_FLAT" 'MatchGroup{SFTP_GROUP}' \
-  "the sshd block scopes by the shared SFTP_GROUP, not a per-site Match"
+must_contain "$SVC_FLAT" '"Match Group " + SftpAccountsGroup' \
+  "the sshd block scopes by the shared SftpAccountsGroup, not a per-site Match"
 
 echo
 echo "── C: password is hashed in-process, never piped as plaintext ──"
-must_contain "$SVC_FLAT" 'ShaCrypt::default()' \
-  "the password is hashed via sha-crypt before ever reaching a command"
-must_contain "$SVC_FLAT" '"usermod",&[]).args(["-p",hash.as_str()' \
+must_contain "$SVC_FLAT" 'crypt.SHA512.New().Generate([]byte(plaintext), salt)' \
+  "the password is hashed via SHA-crypt (explicit salt) before ever reaching a command"
+must_contain "$SVC_FLAT" 'sftpAccountsUnsandboxed("usermod", "-p", hash, username)' \
   "usermod -p receives the HASH, never the plaintext password"
 case "$SVC_FLAT" in
-  *'"chpasswd"'*) bad "sftp_accounts.rs shells out to chpasswd — this pin assumes the hash-then-usermod path instead" ;;
-  *) ok "no chpasswd call anywhere in sftp_accounts.rs" ;;
+  *'"chpasswd"'*) bad "sftp_accounts.go shells out to chpasswd — this pin assumes the hash-then-usermod path instead" ;;
+  *) ok "no chpasswd call anywhere in sftp_accounts.go" ;;
 esac
 case "$MIG_FLAT" in
   *'sftp_password'*) bad "the migration defines a password-shaped column — none should exist, a Linux account needs no stored password to reset" ;;
@@ -126,37 +148,35 @@ echo "── C2: the salt is sized for SHA-crypt's own 16-character cap, not the
 # authenticate, forever, with nothing pointing at the cause. Confirmed on-box
 # via Python's own crypt.crypt(): a hash made with the default 16-byte salt
 # round-tripped as WRONG. 12 raw bytes -> exactly 16 base64 characters.
-case "$SVC_FLAT" in
-  *'.hash_password(plaintext.as_bytes())'*) bad "set_password calls the generic auto-salt hash_password() — this is the exact live-verified authentication-always-fails bug" ;;
-  *) ok "set_password does not call the generic auto-salt hash_password()" ;;
-esac
-must_contain "$SVC_FLAT" 'letsalt:[u8;12]' \
-  "the salt is explicitly sized to 12 raw bytes (-> 16 base64 characters, SHA-crypt's own cap)"
-must_contain "$SVC_FLAT" '.hash_password_with_salt(plaintext.as_bytes(),&salt)' \
-  "set_password uses the explicit-salt API, not the generic auto-salt one"
-must_contain "$SVC_FLAT" 'fnthe_generated_salt_is_at_most_sixteen_characters' \
-  "a unit test pins the 16-character salt limit directly, not just the byte count that is meant to produce it"
+# auto-salt / 12-byte-salt / explicit-salt-API arms retired: covered by
+# TestTheGeneratedSaltIsAtMostSixteenCharacters + TestAProducedHashVerifiesAgainstThePasswordThatMadeIt
+# (panel/go/internal/agent/services/sftp_accounts_test.go) — they measure the
+# produced salt and round-trip the hash, which is the property the Rust arms
+# approximated by spelling. Executed here so a deleted test cannot pass silently.
+gotest ./internal/agent/services/ TestTheGeneratedSaltIsAtMostSixteenCharacters TestAProducedHashVerifiesAgainstThePasswordThatMadeIt TestHashMatchesGlibcKnownAnswer
 
 echo
 echo "── D: teardown proves ownership before touching a real Linux account ──"
-must_contain "$OWNERSHIP_FLAT" 'pubfnsftp_user(uid:i32,domain:&str)->Owner' \
+must_contain "$OWNERSHIP_FLAT" 'func OwnershipSftpUser(uid int32, domain string) OwnershipOwner' \
   "a dedicated ownership check exists for the SFTP uid resource type"
-must_contain "$SVC_FLAT" 'if!crate::services::ownership::sftp_user(uid,domain).may_delete(){' \
+must_contain "$SVC_FLAT" 'if !OwnershipSftpUser(uid, domain).MayDelete() {' \
   "deprovision refuses to proceed unless the marker proves this uid belongs to this domain"
 case "$OWNERSHIP_FLAT" in
-  *'crate::services::sftp_accounts::owner_marker_path(uid)'*) ok "the ownership check reads the SAME marker path provision() writes, not a re-derived one" ;;
-  *) bad "ownership::sftp_user does not read services::sftp_accounts::owner_marker_path — could check the wrong file" ;;
+  *'ownershipByLines(SftpAccountsOwnerMarkerPath(uid),'*) ok "the ownership check reads the SAME marker path provision() writes, not a re-derived one" ;;
+  *) bad "OwnershipSftpUser does not read SftpAccountsOwnerMarkerPath — could check the wrong file" ;;
 esac
 
 echo
 echo "── E: the real site directory is bind-mounted, never moved ──"
-must_contain "$SVC_FLAT" 'What={site_dir}' \
+must_contain "$SVC_FLAT" 'What=%s\nWhere=%s\nType=none\nOptions=bind' \
+  "the mount unit is a bind mount"
+must_contain "$SVC_FLAT" 'domain, siteDir, contentDir)' \
   "the bind mount's What= targets the real, unmoved site directory"
 case "$SVC_FLAT" in
-  *'rename('*|*'std::fs::rename'*) bad "sftp_accounts.rs renames/moves a path — the design deliberately avoids restructuring the docroot" ;;
-  *) ok "sftp_accounts.rs never renames/moves the site directory" ;;
+  *'os.Rename('*|*'"mv"'*) bad "sftp_accounts.go renames/moves a path — the design deliberately avoids restructuring the docroot" ;;
+  *) ok "sftp_accounts.go never renames/moves the site directory" ;;
 esac
-must_contain "$SVC_FLAT" 'systemd-escape' \
+must_contain "$SVC_FLAT" 'sftpAccountsExec("systemd-escape", "--path", "--suffix=mount", contentDir)' \
   "the mount unit name is computed via systemd-escape, not hand-rolled path escaping"
 
 echo
@@ -171,58 +191,62 @@ echo "── E2: /var/dockpanel-sftp creation/removal goes through the unsandbox
 # only helps on a LATER restart after it already exists once — creation and
 # teardown must go through safe_command_unsandboxed regardless.
 case "$SVC_FLAT" in
-  *'std::fs::create_dir_all(&content_dir)'*) bad "provision() creates the jail content dir via plain std::fs — hits the live-verified EROFS bug" ;;
-  *) ok "provision() does not create the jail content dir via plain std::fs" ;;
+  *'os.MkdirAll(contentDir'*|*'os.Mkdir(contentDir'*) bad "provision() creates the jail content dir via plain os.Mkdir* — hits the live-verified EROFS bug" ;;
+  *) ok "provision() does not create the jail content dir via plain os.Mkdir*" ;;
 esac
-must_contain "$SVC_FLAT" 'safe_command_unsandboxed("mkdir",&[]).args(["-p",&content_dir])' \
+must_contain "$SVC_FLAT" 'sftpAccountsUnsandboxed("mkdir", "-p", contentDir)' \
   "provision() creates the jail content dir via the unsandboxed escape"
 case "$SVC_FLAT" in
-  *'std::fs::remove_dir_all(&jail)'*) bad "deprovision() removes the jail tree via plain std::fs — hits the same live-verified EROFS bug on teardown" ;;
-  *) ok "deprovision() does not remove the jail tree via plain std::fs" ;;
+  *'os.RemoveAll(jail)'*) bad "deprovision() removes the jail tree via plain os.RemoveAll — hits the same live-verified EROFS bug on teardown" ;;
+  *) ok "deprovision() does not remove the jail tree via plain os.RemoveAll" ;;
 esac
-must_contain "$SVC_FLAT" 'safe_command_unsandboxed("rm",&[]).args(["-rf",&jail])' \
+must_contain "$SVC_FLAT" 'sftpAccountsUnsandboxed("rm", "-rf", jail)' \
   "deprovision() removes the jail tree via the unsandboxed escape"
-must_contain "$(flat panel/agent/dockpanel-agent.service)" '-/var/dockpanel-sftp' \
+must_contain "$SVC_FLAT" 'safecmd.NewUnsandboxed(bin).Arg(args...)' \
+  "sftpAccountsUnsandboxed really is the unsandboxed escape"
+must_contain "$(flat "$AGENT_UNIT")" '-/var/dockpanel-sftp' \
   "the agent's systemd unit lists /var/dockpanel-sftp in ReadWritePaths (defense-in-depth for restarts after first use)"
 
 echo
 echo "── F: PHP-FPM pool ownership — the actual isolation, both directions ──"
-must_contain "$SVC_FLAT" '"chown",&[]).args(["-R",&format!("{username}:{groupname}"),&site_dir]' \
+must_contain "$SVC_FLAT" 'owner := username + ":" + groupname
+	out, err = sftpAccountsUnsandboxed("chown", "-R", owner, siteDir)' \
   "provision() re-owns the real site directory to the new per-site identity"
-must_contain "$SVC_FLAT" '"chown",&[]).args(["-R","www-data:www-data",&site_dir]' \
+must_contain "$SVC_FLAT" 'sftpAccountsUnsandboxed("chown", "-R", "www-data:www-data", siteDir)' \
   "deprovision() reverts the site directory back to www-data"
-must_contain "$BACKEND_FLAT" 'ifsite.sftp_enabled&&let(Some(uid),Some(gid))=(site.sftp_uid,site.sftp_gid)' \
-  "build_nginx_body only sends pool_user/pool_group for SFTP-enabled sites"
+must_contain "$(fnflat "$BACKEND" rtSitesBuildNginxBody)" 'if site.SFTPEnabled && site.SFTPUID != nil && site.SFTPGID != nil {' \
+  "rtSitesBuildNginxBody only sends pool_user/pool_group for SFTP-enabled sites"
 
 echo
 echo "── G: the naming convention is duplicated correctly, not merely once ──"
-must_contain "$BACKEND_FLAT" 'format!("sftp{uid}")' \
+must_contain "$BACKEND_FLAT" 'body["pool_user"] = fmt.Sprintf("sftp%d", *site.SFTPUID)' \
   "backend's pool_user naming matches sftp{uid}"
-must_contain "$SVC_FLAT" 'format!("sftp{uid}")' \
-  "agent's sftp_username naming matches sftp{uid}"
-must_contain "$BACKEND_FLAT" 'format!("sftpg{gid}")' \
+must_contain "$SVC_FLAT" 'func SftpAccountsUsername(uid int32) string { return fmt.Sprintf("sftp%d", uid) }' \
+  "agent's SftpAccountsUsername naming matches sftp{uid}"
+must_contain "$BACKEND_FLAT" 'body["pool_group"] = fmt.Sprintf("sftpg%d", *site.SFTPGID)' \
   "backend's pool_group naming matches sftpg{gid}"
-must_contain "$SVC_FLAT" 'format!("sftpg{gid}")' \
-  "agent's sftp_groupname naming matches sftpg{gid}"
+must_contain "$SVC_FLAT" 'func SftpAccountsGroupname(gid int32) string { return fmt.Sprintf("sftpg%d", gid) }' \
+  "agent's SftpAccountsGroupname naming matches sftpg{gid}"
 
 echo
 echo "── H: PHP-FPM pool template actually takes the owner as a parameter ──"
-NGINX_SVC_FLAT=$(flat panel/agent/src/services/nginx.rs)
-must_contain "$NGINX_SVC_FLAT" 'pool_owner:Option<(&str,&str)>' \
-  "write_php_pool_config takes an optional pool owner"
-must_contain "$NGINX_SVC_FLAT" 'unwrap_or(("www-data","www-data"))' \
+POOL_FLAT=$(fnflat "$NGINX_SVC" NginxWritePhpPoolConfig)
+must_contain "$POOL_FLAT" 'poolOwner *[2]string) error {' \
+  "NginxWritePhpPoolConfig takes an optional pool owner"
+must_contain "$POOL_FLAT" 'user, group := "www-data", "www-data"
+	if poolOwner != nil {' \
   "the default pool owner (no SFTP) is still the shared www-data identity"
 
 echo
 echo "── I: site deletion tears down SFTP before removing the site directory ──"
-DELETE_FLAT=$(flat "$BACKEND")
-must_contain "$DELETE_FLAT" 'if site.sftp_enabled && let (Some(uid), Some(gid)) = (site.sftp_uid, site.sftp_gid)' \
-  "remove() checks for an active SFTP account"
-must_contain "$DELETE_FLAT" '/sftp/sites/{}/disable' \
-  "remove() calls the agent's SFTP disable endpoint"
+DELETE_FLAT=$(fnflat "$BACKEND" rtSitesRemove)
+must_contain "$DELETE_FLAT" 'if site.SFTPEnabled && site.SFTPUID != nil && site.SFTPGID != nil {' \
+  "rtSitesRemove() checks for an active SFTP account"
+must_contain "$DELETE_FLAT" '"/sftp/sites/"+site.Domain+"/disable"' \
+  "rtSitesRemove() calls the agent's SFTP disable endpoint"
 
 echo
-echo "── I2: disable_sftp reverts the PHP-FPM pool BEFORE tearing down the account ──"
+echo "── I2: rtSitesDisableSftp reverts the PHP-FPM pool BEFORE tearing down the account ──"
 # Live-verified bug (fresh-VPS drive, this session): userdel refuses to
 # remove a uid with a running process, and the OLD PHP-FPM pool's workers
 # are still alive under the SFTP uid until the pool is reverted+reloaded.
@@ -231,17 +255,16 @@ echo "── I2: disable_sftp reverts the PHP-FPM pool BEFORE tearing down the a
 # "disabled" reported success over a half-torn-down box, with nothing in any
 # log pointing at the cause until deprovision()'s userdel/groupdel calls
 # were changed from fire-and-forget to logged (§I3 below).
-DISABLE_FN=$(awk '/^pub async fn disable_sftp\(/{f=1} f&&/^pub async fn /&&!/^pub async fn disable_sftp\(/{exit} f{print}' "$BACKEND")
-if [ -z "$DISABLE_FN" ]; then
-  bad "could not extract disable_sftp() from sites.rs — function renamed or moved"
+DISABLE_FN_FLAT=$(fnflat "$BACKEND" rtSitesDisableSftp)
+if [ -z "$DISABLE_FN_FLAT" ]; then
+  bad "could not extract rtSitesDisableSftp() from rt_sites.go — function renamed or moved"
 else
-  ok "disable_sftp() extracted (bounded on the next pub async fn)"
+  ok "rtSitesDisableSftp() extracted (bounded on its own closing brace)"
 fi
-DISABLE_FN_FLAT=$(printf '%s' "$DISABLE_FN" | tr -d ' \t\n')
-PUT_POS=$(printf '%s' "$DISABLE_FN_FLAT" | grep -bo 'agent.put(&format!("/nginx/sites/{}"' | head -1 | cut -d: -f1)
-POST_POS=$(printf '%s' "$DISABLE_FN_FLAT" | grep -bo '/sftp/sites/{}/disable' | head -1 | cut -d: -f1)
+PUT_POS=$(printf '%s' "$DISABLE_FN_FLAT" | grep -bo 'agent.Put(ctx,"/nginx/sites/"+site.Domain' | head -1 | cut -d: -f1)
+POST_POS=$(printf '%s' "$DISABLE_FN_FLAT" | grep -bo '"/sftp/sites/"+site.Domain+"/disable"' | head -1 | cut -d: -f1)
 if [ -z "$PUT_POS" ] || [ -z "$POST_POS" ]; then
-  bad "could not locate both the pool-rebuild call and the disable call inside disable_sftp() to check their order"
+  bad "could not locate both the pool-rebuild call and the disable call inside rtSitesDisableSftp() to check their order"
 elif [ "$PUT_POS" -lt "$POST_POS" ]; then
   ok "the PHP-FPM pool/vhost rebuild happens before the agent's SFTP disable call"
 else
@@ -251,19 +274,23 @@ fi
 echo
 echo "── I3: userdel/groupdel failures are logged, not silently swallowed ──"
 case "$SVC_FLAT" in
-  *'let_=safe_command_unsandboxed("userdel"'*) bad "deprovision() still discards the userdel result with let _ = ... — a future ordering regression would fail silently again" ;;
+  *'_,_=sftpAccountsUnsandboxed("userdel"'*) bad "deprovision() still discards the userdel result with _, _ = ... — a future ordering regression would fail silently again" ;;
   *) ok "deprovision() does not silently discard the userdel result" ;;
 esac
-must_contain "$SVC_FLAT" 'match safe_command_unsandboxed("userdel",&[]).args([&username]).output().await{' \
-  "userdel's result is matched and a failure is logged"
-must_contain "$SVC_FLAT" 'match safe_command_unsandboxed("groupdel",&[]).args([&groupname]).output().await{' \
-  "groupdel's result is matched and a failure is logged"
+must_contain "$SVC_FLAT" 'out, err = sftpAccountsUnsandboxed("userdel", username)
+	if err != nil {
+		slog.Warn(' \
+  "userdel's result is checked and a failure is logged"
+must_contain "$SVC_FLAT" 'out, err = sftpAccountsUnsandboxed("groupdel", groupname)
+	if err != nil {
+		slog.Warn(' \
+  "groupdel's result is checked and a failure is logged"
 
 echo
 echo "── I4: deprovision() stops this domain's PHP-FPM pool itself — never trusts caller ordering ──"
 # Live-verified the SAME bug through a SECOND, independent caller after §I2's
 # fix: disable_sftp's pool-revert-then-reload unblocked userdel there, but
-# site DELETION's teardown (nginx.rs::delete_site) only ever removes the
+# site DELETION's teardown (nginx.rs::delete_site, Go: nginxRoutes.deleteSite) only ever removes the
 # PHP-FPM pool CONFIG FILE — it never reloads php-fpm, so an already-running
 # worker under the doomed uid is untouched by it, and userdel failed exactly
 # the same way through this path with no ordering fix available to share.
@@ -275,27 +302,27 @@ echo "── I4: deprovision() stops this domain's PHP-FPM pool itself — never
 # between the pkill and the userdel call every time. Only removing the pool
 # file and reloading stops the master from wanting workers under this
 # identity at all — pkill stays as a second layer, not the fix by itself.
-must_contain "$SVC_FLAT" 'letpool_path=format!("/etc/php/{version}/fpm/pool.d/{}.conf",domain.replace(' \
+must_contain "$SVC_FLAT" 'poolName := strings.ReplaceAll(domain, ".", "_")' \
+  "deprovision() derives this domain's PHP-FPM pool name"
+must_contain "$SVC_FLAT" 'poolPath := fmt.Sprintf("/etc/php/%s/fpm/pool.d/%s.conf", v, poolName)' \
   "deprovision() locates and removes this domain's PHP-FPM pool config directly"
-must_contain "$SVC_FLAT" 'crate::services::nginx::reload_php_fpm(version).await' \
+must_contain "$SVC_FLAT" 'if err := NginxReloadPhpFpm(v); err != nil {' \
   "deprovision() reloads php-fpm after removing the pool config, so the master stops respawning workers under this identity"
-must_contain "$SVC_FLAT" '"pkill",&[]).args(["-9","-u",&uid.to_string()]' \
+must_contain "$SVC_FLAT" 'sftpAccountsUnsandboxed("pkill", "-9", "-u", fmt.Sprint(uid))' \
   "deprovision() also force-kills any remaining process as a second layer, before userdel"
 # Both the pool removal AND the pkill must happen BEFORE userdel — a
 # mutation reordering either one reproduces a live-verified bug.
-DEPROVISION_FN=$(awk '/^pub async fn deprovision\(/{f=1} f&&/^pub async fn /&&!/^pub async fn deprovision\(/{exit} f{print}' "$AGENT_SVC")
-DEPROVISION_FN_FLAT=$(printf '%s' "$DEPROVISION_FN" | tr -d ' \t\n')
-POOL_REMOVE_POS=$(printf '%s' "$DEPROVISION_FN_FLAT" | grep -bo 'std::fs::remove_file(&pool_path)' | head -1 | cut -d: -f1)
+DEPROVISION_FN_FLAT=$(fnflat "$AGENT_SVC" SftpAccountsDeprovision)
+POOL_REMOVE_POS=$(printf '%s' "$DEPROVISION_FN_FLAT" | grep -bo 'os.Remove(poolPath)' | head -1 | cut -d: -f1)
 PKILL_POS=$(printf '%s' "$DEPROVISION_FN_FLAT" | grep -bo '"pkill"' | head -1 | cut -d: -f1)
-USERDEL_POS=$(printf '%s' "$DEPROVISION_FN_FLAT" | grep -bo '"userdel",&\[\]' | head -1 | cut -d: -f1)
+USERDEL_POS=$(printf '%s' "$DEPROVISION_FN_FLAT" | grep -bo '"userdel",' | head -1 | cut -d: -f1)
 if [ -z "$POOL_REMOVE_POS" ] || [ -z "$PKILL_POS" ] || [ -z "$USERDEL_POS" ]; then
-  bad "could not locate the pool removal, pkill, and userdel inside deprovision() to check their order"
+  bad "could not locate the pool removal, pkill, and userdel inside SftpAccountsDeprovision() to check their order"
 elif [ "$POOL_REMOVE_POS" -lt "$USERDEL_POS" ] && [ "$PKILL_POS" -lt "$USERDEL_POS" ]; then
-  ok "both the PHP-FPM pool removal and pkill run before userdel inside deprovision()"
+  ok "both the PHP-FPM pool removal and pkill run before userdel inside SftpAccountsDeprovision()"
 else
-  bad "userdel does not run strictly after BOTH the pool removal and pkill inside deprovision() — this ordering is what the live-verified fix depends on"
+  bad "userdel does not run strictly after BOTH the pool removal and pkill inside SftpAccountsDeprovision() — this ordering is what the live-verified fix depends on"
 fi
-
 echo
 echo "── J: the frontend never lets an operator type their own SFTP password ──"
 # Bounded on the card's own comment markers — SiteDetail.tsx is thousands of
@@ -320,29 +347,29 @@ must_contain "$CARD_FLAT" 'willnotbeshownagain' \
   "the reveal-once warning is present on the SFTP password panel"
 
 echo
-echo "── K: safe_cmd.rs escapes \$ for every argument through the unsandboxed escape ──"
+echo "── K: safecmd escapes \$ for every argument through the unsandboxed escape ──"
 # Live-verified bug (fresh-VPS drive, this session, first caller to ever pass
 # a $-containing argument through this shared primitive): systemd-run turns
 # its trailing argv into the transient unit's own ExecStart=, which systemd's
 # unit-file grammar subjects to $VAR/${VAR} environment-variable expansion.
 # A SHA-crypt hash ($6$salt$hash) silently lost everything from the first
 # unset $6 onward — this affects EVERY current and future caller of
-# safe_command_unsandboxed, not just SFTP, since bcrypt/Argon2/SHA-crypt all
+# safecmd.NewUnsandboxed (Rust: safe_command_unsandboxed), not just SFTP, since bcrypt/Argon2/SHA-crypt all
 # use $ as their MCF field separator. Fixed once, at the shared primitive,
 # not worked around per call site.
-must_contain "$SAFE_CMD_FLAT" 'fnescape_dollar_for_systemd_run' \
-  "a dedicated escaping function exists in safe_cmd.rs"
-must_contain "$SAFE_CMD_FLAT" $'s.replace(\'$\',"$$")' \
+must_contain "$SAFE_CMD_FLAT" 'func escapeDollar(a string) string' \
+  "a dedicated escaping function exists in safecmd.go"
+must_contain "$SAFE_CMD_FLAT" 'strings.ReplaceAll(a, "$", "$$")' \
   "the escape doubles a literal \$ (systemd's own escape for it, confirmed on-box to round-trip)"
-must_contain "$SAFE_CMD_FLAT" 'argv.push(escape_dollar_for_systemd_run(a.as_ref()))' \
-  "the escape is applied automatically inside arg()/args() — no caller has to remember to do it"
+ARG_FLAT=$(awk 'index($0, "func (u *Unsandboxed) Arg(") == 1 {f=1} f {print} f && /^}/ {exit}' "$SAFE_CMD" | tr -d ' \t\n')
+must_contain "$ARG_FLAT" 'u.argv = append(u.argv, escapeDollar(a))' \
+  "the escape is applied automatically inside Unsandboxed.Arg() — no caller has to remember to do it"
 case "$SAFE_CMD_FLAT" in
-  *'argv.push(a.as_ref().to_os_string())'*)
-    bad "safe_cmd.rs still has an arg()/args() implementation that pushes raw, un-escaped arguments" ;;
-  *) ok "no arg()/args() implementation in safe_cmd.rs bypasses the \$ escape" ;;
+  *'u.argv=append(u.argv,a)'*|*'u.argv=append(u.argv,args...)'*)
+    bad "safecmd.go still has an Arg() path that appends raw, un-escaped arguments" ;;
+  *) ok "no Arg() path in safecmd.go bypasses the \$ escape" ;;
 esac
-must_contain "$SAFE_CMD_FLAT" 'fna_dollar_sign_in_an_argument_is_escaped_for_systemd_run' \
-  "a unit test proves the escape actually applies through the real arg()/args() call path"
+gotest ./internal/agent/safecmd/ TestDollarEscaping
 
 echo
 if [ "$FAIL" -eq 0 ]; then

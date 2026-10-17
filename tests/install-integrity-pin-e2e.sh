@@ -85,7 +85,7 @@ bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 # NEGATIVE arm (match ⇒ bad) silently green, which is the direction that ships.
 comment_marker_for() {
   case "$1" in
-    *.rs|*.mjs|*.js|*.ts|*.tsx)                echo '//' ;;
+    *.rs|*.go|*.mjs|*.js|*.ts|*.tsx)           echo '//' ;;
     *.json)                                    echo ''   ;;  # JSON has no comments
     *)                                         echo '#'  ;;  # .sh, .service, .gitignore, .toml
   esac

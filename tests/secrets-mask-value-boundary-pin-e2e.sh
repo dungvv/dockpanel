@@ -4,7 +4,8 @@
 # ONE PROPERTY: masking a secret's value for display never panics, regardless
 # of what characters that value contains.
 #
-# `panel/backend/src/routes/secrets.rs`'s `mask_value` sliced the first 4
+# The API's `mask_value` (then routes/secrets.rs; now rtSecretsMaskValue in
+# `panel/go/internal/api/rt_secrets.go`) sliced the first 4
 # BYTES (`&value[..4]`) of any value longer than 4 bytes. Rust panics if a
 # byte-slice boundary doesn't land on a UTF-8 char boundary — reachable from
 # any secret value containing a multi-byte character (a pasted passphrase,
@@ -24,7 +25,9 @@
 # §C the fix threshold (4-or-fewer fully masked, more gets a 4-char prefix)
 #    is preserved — this is a boundary-safety fix, not a behavior change.
 # §D executed unit tests exist for the exact panic scenario (multi-byte value
-#    straddling the old byte offset) and the all-multibyte case.
+#    straddling the old byte offset) and the all-multibyte case — run here
+#    with `go test`. (Go byte-slicing does not panic, it silently yields
+#    invalid UTF-8; the property pinned is the same: a char-boundary-safe mask.)
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
@@ -43,101 +46,75 @@ code() {
   [ -f "$1" ] || return 0
   perl -0777 -pe '
     s{^[ \t]*/\*.*?\*/[ \t]*$}{}gms;
-    s{^\s*//.*$}{}gm;
-    s{^\s*///.*$}{}gm;
+    s{^[ \t]*//.*$}{}gm;
+    s{[ \t]+//[^"`\n]*$}{}gm;
   ' "$1"
 }
 
 has()  { grep -qE -- "$2" <<< "$1"; }
 
+# One Go func (or method) body, bounded by its own closing `}` at column 0.
 fnbody() {
   awk -v fn="$2" '
-    index($0, "fn " fn "(") && !started { started=1 }
-    started {
-      n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
-      if (opened || n>0) opened=1
-      if (opened && depth<=0) exit
+    !started && (index($0, "func " fn "(") == 1 || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) {
+      started=1; print
+      o=gsub(/\{/,"{"); c=gsub(/\}/,"}"); if (o>0 && o==c) exit
+      next
     }
+    started { print; if ($0 == "}") exit }
   ' <<< "$1"
 }
 
-SECRETS=panel/backend/src/routes/secrets.rs
+SECRETS=panel/go/internal/api/rt_secrets.go
 SECRETS_C=$(code "$SECRETS")
-MASK_BODY=$(fnbody "$SECRETS_C" "mask_value")
+MASK_BODY=$(fnbody "$SECRETS_C" "rtSecretsMaskValue")
 
-# ── §A no raw byte-index slicing survives ────────────────────────────────
-echo "── §A mask_value walks chars, not byte indices ──"
+# ── §A the mask walks characters, not bytes ──────────────────────────────
+echo "── §A rtSecretsMaskValue walks chars, not byte indices ──"
 
 if [ -n "$MASK_BODY" ]; then
-  ok "A1 mask_value exists"
+  ok "A1 rtSecretsMaskValue exists"
 else
-  bad "A1 mask_value is missing — every arm below measures nothing"
+  bad "A1 rtSecretsMaskValue is missing — every arm below measures nothing"
 fi
 
-if has "$MASK_BODY" '&value\[\.\.4\]|value\[0\.\.4\]|\[\.\.4\]'; then
-  bad "A2 mask_value still byte-slices with a literal ..4 index — the panic is back"
-else
-  ok "A2 no literal [..4] byte-index slice in mask_value"
-fi
+# A2/A3/A4 retired: covered by TestRtSecretsMultibyteValueStraddlingTheOldByteOffset,
+# TestRtSecretsAllMultibyteValue and TestRtSecretsASCIIValuesKeepTheFourCharPrefix
+# (panel/go/internal/api/rt_secrets_test.go) — the char-boundary walk and the
+# 4-character prefix are behaviour, asserted by calling the function (and run in §D).
 
-if has "$MASK_BODY" '\.chars\(\)'; then
-  ok "A3 mask_value iterates .chars() (char-boundary-safe by construction)"
-else
-  bad "A3 mask_value doesn't use .chars() — the fix shape is gone"
-fi
+# ── §B every known call site still reaches the mask ──────────────────────
+echo "── §B rtSecretsMaskValue's call-site count is unchanged (3) ──"
 
-if has "$MASK_BODY" '\.take\(4\)'; then
-  ok "A4 the prefix is still 4 characters (unchanged UI contract)"
-else
-  bad "A4 the prefix length changed or the take(4) call is gone"
-fi
-
-# ── §B every known call site still reaches mask_value ────────────────────
-echo "── §B mask_value's call-site count is unchanged (3) ──"
-
-# Scoped to code BEFORE the first #[cfg(test)] block so this suite's own
-# test-module calls to mask_value() don't inflate the count.
-PROD_ONLY=$(awk '/^#\[cfg\(test\)\]/{exit} {print}' "$SECRETS")
-CALL_COUNT=$(grep -c 'mask_value(' <<< "$PROD_ONLY")
+# Go keeps tests in rt_secrets_test.go, so the whole (comment-stripped) file
+# is production code.
+CALL_COUNT=$(grep -c 'rtSecretsMaskValue(' <<< "$SECRETS_C")
 # 3 call sites + 1 definition = 4 occurrences of the identifier.
 if [ "$CALL_COUNT" -eq 4 ]; then
-  ok "B1 mask_value appears 4 times (1 definition + 3 call sites), matching the finder's exhaustiveness claim"
+  ok "B1 rtSecretsMaskValue appears 4 times (1 definition + 3 call sites), matching the finder's exhaustiveness claim"
 else
-  bad "B1 mask_value appears $CALL_COUNT times, expected 4 — a call site was added, removed, or the fix moved the definition"
+  bad "B1 rtSecretsMaskValue appears $CALL_COUNT times, expected 4 — a call site was added, removed, or the fix moved the definition"
 fi
 
 # ── §C the masking threshold behavior is unchanged ────────────────────────
-echo "── §C 4-or-fewer stays fully masked; more gets a char prefix ──"
-
-if has "$MASK_BODY" 'is_none\(\)' && has "$MASK_BODY" '••••••••'; then
-  ok "C1 a short (<=4 char) value still resolves to the fully-masked constant"
-else
-  bad "C1 short-value handling looks different — verify by hand"
-fi
-
-if has "$MASK_BODY" 'format!\("\{prefix\}••••••••"\)|format!\("\{\}••••••••"'; then
-  ok "C2 a long value still formats as prefix + mask suffix"
-else
-  bad "C2 the long-value format string changed shape"
-fi
+# C1/C2 retired: covered by TestRtSecretsShortValuesAreFullyMasked and
+# TestRtSecretsASCIIValuesKeepTheFourCharPrefix (panel/go/internal/api/rt_secrets_test.go).
 
 # ── §D executed tests cover the exact panic scenario ──────────────────────
-echo "── §D unit tests exist for the exact byte-offset-4 panic input ──"
+echo "── §D the unit tests for the exact byte-offset-4 input exist AND pass ──"
 
-TEST_MOD=$(fnbody "$SECRETS_C" "a_multibyte_value_straddling_the_old_byte_offset_does_not_panic")
-if [ -n "$TEST_MOD" ]; then
-  ok "D1 a test named for the exact straddling scenario exists"
+TESTS='^(TestRtSecretsMultibyteValueStraddlingTheOldByteOffset|TestRtSecretsAllMultibyteValue|TestRtSecretsShortValuesAreFullyMasked|TestRtSecretsASCIIValuesKeepTheFourCharPrefix)$'
+GT=$(cd panel/go && go test ./internal/api/ -run "$TESTS" -count=1 -v 2>&1)
+NPASS=$(grep -c -- '--- PASS' <<< "$GT")
+if [ "$NPASS" -eq 4 ] && grep -q '^ok' <<< "$GT"; then
+  ok "D1 all 4 mask tests ran and passed (straddling offset, all-multibyte, short, ASCII prefix)"
 else
-  bad "D1 no test names the exact byte-offset-4 straddling scenario"
+  bad "D1 expected 4 passing mask tests, got $NPASS — $(grep -E -- '--- FAIL|^FAIL|cannot|no tests' <<< "$GT" | head -3 | tr '\n' ' ')"
 fi
 
-if grep -q 'mod mask_value_tests' "$SECRETS"; then
-  ok "D2 a dedicated mask_value_tests module exists"
-else
-  bad "D2 no dedicated test module for mask_value"
-fi
+# D2 retired (obsolete in Go): a dedicated `mod mask_value_tests` is a Rust #[cfg(test)] layout; Go tests live in rt_secrets_test.go and D1 runs them.
 
-if grep -qE '日|本|語' "$SECRETS"; then
+if grep -qE '日|本|語' panel/go/internal/api/rt_secrets_test.go; then
   ok "D3 the tests use real multi-byte (non-ASCII) literals, not just an assertion of intent"
 else
   bad "D3 no multi-byte literal found — the panic scenario may not actually be exercised"

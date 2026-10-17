@@ -25,6 +25,10 @@
 #   §B  the agent takes the scope FROM the ticket, not the query param
 #   §C  the two ends agree on the server-shell marker
 #
+# Subjects are the Go ports: panel/go/internal/api/rt_terminal.go (rtTerminalWsToken,
+# the share handlers) and panel/go/internal/agent/routes/terminal.go
+# (terminalWsHandler, terminalOpenPtyShell).
+#
 # Pure source analysis: no box, no network, no build.
 #
 # NO PIPES INTO `grep -q`. Under `set -o pipefail` grep -q closes the pipe on its
@@ -39,8 +43,8 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-BE=panel/backend/src/routes/terminal.rs
-AG=panel/agent/src/routes/terminal.rs
+BE=panel/go/internal/api/rt_terminal.go
+AG=panel/go/internal/agent/routes/terminal.go
 
 for f in "$BE" "$AG"; do [ -f "$f" ] || bad "MISSING SUBJECT FILE: $f"; done
 
@@ -60,6 +64,7 @@ count() { grep -cE -- "$2" <<< "$1" || true; }
 
 # One function's body, bounded by its OWN closing brace in column 0.
 fn_body() { awk -v pat="$1" '$0 ~ pat {f=1} f {print} f && /^\}/ {exit}' <<< "$2"; }
+flat() { tr '\n' ' ' <<< "$1" | tr -s ' \t' ' '; }
 # Order predicate: does `first` appear before `second` in `body`?
 before() {
   local body="$1" first="$2" second="$3" a b
@@ -71,44 +76,40 @@ before() {
 BE_S=$(subj "$BE" || true)
 AG_S=$(subj "$AG" || true)
 
+MINT=$(fn_body '^func rtTerminalWsToken[(]' "$BE_S")
+MINT_FLAT=$(flat "$MINT")
+
 echo "§A  the panel binds the scope INTO the signed ticket"
 
-# A1 — the signed struct carries a scope field. The struct is what gets HS256'd,
-# so a field here is a field the agent can trust.
-if [ -z "$BE_S" ]; then
-  bad "A1 SKIPPED: $BE did not yield source"
+# A1 — the signed claims carry a scope. The Go mint signs a jwt.MapClaims
+# literal that is then HS256'd, so a key there is a key the agent can trust.
+if [ -z "$MINT" ]; then
+  bad "A1 SKIPPED: could not bound rtTerminalWsToken in $BE"
+elif has "$MINT_FLAT" 'ticket := jwt\.MapClaims\{[^}]*"scope": *scope,[^}]*\}' \
+  && has "$MINT_FLAT" 'jwt\.NewWithClaims\(jwt\.SigningMethodHS256, ticket\)'; then
+  ok "A1 the signed terminal ticket carries a scope"
 else
-  TICKET=$(fn_body 'struct TerminalTicket' "$BE_S")
-  if [ -n "$TICKET" ] && has "$TICKET" 'scope: String'; then
-    ok "A1 the signed TerminalTicket carries a scope"
-  else
-    bad "A1 the signed ticket has no scope field — the shell decision is not in the signature"
-  fi
+  bad "A1 the signed ticket has no scope field — the shell decision is not in the signature"
 fi
 
 # A2 — and it is set from the ownership-resolved domain, not from anything the
-# caller sent. The mint reads `domain` (the SITE_CALLER_PREDICATE result) and
+# caller sent. The mint reads `domain` (the SiteCallerPredicate result) and
 # falls back to the server marker. Keyed on the decision, not the field name.
-if [ -z "$BE_S" ]; then
-  bad "A2 SKIPPED: $BE did not yield source"
+if [ -z "$MINT" ]; then
+  bad "A2 SKIPPED: could not bound rtTerminalWsToken in $BE"
+elif has "$MINT_FLAT" 'scope := rtTerminalServerShellScope if domain != nil \{ scope = \*domain \}' \
+  && has "$MINT_FLAT" 'd, err := queryScalarOpt\[string\]\(ctx, st\.DB, "SELECT s\.domain FROM sites s WHERE "\+SiteCallerPredicate, siteID, c\.Sub\)' \
+  && has "$MINT_FLAT" 'domain = d \}'; then
+  ok "A2 the scope is set from the ownership-resolved domain, server marker as the only fallback"
 else
-  MINT=$(fn_body 'async fn ws_token' "$BE_S")
-  # Flatten: the derivation spans several lines and the invariant is the whole
-  # expression `scope = domain … unwrap_or_else(… SERVER_SHELL_SCOPE)`.
-  MINT_FLAT=$(tr '\n' ' ' <<< "$MINT" | tr -s ' ')
-  if [ -n "$MINT" ] \
-    && has "$MINT_FLAT" 'let scope = domain \.clone\(\) \.unwrap_or_else\(\|\| SERVER_SHELL_SCOPE'; then
-    ok "A2 the scope is set from the ownership-resolved domain, server marker as the only fallback"
-  else
-    bad "A2 the ticket scope is not derived from the resolved domain — an attacker-supplied value could reach it"
-  fi
+  bad "A2 the ticket scope is not derived from the resolved domain — an attacker-supplied value could reach it"
 fi
 
 # A3 — the ownership check still gates the site branch (the scope is only as good
-# as the resolution behind it). SITE_CALLER_PREDICATE must still bind the domain.
-if [ -z "$BE_S" ]; then
-  bad "A3 SKIPPED: $BE did not yield source"
-elif has "$BE_S" 'SITE_CALLER_PREDICATE' && has "$BE_S" 'not owned by you'; then
+# as the resolution behind it). SiteCallerPredicate must still bind the domain.
+if [ -z "$MINT" ]; then
+  bad "A3 SKIPPED: could not bound rtTerminalWsToken in $BE"
+elif has "$MINT" 'SiteCallerPredicate' && has "$MINT" 'not owned by you'; then
   ok "A3 the site domain is still resolved under the ownership predicate before it becomes the scope"
 else
   bad "A3 the ownership resolution behind the scope is gone — the signed scope would certify nothing"
@@ -116,52 +117,31 @@ fi
 
 echo "§B  the agent takes the scope FROM the ticket, not the query param"
 
-# B1 — the agent's decode struct carries the scope, so the value it acts on is
-# the signed one.
-if [ -z "$AG_S" ]; then
-  bad "B1 SKIPPED: $AG did not yield source"
-else
-  ATICKET=$(fn_body 'struct TerminalTicket' "$AG_S")
-  if [ -n "$ATICKET" ] && has "$ATICKET" 'scope: Option<String>'; then
-    ok "B1 the agent decodes the ticket's scope"
-  else
-    bad "B1 the agent does not read a scope off the ticket — it can only be trusting the query param"
-  fi
-fi
+# B1 retired: covered by TestTerminalValidateTicket (panel/go/internal/agent/routes/terminal_test.go) — the agent decodes the signed scope (nil when absent, "@server" when signed)
+
+WS=$(fn_body '^func terminalWsHandler[(]' "$AG_S")
 
 # B2 — THE ARM THAT MATTERS. The domain the shell opens under is chosen from the
 # TICKET scope, and the query param is used ONLY on the no-scope (legacy) branch.
-# A regression that reads `q.domain` up front, before the scope, is the defect.
-if [ -z "$AG_S" ]; then
-  bad "B2 SKIPPED: $AG did not yield source"
+# A regression that reads `?domain=` up front, before the scope, is the defect.
+if [ -z "$WS" ]; then
+  bad "B2 SKIPPED: could not bound terminalWsHandler"
+elif before "$WS" 'ticketScope, ok = terminalValidateTicket\(' 'var domain string' \
+  && has "$(flat "$WS")" 'var domain string switch \{ case ticketScope != nil && \*ticketScope == terminalServerShellScope: domain = "" case ticketScope != nil: domain = \*ticketScope default: domain = q\.Get\("domain"\)'; then
+  ok "B2 the shell's domain is chosen from the signed scope; the query param is not read up front"
 else
-  WS=$(fn_body 'async fn ws_handler' "$AG_S")
-  if [ -z "$WS" ]; then
-    bad "B2 SKIPPED: could not bound ws_handler"
-  # The scope match must be reached BEFORE the domain binding, and the domain
-  # binding must be the match itself, not a bare `q.domain.clone()` assignment.
-  elif before "$WS" 'ticket_scope' 'let domain =' \
-    && has "$WS" 'let domain = match ticket_scope'; then
-    ok "B2 the shell's domain is chosen from the signed scope; the query param is not read up front"
-  else
-    bad "B2 the domain is bound from the query param, not the ticket scope — the escalation is restored"
-  fi
+  bad "B2 the domain is bound from the query param, not the ticket scope — the escalation is restored"
 fi
 
 # B3 — the legacy fallback to the query param is confined to the no-scope branch
 # AND announces itself. An unscoped root shell that is silent is how this would
 # hide on a mixed-version fleet.
-if [ -z "$AG_S" ]; then
-  bad "B3 SKIPPED: $AG did not yield source"
+N=$(count "$WS" 'q\.Get\("domain"\)')
+if [ -n "$WS" ] && [ "$N" = "1" ] && before "$WS" 'default:' 'q\.Get\("domain"\)' \
+  && has "$(flat "$WS")" 'domain = q\.Get\("domain"\) if domain == "" \{ slog\.Warn\('; then
+  ok "B3 the query param is read once, only on the no-scope legacy branch, and it is logged"
 else
-  WS=$(fn_body 'async fn ws_handler' "$AG_S")
-  # Exactly one q.domain read, and it sits after a `None =>` arm with a warn.
-  N=$(count "$WS" 'q\.domain\.clone\(\)')
-  if [ "$N" = "1" ] && has "$WS" 'None =>' && before "$WS" 'None =>' 'q\.domain\.clone\(\)' && has "$WS" 'tracing::warn'; then
-    ok "B3 the query param is read once, only on the no-scope legacy branch, and it is logged"
-  else
-    bad "B3 the query param is read outside the legacy branch (${N} reads) or an unscoped root shell is silent"
-  fi
+  bad "B3 the query param is read outside the legacy branch (${N} reads) or an unscoped root shell is silent"
 fi
 
 echo "§C  the two ends agree on the server-shell marker"
@@ -169,8 +149,8 @@ echo "§C  the two ends agree on the server-shell marker"
 # C1 — both files define the SAME marker string. If they drift, an admin server
 # shell minted by the panel is treated as a site named '@server' by the agent, or
 # worse a site scope is mistaken for the server shell.
-BE_MARK=$(grep -oE 'SERVER_SHELL_SCOPE[^;]*"[^"]+"' <<< "$BE_S" | grep -oE '"[^"]+"' | head -1)
-AG_MARK=$(grep -oE 'SERVER_SHELL_SCOPE[^;]*"[^"]+"' <<< "$AG_S" | grep -oE '"[^"]+"' | head -1)
+BE_MARK=$(grep -oE 'const rtTerminalServerShellScope = "[^"]+"' <<< "$BE_S" | grep -oE '"[^"]+"' | head -1)
+AG_MARK=$(grep -oE 'const terminalServerShellScope = "[^"]+"' <<< "$AG_S" | grep -oE '"[^"]+"' | head -1)
 if [ -n "$BE_MARK" ] && [ "$BE_MARK" = "$AG_MARK" ]; then
   ok "C1 both ends agree the server-shell marker is $BE_MARK"
 else
@@ -190,12 +170,17 @@ else
   bad "C2 SKIPPED: no marker found to check"
 fi
 
+DROP=$(fn_body '^func terminalOpenPtyShell[(]' "$AG_S")
+DROP_FLAT=$(flat "$DROP")
+
 # C3 — the agent still drops privilege for a site scope: a non-empty domain must
-# reach the setuid path. Guards against a fix that carries the scope but forgets
-# to act on it.
+# reach the credential-switching path. Guards against a fix that carries the
+# scope but forgets to act on it.
 if [ -z "$AG_S" ]; then
   bad "C3 SKIPPED: $AG did not yield source"
-elif has "$AG_S" 'site_domain\.is_some\(\)' && has "$AG_S" 'setuid'; then
+elif has "$AG_S" 'isSite := domain != ""' \
+  && has "$AG_S" 'terminalOpenPtyShell\(cwd, cols, rows, isSite\)' \
+  && has "$DROP_FLAT" 'if site \{.*attrs\.Credential = &syscall\.Credential\{Uid: uid, Gid: gid, Groups: groups\}'; then
   ok "C3 a site-scoped shell still drops to the site's user"
 else
   bad "C3 the privilege drop for a site shell is gone"
@@ -204,31 +189,27 @@ fi
 # C4 — and the drop must be VERIFIED, not merely attempted.
 #
 # ⚠ WHY C3 IS NOT ENOUGH, written down because C3 reads as though it were.
-# C3 asserts two tokens that merely COEXIST in the file: `site_domain.is_some()`
-# and `setuid`. Both survive a tree in which `setuid` FAILS and the child falls
-# through to `execv` anyway — which is exactly what this code did until v2.88.0,
-# where all three of setgid/initgroups/setuid had their results discarded. So C3
-# would have certified "a site-scoped shell still drops to the site's user" on a
-# tree that hands the SITE'S OWNER a root shell in their own webroot. That is the
-# project's #321 shape — a context arm must name the PROPERTY whose change would
-# invalidate the decision it guards, never two tokens a rewrite keeps.
+# In the Rust era all three of setgid/initgroups/setuid once had their results
+# discarded (until v2.88.0), so a tree where `setuid` FAILS and the child falls
+# through to `execv` would have passed a C3-shaped arm while handing the SITE'S
+# OWNER a root shell in their own webroot (#321: name the PROPERTY, not two
+# tokens a rewrite keeps).
 #
-# The property: a failed privilege drop must not reach `execv`. `getuid`/`geteuid`
-# are the half that cannot be fooled by a return code nobody read.
-if [ -z "$AG_S" ]; then
-  bad "C4 SKIPPED: $AG did not yield source"
+# The property: a failed privilege drop must not yield a running shell. In Go,
+# SysProcAttr.Credential makes the child abort the exec if any of
+# setgid/setgroups/setuid fails, and the parent then asks the KERNEL who the
+# child is (/proc/<pid>/status: real+effective uid, real gid) and kills it on a
+# mismatch — the half that cannot be fooled by a return code nobody read.
+CREDS=$(fn_body '^func terminalCredsAre[(]' "$AG_S")
+if [ -z "$DROP" ] || [ -z "$CREDS" ]; then
+  bad "C4 SKIPPED: could not bound terminalOpenPtyShell / terminalCredsAre"
+elif has "$DROP_FLAT" 'if !terminalCredsAre\(cmd\.Process\.Pid, uid, gid\) \{ _ = s\.f\.Close\(\) _ = cmd\.Process\.Kill\(\) _ = cmd\.Wait\(\) return nil, nil, ' \
+  && before "$DROP" 'pty\.StartWithAttrs\(cmd, size, attrs\)' 'terminalCredsAre\(' \
+  && has "$CREDS" '/proc/%d/status' \
+  && has "$CREDS" 'want\("Uid:", \[\]int\{1, 2\}, uid\)'; then
+  ok "C4 a FAILED privilege drop never yields a shell, and the result is re-read from the kernel"
 else
-  DROP=$(fn_body 'fn open_pty_shell' "$AG_S")
-  DROP_FLAT=$(tr '\n' ' ' <<< "$DROP" | tr -s ' ')
-  if [ -z "$DROP" ]; then
-    bad "C4 SKIPPED: could not bound open_pty_shell"
-  elif has "$DROP_FLAT" 'libc::setgid\(gid\) != 0 \|\| libc::initgroups\(username, gid\) != 0 \|\| libc::setuid\(uid\) != 0' \
-    && has "$DROP_FLAT" 'libc::getuid\(\) != uid \|\| libc::geteuid\(\) != uid' \
-    && has "$DROP_FLAT" '_exit\(1\)'; then
-    ok "C4 a FAILED privilege drop exits instead of reaching execv, and the result is re-read from the kernel"
-  else
-    bad "C4 the privilege drop's syscalls are unchecked — a failed setuid would exec a ROOT shell for the site's owner"
-  fi
+  bad "C4 the privilege drop is not verified — a failed setuid could hand a ROOT shell to the site's owner"
 fi
 
 echo "§D  a terminal share is scoped to the admin who created it (s428)"
@@ -246,75 +227,47 @@ echo "§D  a terminal share is scoped to the admin who created it (s428)"
 # D1 — share_output stores the CREATING ADMIN's id alongside the timestamp,
 # not just content. Three pipe-delimited fields, the middle one bound from
 # claims — not two.
-if [ -z "$BE_S" ]; then
-  bad "D1 SKIPPED: $BE did not yield source"
+SO=$(fn_body '^func rtTerminalShareOutput[(]' "$BE_S")
+if [ -n "$SO" ] && has "$SO" 'value := strconv\.FormatInt\(time\.Now\(\)\.Unix\(\), 10\) \+ "\|" \+ c\.Sub\.String\(\) \+ "\|" \+ content'; then
+  ok "D1 share_output stores the creating admin's id in the share value"
 else
-  SO=$(fn_body 'async fn share_output' "$BE_S")
-  if [ -n "$SO" ] && has "$SO" 'format!\("\{\}\|\{\}\|\{\}"' && has "$SO" 'claims\.sub'; then
-    ok "D1 share_output stores the creating admin's id in the share value"
-  else
-    bad "D1 share_output does not store an owner — every admin's shares are indistinguishable"
-  fi
+  bad "D1 share_output does not store an owner — every admin's shares are indistinguishable"
 fi
 
-# D2 — share_lifetime parses out an owner field alongside timestamp/content,
-# so the two readers below can actually scope on it.
-if [ -z "$BE_S" ]; then
-  bad "D2 SKIPPED: $BE did not yield source"
-else
-  LIFETIME=$(fn_body 'fn share_lifetime' "$BE_S")
-  if [ -n "$LIFETIME" ] && has "$LIFETIME" 'Option<\(i64, i64, &str, &str\)>'; then
-    ok "D2 share_lifetime returns an owner field, not just (created_at, remaining, content)"
-  else
-    bad "D2 share_lifetime's signature lost the owner field — list_shares/revoke_share cannot scope"
-  fi
-fi
+# D2 retired: covered by TestRtTerminalShareLifetime (panel/go/internal/api/rt_terminal_test.go) — share_lifetime parses the owner field (and fails closed to "" on a pre-owner row)
 
 # D3 — THE ARM THAT MATTERS. list_shares skips any share whose owner is not
 # the calling admin's own id.
-if [ -z "$BE_S" ]; then
-  bad "D3 SKIPPED: $BE did not yield source"
+LIST=$(fn_body '^func rtTerminalListShares[(]' "$BE_S")
+LIST_FLAT=$(flat "$LIST")
+if [ -n "$LIST" ] && has "$LIST" 'me := c\.Sub\.String\(\)' \
+  && has "$LIST_FLAT" 'owner, _, ok := rtTerminalShareLifetime\(kv\.B, now\) if !ok \|\| owner != me \{ continue \}'; then
+  ok "D3 list_shares skips any share not owned by the calling admin"
 else
-  LIST=$(fn_body 'async fn list_shares' "$BE_S")
-  LIST_FLAT=$(tr '\n' ' ' <<< "$LIST" | tr -s ' ')
-  if [ -n "$LIST" ] && has "$LIST" 'claims\.sub\.to_string\(\)' \
-    && has "$LIST_FLAT" 'if owner != my_id \{ continue; \}'; then
-    ok "D3 list_shares skips any share not owned by the calling admin"
-  else
-    bad "D3 list_shares returns every admin's shares — any admin can enumerate another's root terminal output"
-  fi
+  bad "D3 list_shares returns every admin's shares — any admin can enumerate another's root terminal output"
 fi
 
 # D4 — revoke_share's DELETE is scoped to the calling admin's own share, not
 # just the share id. A key match alone lets any admin revoke — or, paired with
 # a D3 regression, first enumerate then read via the share_id — another
 # admin's share.
-if [ -z "$BE_S" ]; then
-  bad "D4 SKIPPED: $BE did not yield source"
+REVOKE=$(fn_body '^func rtTerminalRevokeShare[(]' "$BE_S")
+if [ -n "$REVOKE" ] && has "$(flat "$REVOKE")" "split_part\(value, '\|', 2\) = \\\$2\", \"terminal_share_\"\+id, c\.Sub\.String\(\)\)"; then
+  ok "D4 revoke_share's DELETE is scoped to the calling admin's own share"
 else
-  REVOKE=$(fn_body 'async fn revoke_share' "$BE_S")
-  if [ -n "$REVOKE" ] && has "$REVOKE" 'split_part\(value, .\|., 2\) = \$2' \
-    && has "$REVOKE" 'claims\.sub\.to_string\(\)'; then
-    ok "D4 revoke_share's DELETE is scoped to the calling admin's own share"
-  else
-    bad "D4 revoke_share can delete any admin's share by id alone — no ownership check"
-  fi
+  bad "D4 revoke_share can delete any admin's share by id alone — no ownership check"
 fi
 
 # D5 — view_shared (the public, unauthenticated link) must NOT gain an owner
-# check — its whole design is "the id is the credential." Bounded on the
-# signature alone: fn_body's closing-brace-at-column-0 heuristic cannot bound
-# this function (its body is a raw HTML/JS template with braces starting at
-# column 0), so this confirms the fix didn't overcorrect without relying on it.
-if [ -z "$BE_S" ]; then
-  bad "D5 SKIPPED: $BE did not yield source"
+# check — its whole design is "the id is the credential." In Go, auth is a call
+# in the body (st.authUser / st.adminUser), so the body is the subject; the
+# id-validation call is the positive anchor proving the body was extracted.
+VIEW=$(fn_body '^func rtTerminalViewShared[(]' "$BE_S")
+if [ -n "$VIEW" ] && has "$VIEW" 'rtTerminalValidShareID\(id\)' \
+  && ! has "$VIEW" 'st\.(authUser|adminUser)\(|requireAdmin\(|claims|c\.Sub'; then
+  ok "D5 view_shared stays unauthenticated — the link itself remains the only credential"
 else
-  VIEW_SIG=$(awk '/pub async fn view_shared\(/{f=1} f{print} f && /-> Result</{exit}' <<< "$BE_S")
-  if [ -n "$VIEW_SIG" ] && ! has "$VIEW_SIG" 'AuthUser'; then
-    ok "D5 view_shared stays unauthenticated — the link itself remains the only credential"
-  else
-    bad "D5 view_shared gained an auth requirement, or its signature could not be found — legitimate share links would break"
-  fi
+  bad "D5 view_shared gained an auth requirement, or its body could not be found — legitimate share links would break"
 fi
 
 echo

@@ -56,6 +56,17 @@
 # read a constant 8 out of `[u8; 8]` — the 8 in `u8` — so it compared 16 against a
 # hardcoded 16 and passed on every tree. Only the mutation that widened the
 # generator to 32 bytes exposed it.
+#
+# GO PORT: subjects are panel/go/internal/api/{rt_auth,rt_users,core_router}.go.
+# Names: reset_2fa -> rtUsersReset2fa, twofa_regenerate_recovery_codes ->
+# rtAuthTwofaRegenerateRecoveryCodes, try_recovery_code -> rtAuthTryRecoveryCode,
+# twofa_rate_limit_{check,record,clear} -> rtAuthTwofaRateLimit{Check,Record,Clear},
+# AdminUser -> st.adminUser(r), state.twofa_attempts -> st.TwofaAttempts. The
+# Go port moved disable/reissue's shared "code or recovery code" body into ONE
+# helper, rtAuthTwofaCodeOrRecovery, so §C judges the functions that touch
+# rtAuthTryRecoveryCode directly, and counts DOORS (handlers reaching it,
+# directly or through such a helper) separately. Routes are registered per file
+# (`r.Handle(...)`) and wired by core_router.go's registrars list.
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
@@ -100,7 +111,7 @@ flat() { tr '\n' ' ' <<< "$1" | tr -s ' '; }
 # left the terminator off (#299).
 fnbody() {
   awk -v fn="$2" '
-    index($0, "fn " fn "(") && !started { started=1 }
+    (index($0, "func " fn "(") == 1 || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) && !started { started=1 }
     started {
       n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
       if (opened || n>0) opened=1
@@ -109,9 +120,9 @@ fnbody() {
   ' <<< "$1"
 }
 
-AUTH=panel/backend/src/routes/auth.rs
-USERS=panel/backend/src/routes/users.rs
-ROUTER=panel/backend/src/routes/mod.rs
+AUTH=panel/go/internal/api/rt_auth.go
+USERS=panel/go/internal/api/rt_users.go
+ROUTER=panel/go/internal/api/core_router.go
 CARDS=panel/frontend/src/components/AccountSecurity.tsx
 USERPAGE=panel/frontend/src/pages/Users.tsx
 GUIDE=docs/guides/security-hardening.md
@@ -126,7 +137,7 @@ GUIDE_R=$(raw "$GUIDE")
 # ── §A the administrator's door ─────────────────────────────────────────────
 echo "── §A an administrator can clear somebody else's enrolment ──"
 
-RESET_BODY=$(fnbody "$USERS_C" "reset_2fa")
+RESET_BODY=$(fnbody "$USERS_C" "rtUsersReset2fa")
 
 if [ -n "$RESET_BODY" ]; then
   ok "A1 a reset_2fa handler exists"
@@ -135,14 +146,15 @@ else
 fi
 
 # Its own body, not the file: users.rs is full of AdminUser handlers.
-if has "$RESET_BODY" 'AdminUser'; then
+if has "$RESET_BODY" 'st\.adminUser\(r\)'; then
   ok "A2 reset_2fa is AdminUser"
 else
   bad "A2 reset_2fa is not AdminUser — clearing another account's 2FA is not an ordinary permission"
 fi
 
 # An unrouted handler is dead code that every other arm here would still pass.
-if has "$ROUTER_C" 'users/\{id\}/reset-2fa'; then
+if has "$USERS_C" 'r\.Handle\("POST /api/users/\{id\}/reset-2fa", h\(rtUsersReset2fa\)\)' \
+   && has "$ROUTER_C" '^[[:space:]]*rtUsersRegister,'; then
   ok "A3 reset-2fa is routed"
 else
   bad "A3 reset_2fa exists but nothing routes to it — the door is not connected"
@@ -151,7 +163,7 @@ fi
 # ⚠ THE SECURITY ARM. Without this the route is a re-authentication bypass: an
 # administrator (or a hijacked administrator session) turns 2FA off in one click,
 # presenting no code at all.
-if has "$RESET_BODY" 'id == claims\.sub'; then
+if has "$RESET_BODY" 'if id == claims\.Sub \{'; then
   ok "A4 reset_2fa refuses the caller's own account"
 else
   bad "A4 reset_2fa will act on the CALLER — that is disabling your own 2FA with no code, from an admin screen"
@@ -169,13 +181,13 @@ else
   bad "A5 reset_2fa leaves part of the enrolment behind"
 fi
 
-if has "$RESET_BODY" 'revoke_all_user_sessions'; then
+if has "$RESET_BODY" 'st\.revokeAllUserSessions\(ctx, id\)'; then
   ok "A6 reset_2fa signs the target's sessions out"
 else
   bad "A6 reset_2fa leaves live sessions on an account whose authentication just changed"
 fi
 
-if has "$RESET_BODY" 'log_activity'; then
+if has "$RESET_BODY" 'ActivityLogActivity\('; then
   ok "A7 reset_2fa is recorded in the activity log"
 else
   bad "A7 reset_2fa is silent — an admin clearing another admin's 2FA leaves no trace"
@@ -190,7 +202,7 @@ fi
 
 # ...which requires the list to actually carry the field. A UI keyed on a field
 # the API never sends is a control that never appears.
-if has "$USERS_C" 'totp_enabled' && has "$(fnbody "$USERS_C" "list")" 'totp_enabled'; then
+if has "$USERS_C" 'TotpEnabled bool `json:"totp_enabled"' && has "$(fnbody "$USERS_C" "rtUsersList")" 'u\.totp_enabled'; then
   ok "A9 the users list carries totp_enabled"
 else
   bad "A9 the list never sends totp_enabled — A8's condition is always false and the control never draws"
@@ -200,7 +212,7 @@ fi
 echo
 echo "── §B an owner can reissue codes without losing the enrolment ──"
 
-REGEN_BODY=$(fnbody "$AUTH_C" "twofa_regenerate_recovery_codes")
+REGEN_BODY=$(fnbody "$AUTH_C" "rtAuthTwofaRegenerateRecoveryCodes")
 
 if [ -n "$REGEN_BODY" ]; then
   ok "B1 a recovery-code reissue handler exists"
@@ -208,27 +220,30 @@ else
   bad "B1 no reissue handler — codes are still write-once and cannot be replaced"
 fi
 
-if has "$ROUTER_C" '2fa/recovery-codes'; then
+if has "$AUTH_C" 'r\.Handle\("POST /api/auth/2fa/recovery-codes", h\(rtAuthTwofaRegenerateRecoveryCodes\)\)' \
+   && has "$ROUTER_C" '^[[:space:]]*rtAuthRegister,'; then
   ok "B2 the reissue route is wired"
 else
   bad "B2 the reissue handler is not routed"
 fi
 
-# Scoped to its OWN body: `try_recovery_code` is called by two other handlers, so
-# a file-wide grep passes on a tree where this one never learned about it.
-if has "$REGEN_BODY" 'try_recovery_code'; then
+# Scoped to its OWN body: `rtAuthTryRecoveryCode` is called by other handlers, so
+# a file-wide grep passes on a tree where this one never learned about it. In Go
+# the reissue reaches it through the shared rtAuthTwofaCodeOrRecovery helper.
+if has "$REGEN_BODY" 'rtAuthTwofaCodeOrRecovery\(' \
+   && has "$(fnbody "$AUTH_C" "rtAuthTwofaCodeOrRecovery")" 'rtAuthTryRecoveryCode\('; then
   ok "B3 reissue accepts a recovery code, not only a live TOTP code"
 else
   bad "B3 reissue takes only a TOTP code — the account it most helps is the one that cannot produce one"
 fi
 
-if has "$REGEN_BODY" 'generate_recovery_codes' && has "$REGEN_BODY" 'recovery_codes = \$1'; then
+if has "$REGEN_BODY" 'codes := rtAuthGenerateRecoveryCodes\(\)' && has "$REGEN_BODY" 'SET recovery_codes = \$1'; then
   ok "B4 reissue mints a new set and stores it"
 else
   bad "B4 reissue does not actually write a new set"
 fi
 
-if has "$REGEN_BODY" 'recovery_codes.*codes'; then
+if has "$REGEN_BODY" '"recovery_codes": codes'; then
   ok "B5 reissue returns the plaintext codes to the caller"
 else
   bad "B5 reissue stores codes it never shows — the v2.83.0 defect, one route over"
@@ -237,11 +252,7 @@ fi
 # A recovery code is a credential stored under an UNSALTED SHA-256, which is a
 # fast hash — so its only real defence is its width. At 4 bytes the preimage space
 # was 32 bits and a leaked `users` table gave up the plaintext in seconds.
-if [ -n "$(grep -oE '\[u8; 8\]' <<< "$(fnbody "$AUTH_C" "generate_recovery_codes")")" ]; then
-  ok "B6 recovery codes are 8 random bytes (64 bits), not 4"
-else
-  bad "B6 recovery codes are narrower than 8 bytes — a fast unsalted hash over a small space"
-fi
+# B6 retired: covered by TestRtAuthRecoveryCodesAre64Bit (panel/go/internal/api/rt_auth_test.go)
 
 # ⚠ CROSS-TREE, and DERIVED rather than spelled: the field that accepts a recovery
 # code must be at least as wide as the code the backend issues. Widening the
@@ -255,7 +266,8 @@ fi
 # bytes exposed it. Same defect as the cap extractor below, in the same commit,
 # five lines apart; the one that reported a cap of 0 was caught instantly because
 # it went red, and this one was not because it went green.
-GEN_BYTES=$(sed -nE 's/.*\[u8; ([0-9]+)\].*/\1/p' <<< "$(fnbody "$AUTH_C" "generate_recovery_codes")" | head -1)
+# Go: `b := make([]byte, N)` — captured, never the first digit on the line.
+GEN_BYTES=$(sed -nE 's/.*make\(\[\]byte, ([0-9]+)\).*/\1/p' <<< "$(fnbody "$AUTH_C" "rtAuthGenerateRecoveryCodes")" | head -1)
 # ⚠ Extract the cap with a CAPTURE. `grep -oE '[0-9]+' | head -1` returns the
 # ZERO in `slice(0, …`, and this arm's first run duly reported a cap of 0 against
 # a field that was already correct.
@@ -277,29 +289,43 @@ echo "── §C every door that verifies a 2FA code is rate-limited ──"
 #
 # Enumerated from source rather than listed, so a NEW door of this shape joins the
 # check automatically instead of being silently uncovered.
+# MEMBERS: every function that itself verifies a recovery code — the place the
+# limiter must sit. DOORS: every handler that reaches one (directly, or through a
+# member helper), which is what C0 counts.
+ALLFNS=$(sed -nE 's/^func (\([^)]*\) )?([A-Za-z0-9_]+)\(.*/\2/p' <<< "$AUTH_C" | sort -u)
 MEMBERS=""
-for fn in $(grep -oE 'pub async fn [a-z0-9_]+' "$AUTH" | awk '{print $4}'); do
+for fn in $ALLFNS; do
+  [ "$fn" = "rtAuthTryRecoveryCode" ] && continue
   b=$(fnbody "$AUTH_C" "$fn")
-  if has "$b" 'try_recovery_code\('; then
+  if has "$b" 'rtAuthTryRecoveryCode\('; then
     MEMBERS="$MEMBERS $fn"
   fi
 done
-MEMBERS_N=$(printf '%s\n' $MEMBERS | grep -c . || true)
+DOORS=""
+for fn in $ALLFNS; do
+  grep -qE "^func $fn\(st \*AppState, w http\.ResponseWriter" <<< "$AUTH_C" || continue
+  b=$(fnbody "$AUTH_C" "$fn")
+  for m in rtAuthTryRecoveryCode $MEMBERS; do
+    if has "$b" "[^A-Za-z0-9_]$m\\("; then DOORS="$DOORS $fn"; break; fi
+  done
+done
+DOORS_N=$(printf '%s\n' $DOORS | grep -c . || true)
 
-printf '%s\n' $MEMBERS | sed 's/^/  door: /'
+printf '%s\n' $DOORS | sed 's/^/  door: /'
+printf '%s\n' $MEMBERS | sed 's/^/  verifier: /'
 
 # §C0 — the discovery itself. Three are known to exist (login's second step,
 # disable, reissue). Fewer means the pattern moved and every arm below inspects
 # nothing.
-if [ "$MEMBERS_N" -ge 3 ]; then
-  ok "C0 discovered $MEMBERS_N doors that verify a 2FA credential (>= 3 known)"
+if [ "$DOORS_N" -ge 3 ]; then
+  ok "C0 discovered $DOORS_N doors that verify a 2FA credential (>= 3 known)"
 else
-  bad "C0 only $MEMBERS_N discovered — the pattern moved; every §C arm is now vacuous"
+  bad "C0 only $DOORS_N discovered — the pattern moved; every §C arm is now vacuous"
 fi
 
 for fn in $MEMBERS; do
   b=$(fnbody "$AUTH_C" "$fn")
-  if has "$b" 'twofa_rate_limit_check'; then
+  if has "$b" 'rtAuthTwofaRateLimitCheck\('; then
     ok "C-$fn is rate-limited"
   else
     bad "C-$fn verifies a 2FA code with NO limit — 3 codes in 10^6 are live at any instant"
@@ -309,7 +335,7 @@ done
 # A door that never records a failure has a limiter that never counts.
 for fn in $MEMBERS; do
   b=$(fnbody "$AUTH_C" "$fn")
-  if has "$b" 'twofa_rate_limit_record'; then
+  if has "$b" 'rtAuthTwofaRateLimitRecord\('; then
     ok "C-$fn records failed attempts"
   else
     bad "C-$fn checks the limit but never increments it — the counter stays at zero forever"
@@ -324,26 +350,26 @@ done
 # the exact defect. A threshold satisfied by the bug is not a check. The property
 # is CONTAINMENT: every touch must sit inside one of the three helpers, so the
 # file-wide count and the in-helper count have to agree.
-TOTAL_TOUCH=$(grep -c 'twofa_attempts' <<< "$AUTH_C" || true)
+TOTAL_TOUCH=$(grep -c 'TwofaAttempts' <<< "$AUTH_C" || true)
 HELPER_TOUCH=0
 HELPERS_PRESENT=1
-for h in twofa_rate_limit_check twofa_rate_limit_record twofa_rate_limit_clear; do
+for h in rtAuthTwofaRateLimitCheck rtAuthTwofaRateLimitRecord rtAuthTwofaRateLimitClear; do
   hb=$(fnbody "$AUTH_C" "$h")
-  n=$(grep -c 'twofa_attempts' <<< "$hb" || true)
+  n=$(grep -c 'TwofaAttempts' <<< "$hb" || true)
   [ "$n" -ge 1 ] || HELPERS_PRESENT=0
   HELPER_TOUCH=$((HELPER_TOUCH + n))
 done
 if [ "$HELPERS_PRESENT" -eq 1 ] && [ "$TOTAL_TOUCH" -eq "$HELPER_TOUCH" ]; then
   ok "C9 every touch of the limiter state is inside its three helpers ($HELPER_TOUCH/$TOTAL_TOUCH)"
 else
-  bad "C9 $((TOTAL_TOUCH - HELPER_TOUCH)) touch(es) of twofa_attempts sit outside the helpers — an inline copy will drift"
+  bad "C9 $((TOTAL_TOUCH - HELPER_TOUCH)) touch(es) of TwofaAttempts sit outside the helpers — an inline copy will drift"
 fi
 
 # ── §D the remaining count is visible ───────────────────────────────────────
 echo
 echo "── §D the account can see how many codes are left ──"
 
-if has "$(fnbody "$AUTH_C" "twofa_status")" 'recovery_codes_remaining'; then
+if has "$(fnbody "$AUTH_C" "rtAuthTwofaStatus")" '"recovery_codes_remaining": rtAuthRecoveryCodesRemaining\('; then
   ok "D1 the status endpoint reports how many codes remain"
 else
   bad "D1 nothing reports the remaining count — an account can reach zero without being told"
@@ -396,7 +422,7 @@ fi
 echo
 echo "── §F the guide describes what the code actually does ──"
 
-# `hash_token` is SHA-256 (routes/auth.rs). The guide named Argon2 — a materially
+# `rtAuthHashToken` is SHA-256 (rt_auth.go). The guide named Argon2 — a materially
 # stronger protection than the one applied, in the document an operator reads to
 # assess exactly that.
 if ! has "$GUIDE_R" 'recovery codes are stored as Argon2' && ! has "$GUIDE_R" 'Recovery codes are stored as Argon2'; then
@@ -424,20 +450,20 @@ fi
 echo
 echo "── §G context (green at both tags — each owes a mutation) ──"
 
-if [ -n "$(fnbody "$USERS_C" "reset_password")" ]; then
+if [ -n "$(fnbody "$USERS_C" "rtUsersResetPassword")" ]; then
   ok "G1 reset_password still exists — §A's sibling, and the shape it mirrors"
 else
   bad "G1 reset_password is gone — §A is measuring an admin module that changed underneath it"
 fi
 
-if has "$(fnbody "$AUTH_C" "twofa_verify")" 'try_recovery_code'; then
+if has "$(fnbody "$AUTH_C" "rtAuthTwofaVerify")" 'rtAuthTryRecoveryCode\('; then
   ok "G2 the login door still accepts a recovery code (fnbody is discriminating)"
 else
-  bad "G2 twofa_verify lost its recovery branch — or fnbody is broken and §C's discovery is empty"
+  bad "G2 rtAuthTwofaVerify lost its recovery branch — or fnbody is broken and §C's discovery is empty"
 fi
 
-ROUTES_N=$(grep -c '\.route(' <<< "$ROUTER_C" || true)
-if [ "$ROUTES_N" -ge 200 ]; then
+ROUTES_N=$(cat panel/go/internal/api/rt_*.go | grep -c 'r\.Handle("' || true)
+if [ "$ROUTES_N" -ge 200 ] && has "$ROUTER_C" '^var registrars = '; then
   ok "G3 the router still parses as a router ($ROUTES_N routes) — §A3/§B2 are non-vacuous"
 else
   bad "G3 only $ROUTES_N routes read from the router — the file shape moved"

@@ -23,7 +23,8 @@
 #       filter matched a great many rows". A typo silently widened the answer.
 #
 #   S4  A DATABASE FAILURE LOOKED LIKE AN EMPTY LOG. Both endpoints ended in
-#       `.unwrap_or_default()`, so "we could not read the logs" and "there are no
+#       `.unwrap_or_default()` (Rust era; the Go equivalent is a discarded
+#       `_` error), so "we could not read the logs" and "there are no
 #       logs" rendered as the same screen — the silence-as-safety class the canary
 #       reader was corrected for one release earlier.
 #
@@ -43,7 +44,9 @@
 # source must STILL be reachable when explicitly named. Both were mutation-tested
 # by planting the defect in a subject that is still a member.
 #
-# Pure source analysis: no box, no network, no build.
+# Pure source analysis: no box, no network, no build. Subject is the Go API
+# (panel/go/internal/api/rt_system_logs.go, ported from the Rust
+# routes/system_logs.rs) and its SystemLogLogEvent writers.
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -60,10 +63,10 @@ bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 # than a broken arm. `grep -c` reads to EOF, and its exit status is still 0 on a
 # match, so this is the same boolean with no early exit.
 qgrep() { grep -c "$@" >/dev/null; }
-BE=panel/backend/src
+BE=panel/go/internal/api
 FE=panel/frontend/src
 
-for d in "$BE" "$FE" panel/backend/migrations; do
+for d in "$BE" "$FE" "$BE/migrations"; do
   [ -d "$d" ] || { echo "missing dir: $d — refusing to report a clean sweep"; exit 1; }
 done
 
@@ -80,7 +83,7 @@ code() {
   ' "$1"
 }
 
-SL="$BE/routes/system_logs.rs"
+SL="$BE/rt_system_logs.go"
 UI="$FE/pages/SystemLogs.tsx"
 [ -f "$SL" ] || { echo "missing $SL — refusing to report a clean sweep"; exit 1; }
 [ -f "$UI" ] || { echo "missing $UI — refusing to report a clean sweep"; exit 1; }
@@ -97,7 +100,7 @@ echo "── system logs scope pins ──"
 # BUILDS the string still existed and still contained it. An arm that proves a
 # guard is DEFINED tells you nothing about whether anything invokes it; the
 # mutation harness is what exposed that, not review.
-if code "$SL" | qgrep -E 'conditions\.push\(hide_metric\(\)\)'; then
+if code "$SL" | qgrep -E 'conds = append\(conds, rtSystemLogsHideMetric\(\)\)'; then
   ok "S1 the default listing applies the metric exclusion, so genuine entries are not buried"
 else
   bad "S1 nothing applies the metric exclusion — one row a minute still buries the log"
@@ -122,7 +125,7 @@ fi
 
 # ── S2b. The exclusion must be CONFINED to the unnamed-source branch. ────────
 # Not a control: red at the previous tag, where no exclusion existed at all.
-if code "$SL" | qgrep -E 'None *=> *conditions\.push\(hide_metric\(\)\)'; then
+if code "$SL" | perl -0777 -ne 'exit(/if p\.Source != nil[^\n]*\{\n[^}]*source = \$[^}]*\}\s*else\s*\{\s*conds = append\(conds, rtSystemLogsHideMetric\(\)\)/ ? 0 : 1)'; then
   ok "S2b the exclusion applies only when no source was named, so naming the metric still returns it"
 else
   bad "S2b the exclusion is not confined to the unnamed-source branch — it may hide the rows unconditionally"
@@ -143,23 +146,23 @@ else
 fi
 
 # ── S5/S6. Neither endpoint may render a database failure as an empty result. ─
-if [ "$(code "$SL" | grep -c 'unwrap_or_default')" -eq 0 ]; then
+if [ "$(code "$SL" | grep -cE '_ *:?= *query|, *_ *:?= *query|_ *:?= *execSQL')" -eq 0 ]; then
   ok "S5 a failed log read is an error, not an empty list that reads as 'nothing went wrong'"
 else
-  bad "S5 an endpoint still ends in unwrap_or_default — a database failure renders as silence"
+  bad "S5 an endpoint still discards its query error (_ :=) — a database failure renders as silence"
 fi
 
-if [ "$(code "$SL" | grep -cE 'map_err\(\|e\| internal_error')" -ge 2 ]; then
+if [ "$(code "$SL" | perl -0777 -ne 'my $c = () = /if err != nil \{\s*return internalError\(/g; print $c')" -ge 2 ]; then
   ok "S6 both the list and the count endpoints propagate a database failure"
 else
   bad "S6 fewer than two endpoints propagate — one of them still swallows its error"
 fi
 
 # ── S7. The tiles must count the same population the default listing shows. ──
-COUNT_FN=$(code "$SL" | perl -0777 -ne 'print $1 if /(pub async fn count.*)/s')
+COUNT_FN=$(code "$SL" | perl -0777 -ne 'print $1 if /(^func rtSystemLogsCount\(.*?^\})/ms')
 if [ -z "$COUNT_FN" ]; then
   bad "S7 could not extract the count endpoint — the arm has no subject, not a passing result"
-elif printf '%s' "$COUNT_FN" | qgrep -E 'source <> |\{hide\}'; then
+elif printf '%s' "$COUNT_FN" | qgrep -E 'source <> |rtSystemLogsHideMetric\(\)'; then
   ok "S7 the count endpoint applies the same exclusion, so the Info tile is not one metric a minute"
 else
   bad "S7 the count endpoint counts the metric rows the listing hides — the tiles disagree with the list"
@@ -170,9 +173,9 @@ fi
 # beside both writers, and an arm reading raw source would match that prose.
 SHORT=0
 while IFS= read -r f; do
-  n=$(code "$f" | perl -0777 -ne 'my $c = () = /log_event\s*\(\s*[^,]+,\s*"warn"/gs; print $c')
+  n=$(code "$f" | perl -0777 -ne 'my $c = () = /SystemLogLogEvent\s*\(\s*[^,]+,\s*[^,]+,\s*"warn"/gs; print $c')
   SHORT=$((SHORT + ${n:-0}))
-done < <(grep -rl 'log_event' "$BE" --include=*.rs)
+done < <(grep -rl 'SystemLogLogEvent' "$BE" --include=*.go)
 if [ "$SHORT" -eq 0 ]; then
   ok "S8 every writer spells the warning level the way the readers filter and count it"
 else
@@ -185,10 +188,10 @@ fi
 # asserted before it is used: an empty subject list would let an absence arm pass
 # having examined nothing (#143).
 mapfile -t WRITTEN < <(
-  grep -rl --include=*.rs -e 'log_event' -e 'INSERT INTO system_logs' "$BE" |
+  grep -rl --include=*.go -e 'SystemLogLogEvent' -e 'INSERT INTO system_logs' "$BE" | grep -v '_test\.go$' |
   while IFS= read -r f; do
     code "$f" | perl -0777 -ne '
-      while (/log_event\s*\(\s*[^,]+,\s*"[a-z_]+"\s*,\s*"([a-z_]+)"/gs) { print "$1\n" }
+      while (/SystemLogLogEvent\s*\(\s*[^,]+,\s*[^,]+,\s*"[a-z_]+"\s*,\s*"([a-z_]+)"/gs) { print "$1\n" }
       while (/INSERT INTO system_logs.*?VALUES\s*\(\s*\x27[a-z]+\x27\s*,\s*\x27([a-z_]+)\x27/gs) { print "$1\n" }
     '
   done | sort -u
@@ -212,7 +215,7 @@ else
   # would still find its inequality and pass, while the listing excluded nothing
   # and the metric kept burying the log. The arm that checks a filter EXISTS
   # cannot tell you the filter is pointed at anything.
-  METRIC=$(code "$SL" | perl -0777 -ne 'print $1 if /METRIC_SOURCE: &str = "([a-z_]+)"/')
+  METRIC=$(code "$SL" | perl -0777 -ne 'print $1 if /const rtSystemLogsMetricSource = "([a-z_]+)"/')
   if [ -z "$METRIC" ]; then
     bad "S12 could not read the excluded source constant — the arm has no subject"
   elif printf '%s\n' "${WRITTEN[@]}" | qgrep -x "$METRIC"; then
@@ -243,23 +246,23 @@ SL_CODE=$(code "$SL")
 # which is how an arm confidently answers a question about code it never read.
 fnbody() {
   awk -v want="$1" '
-    $0 ~ ("^pub async fn " want "\\(") { inside = 1 }
+    $0 ~ ("^func " want "\\(") { inside = 1 }
     inside                            { print }
     inside && /^\}/                   { exit }
   '
 }
 
-HANDLERS=$(printf '%s\n' "$SL_CODE" | perl -ne 'print "$1\n" if /^pub async fn (\w+)\(/')
+HANDLERS=$(printf '%s\n' "$SL_CODE" | perl -ne 'print "$1\n" if /^func (\w+)\(st \*AppState, w http\.ResponseWriter, r \*http\.Request\) error/')
 HANDLER_N=$(printf '%s\n' "$HANDLERS" | grep -c '[a-z]')
 if [ "$HANDLER_N" -lt 2 ]; then
-  bad "S10 enumerated $HANDLER_N handlers in system_logs.rs, expected at least 2 — the arm has no subject"
+  bad "S10 enumerated $HANDLER_N handlers in rt_system_logs.go, expected at least 2 — the arm has no subject"
 else
-  ok "S10 enumerated $HANDLER_N request handlers in system_logs.rs"
+  ok "S10 enumerated $HANDLER_N request handlers in rt_system_logs.go"
   for fn in $HANDLERS; do
     BODY=$(printf '%s\n' "$SL_CODE" | fnbody "$fn")
     if [ "$(printf '%s\n' "$BODY" | grep -c '[^[:space:]]')" -lt 3 ]; then
       bad "S10 could not extract the body of $fn() — the arm has no subject"
-    elif printf '%s\n' "$BODY" | qgrep -E 'require_admin\(&claims\.role\)'; then
+    elif printf '%s\n' "$BODY" | qgrep -E 'requireAdmin\(c\.Role\)'; then
       ok "S10 CONTROL $fn() is still admin-only"
     else
       bad "S10 CONTROL $fn() lost its admin gate — that endpoint answers any authenticated caller"
@@ -270,8 +273,8 @@ fi
 # ── S11. CONTROL, green at both tags. The metric must KEEP being written. ────
 # The consumer is a 30-day storage series; silencing the writer to clean up the
 # log would break a chart, which is why the fix hides the rows instead.
-if qgrep -E "INSERT INTO system_logs" "$BE/services/backup_policy_executor.rs" \
-   && qgrep -E 'FROM system_logs' "$BE/routes/backup_orchestrator.rs"; then
+if qgrep -E "INSERT INTO system_logs" "$BE/svc_backup_policy_executor.go" \
+   && qgrep -E 'FROM system_logs' "$BE/rt_backup_orchestrator.go"; then
   ok "S11 CONTROL the storage metric is still written and still read as a series"
 else
   bad "S11 CONTROL the storage metric writer or its reader is gone — the chart lost its data"

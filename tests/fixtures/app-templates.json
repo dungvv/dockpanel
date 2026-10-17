@@ -1,5 +1,5 @@
 {
-  "_generated": "Do not edit. Source of truth is TEMPLATES in panel/agent/src/services/docker_apps.rs. Regenerate with UPDATE_TEMPLATE_CATALOGUE=1 cargo test -p dockpanel-agent catalogue",
+  "_generated": "Do not edit. Source of truth is dockerAppsTemplates in panel/go/internal/agent/services/docker_apps.go. Regenerate with UPDATE_TEMPLATE_CATALOGUE=1 go test ./internal/agent/services -run Catalogue",
   "count": 148,
   "templates": [
     {

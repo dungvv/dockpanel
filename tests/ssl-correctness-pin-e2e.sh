@@ -58,14 +58,17 @@ set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GATE="$REPO/scripts/npm-audit-gate.mjs"
 HOOK="$REPO/scripts/hooks/pre-push"
-SITES="$REPO/panel/backend/src/routes/sites.rs"
-WP="$REPO/panel/agent/src/services/wordpress.rs"
-AGENT_SSL="$REPO/panel/agent/src/services/ssl.rs"
-HEALER="$REPO/panel/backend/src/services/auto_healer.rs"
-SCAN="$REPO/panel/backend/src/services/security_scanner.rs"
-NOTIF="$REPO/panel/backend/src/services/notifications.rs"
+# Every subject below is the shipped Go tree (panel/go); the Rust sources these
+# arms were first written against are no longer built.
+GOAPI="$REPO/panel/go/internal/api"
+SITES="$GOAPI/rt_sites.go"
+WP="$REPO/panel/go/internal/agent/services/wordpress.go"
+AGENT_SSL="$REPO/panel/go/internal/agent/services/ssl.go"
+HEALER="$GOAPI/svc_auto_healer.go"
+SCAN="$GOAPI/svc_security_scanner.go"
+NOTIF="$GOAPI/svc_notifications.go"
 SETUP="$REPO/scripts/setup.sh"
-BE_SSL="$REPO/panel/backend/src/routes/ssl.rs"
+BE_SSL="$GOAPI/rt_ssl.go"
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
@@ -88,7 +91,7 @@ trap 'rm -rf "$TMP" "$FIXDIR"' EXIT
 # NEGATIVE arm (match ⇒ bad) silently green, which is the direction that ships.
 comment_marker_for() {
   case "$1" in
-    *.rs|*.mjs|*.js|*.ts|*.tsx)                echo '//' ;;
+    *.go|*.rs|*.mjs|*.js|*.ts|*.tsx)           echo '//' ;;
     *.json)                                    echo ''   ;;  # JSON has no comments
     *)                                         echo '#'  ;;  # .sh, .service, .gitignore, .toml
   esac
@@ -155,11 +158,17 @@ has_code()   { local f="$1"; shift; [ "$(code_count "$f" "$@")" -gt 0 ]; }
 # True file line numbers, because code_lines blanks rather than deletes.
 code_lineno() { local f="$1"; shift; code_lines "$f" | grep -n "$@" 2>/dev/null | head -1 | cut -d: -f1 || true; }
 
-# §F's subjects carry unit tests in-file, and a fixture is not the shipping path.
-# Blank from the test attribute down rather than cutting, for the same reason
-# code_lines blanks: height is part of the contract.
-prod_lines() {
-  code_lines "$1" | awk '/^#\[cfg\(test\)\]/ { intest = 1 } { if (intest) print ""; else print }'
+# §F's subjects used to carry unit tests in-file (Rust `#[cfg(test)]`), and a
+# fixture is not the shipping path. Go keeps tests in `_test.go` files, which no
+# subject here is and which §F's discovery excludes, so the production view of a
+# Go file is its code view. Kept as its own name so the arms still say which
+# view they mean.
+prod_lines() { code_lines "$1"; }
+
+# Body of a Go function or method, comment-stripped: from its `func` line to
+# the first column-0 closing brace. Finds `func Name(` and `func (r *T) Name(`.
+go_fnbody() { # $1=file $2=name
+  code_lines "$1" | awk -v name="$2" '!inside && (index($0, "func " name "(") == 1 || $0 ~ ("^func \\([^)]*\\) " name "\\(")) {inside=1; print; next} inside && /^}/ {print; exit} inside {print}'
 }
 prod_count() { local f="$1"; shift; prod_lines "$f" | grep -c "$@" 2>/dev/null || true; }
 
@@ -363,15 +372,15 @@ echo "── B: a site is installed at the scheme it can actually serve ──"
 # unreachable on both schemes. Measured at s338: commenting that one line out
 # left this arm AND its negative twin below green together, so both halves of
 # this section went quiet at once.
-if has_code "$SITES" -F -e '"url": format!("http://{cms_domain}")'; then
+if has_code "$SITES" -F -e '"url": "http://" + j.domain'; then
   ok "the CMS installer is handed the plain-HTTP URL"
 else
   bad "the CMS installer no longer installs at the plain-HTTP URL"
 fi
 
 # NEGATIVE arm. Controlled in §I.
-if has_code "$SITES" -F -e '"url": format!("https'; then
-  bad "an unconditional secure install URL is back in sites.rs"
+if has_code "$SITES" -F -e '"url": "https'; then
+  bad "an unconditional secure install URL is back in rt_sites.go"
 else
   ok "no unconditional secure install URL remains"
 fi
@@ -392,19 +401,19 @@ echo "── C: the promotion only ever touches the URL DockPanel itself set ─
 # All three arms here were measured comment-satisfiable at s338, and the shape
 # was the ordinary one: rename or retire the symbol, leave a note saying what it
 # used to be, and the pin never notices.
-if has_code "$WP" -F -e 'fn https_promotion_target'; then
+if has_code "$WP" -F -e 'func WordpressHttpsPromotionTarget('; then
   ok "the promotion decision is a separate, testable function"
 else
   bad "the promotion decision is not extracted"
 fi
 
-if has_code "$WP" -F -e 'eq_ignore_ascii_case'; then
+if has_code "$WP" -F -e 'strings.EqualFold(current, "http://"+domain)'; then
   ok "…and compares the stored URL against this vhost's own plain-HTTP form"
 else
   bad "the promotion no longer pins the comparison to this vhost's own domain"
 fi
 
-if has_code "$AGENT_SSL" -F -e 'promote_site_url_to_https(domain)'; then
+if has_code "$AGENT_SSL" -F -e 'WordpressPromoteSiteUrlToHttps(domain)'; then
   ok "every path that enables SSL runs the promotion (single choke point)"
 else
   bad "enabling SSL no longer promotes the canonical URL"
@@ -413,7 +422,7 @@ fi
 echo
 echo "── D: a certificate that stops renewing is announced, not just logged ──"
 
-if has_code "$NOTIF" -F -e 'fn fire_alert_deduped'; then
+if has_code "$NOTIF" -F -e 'func NotificationsFireAlertDeduped('; then
   ok "there is a deduped alert path"
 else
   bad "no deduped alert path — an alert from a 120s loop is a flood"
@@ -428,7 +437,7 @@ fi
 # two live ones plus a note about the third are the same number. Counted from
 # code, the count moves.
 check "auto-healer alerts when a renewal cannot be attempted" \
-  "$(code_count "$HEALER" -F -e 'ssl_renewal_blocked(')" "3"
+  "$(code_count "$HEALER" -F -e 'autoHealerSslRenewalBlocked(')" "3"
 # Still four, and the count is load-bearing in a new way since v2.139.0. A fifth
 # outcome exists — a renewal deliberately NOT attempted, because the installed
 # certificate was issued by someone other than Let's Encrypt and renewing would
@@ -438,18 +447,18 @@ check "auto-healer alerts when a renewal cannot be attempted" \
 # purpose. If this count reaches five, check whether a declined renewal has been
 # wired into the failure wording again.
 check "the scanner alerts on every renewal outcome it can see" \
-  "$(code_count "$SCAN" -F -e 'ssl_renewal_alert(')" "4"
+  "$(code_count "$SCAN" -F -e 'securityScannerSslRenewalAlert(')" "4"
 check "and a DECLINED renewal announces without claiming a failure" \
-  "$(code_count "$SCAN" -F -e 'ssl_renewal_declined_alert(')" "2"
+  "$(code_count "$SCAN" -F -e 'securityScannerSslRenewalDeclinedAlert(')" "2"
 
 # Both loops touch the same certificate; neither may alert unconditionally.
-if has_code "$HEALER" -F -e 'fire_alert_deduped' && has_code "$SCAN" -F -e 'fire_alert_deduped'; then
+if has_code "$HEALER" -F -e 'NotificationsFireAlertDeduped(' && has_code "$SCAN" -F -e 'NotificationsFireAlertDeduped('; then
   ok "both loops dedupe, so one stuck certificate is one alert"
 else
   bad "a loop still alerts unconditionally"
 fi
 
-if has_code "$SCAN" -F -e 'fire_alert(' && has_code "$SCAN" -F -e 'ssl_renewal'; then
+if has_code "$SCAN" -F -e 'NotificationsFireAlert(' && has_code "$SCAN" -F -e 'ssl_renewal'; then
   ok "the scanner's renewal path reaches the alert system at all"
 else
   bad "the scanner's renewal failure is still log-only"
@@ -560,11 +569,11 @@ RENEW_SKIPPED=0
 RENEW_EXCLUDED=0
 while IFS= read -r f; do
   [ -n "$f" ] || continue
-  has_code "$f" -E -e 'format!\("/ssl/(provision/|\{)' || continue
+  has_code "$f" -E -e '"/ssl/(provision/"|"[ ]*\+|%s/)' || continue
   case "$(basename "$f")" in
-    mail.rs)
+    rt_mail.go)
       RENEW_EXCLUDED=$((RENEW_EXCLUDED + 1))
-      echo "  · mail.rs excluded by name: it provisions for a mail host and has no sites row to record an expiry on"
+      echo "  · rt_mail.go excluded by name: it provisions for a mail host and has no sites row to record an expiry on"
       continue
       ;;
   esac
@@ -573,17 +582,17 @@ while IFS= read -r f; do
   else
     RENEW_SKIPPED=$((RENEW_SKIPPED + 1))
   fi
-done < <(find "$REPO/panel/backend/src" -name '*.rs' 2>/dev/null | sort)
+done < <(find "$GOAPI" -maxdepth 1 -name '*.go' -not -name '*_test.go' 2>/dev/null | sort)
 
 # The exclusion asserts its own premise, so it cannot outlive its reason. If
 # `mail_domains` ever grows a place to put an expiry, mail.rs stops being a file
 # with nowhere to write one and belongs back in the class above.
 if [ "$RENEW_EXCLUDED" -eq 0 ]; then
-  bad "mail.rs no longer calls an agent SSL route — remove its exclusion above rather than leaving a carve-out for a file that left the class"
-elif grep -rqE 'mail_domains[^;]*ssl_expiry|ssl_expiry[^;]*mail_domains' "$REPO/panel/backend/migrations/" 2>/dev/null; then
-  bad "mail_domains now carries an expiry column — mail.rs has somewhere to record its certificate, so its exclusion from the renewal class is stale"
+  bad "rt_mail.go no longer calls an agent SSL route — remove its exclusion above rather than leaving a carve-out for a file that left the class"
+elif grep -rqE 'mail_domains[^;]*ssl_expiry|ssl_expiry[^;]*mail_domains' "$GOAPI/migrations/" 2>/dev/null; then
+  bad "mail_domains now carries an expiry column — rt_mail.go has somewhere to record its certificate, so its exclusion from the renewal class is stale"
 else
-  ok "mail.rs is excluded for a reason that still holds: no expiry column exists for a mail domain"
+  ok "rt_mail.go is excluded for a reason that still holds: no expiry column exists for a mail domain"
 fi
 [ "$RENEW_SKIPPED" -gt 0 ] && \
   echo "  · $RENEW_SKIPPED agent SSL caller(s) hold no sites row and are out of this class"
@@ -620,7 +629,12 @@ done
 # host's row — which this path then pushes as a vhost through THIS host's agent.
 #
 # NEGATIVE arm. Controlled in §I.
-if [ "$(prod_count "$SCAN" -F -e 'FROM sites WHERE domain')" -eq 0 ]; then
+# Positive anchor: the id-keyed re-read must exist, or an empty/renamed file
+# would satisfy the absence below. `lower(domain)` is the Go tree's spelling of
+# a domain lookup elsewhere (rt_mail.go), so it is caught too.
+if [ "$(prod_count "$SCAN" -F -e 'FROM sites WHERE id = $1')" -eq 0 ]; then
+  bad "the scanner has no id-keyed site re-read at all — the absence arm below would be vacuous"
+elif [ "$(prod_count "$SCAN" -E -e 'FROM sites WHERE (lower\()?domain')" -eq 0 ]; then
   ok "the scanner's post-renewal re-read is not keyed on a domain"
 else
   bad "the scanner re-reads the site by domain after renewing — on a fleet that can rebuild another host's vhost through this host's agent"
@@ -641,16 +655,16 @@ run_the TOKENWORD --now
 echo "a literal hash # inside a string keeps TOKENSTR"
 FIX
 
-cat > "$FIXDIR/f.rs" <<'FIX'
+cat > "$FIXDIR/f.go" <<'FIX'
 // TOKENWORD in a line comment
 /*
  * TOKENWORD in a block comment
  */
-let live = call(TOKENWORD);
-let trail = other(); // TOKENWORD trailing
-let url = "https://example.invalid/TOKENURL";
-let glob = "COPY /app/target/release/*";
-let after_glob = keep(TOKENAFTER);
+live := call(TOKENWORD)
+trail := other() // TOKENWORD trailing
+url := "https://example.invalid/TOKENURL"
+glob := "COPY /app/target/release/*"
+afterGlob := keep(TOKENAFTER)
 FIX
 
 printf '{ "name": "x", "note": "TOKENWORD" }\n' > "$FIXDIR/f.json"
@@ -667,25 +681,25 @@ else
   bad "shell: the stripper ate a '#' inside a string — a negative arm would now pass on broken code"
 fi
 
-if [ "$(code_count "$FIXDIR/f.rs" -F -e 'TOKENWORD')" -eq 1 ]; then
-  ok "rust: '//' line, '/* */' block and trailing '//' all blanked (1 code hit of 4)"
+if [ "$(code_count "$FIXDIR/f.go" -F -e 'TOKENWORD')" -eq 1 ]; then
+  ok "go: '//' line, '/* */' block and trailing '//' all blanked (1 code hit of 4)"
 else
-  bad "rust: expected exactly 1 code hit for TOKENWORD, got $(code_count "$FIXDIR/f.rs" -F -e 'TOKENWORD')"
+  bad "go: expected exactly 1 code hit for TOKENWORD, got $(code_count "$FIXDIR/f.go" -F -e 'TOKENWORD')"
 fi
 
-if [ "$(code_count "$FIXDIR/f.rs" -F -e 'TOKENURL')" -eq 1 ]; then
-  ok "rust: '//' inside a quoted string survives — a URL is not a comment"
+if [ "$(code_count "$FIXDIR/f.go" -F -e 'TOKENURL')" -eq 1 ]; then
+  ok "go: '//' inside a quoted string survives — a URL is not a comment"
 else
-  bad "rust: the stripper cut a line at the '//' of a URL inside a string literal"
+  bad "go: the stripper cut a line at the '//' of a URL inside a string literal"
 fi
 
 # s294: a `/*` inside a string literal opened a block comment that ran to the
 # next `*/` and deleted 485 lines of git_build.rs. The guard is that a block is
 # recognised only where one is WRITTEN — opening at line start.
-if [ "$(code_count "$FIXDIR/f.rs" -F -e 'TOKENAFTER')" -eq 1 ]; then
-  ok "rust: a '/*' inside a string literal does not open a block (the s294 guard holds)"
+if [ "$(code_count "$FIXDIR/f.go" -F -e 'TOKENAFTER')" -eq 1 ]; then
+  ok "go: a '/*' inside a string literal does not open a block (the s294 guard holds)"
 else
-  bad "rust: a string containing '/*' swallowed the code after it — the s294 stripper defect is back"
+  bad "go: a string containing '/*' swallowed the code after it — the s294 stripper defect is back"
 fi
 
 if [ "$(code_count "$FIXDIR/f.json" -F -e 'TOKENWORD')" -eq 1 ]; then
@@ -735,21 +749,22 @@ PINNED=(
   "$GATE|-F|stale "
   "$GATE|-F|const ALLOWLIST = ["
   "$HOOK|-F|npm-audit-gate.mjs"
-  "$SITES|-F|\"url\": format!(\"http://{cms_domain}\")"
+  "$SITES|-F|\"url\": \"http://\" + j.domain"
   "$SITES|-F|promote-https"
   "$SITES|-E|ssl_expiry[ ]*=[ ]*\\\$"
-  "$WP|-F|fn https_promotion_target"
-  "$WP|-F|eq_ignore_ascii_case"
-  "$AGENT_SSL|-F|promote_site_url_to_https(domain)"
-  "$NOTIF|-F|fn fire_alert_deduped"
-  "$HEALER|-F|ssl_renewal_blocked("
-  "$HEALER|-F|fire_alert_deduped"
+  "$WP|-F|func WordpressHttpsPromotionTarget("
+  "$WP|-F|strings.EqualFold(current, \"http://\"+domain)"
+  "$AGENT_SSL|-F|WordpressPromoteSiteUrlToHttps(domain)"
+  "$NOTIF|-F|func NotificationsFireAlertDeduped("
+  "$HEALER|-F|autoHealerSslRenewalBlocked("
+  "$HEALER|-F|NotificationsFireAlertDeduped("
   "$HEALER|-F|ssl_renewal_at = NULL"
   "$HEALER|-F|ssl_renewal_checked_at = NULL"
   "$HEALER|-E|ssl_expiry[ ]*=[ ]*\\\$"
-  "$SCAN|-F|ssl_renewal_alert("
-  "$SCAN|-F|fire_alert_deduped"
-  "$SCAN|-F|fire_alert("
+  "$SCAN|-F|securityScannerSslRenewalAlert("
+  "$SCAN|-F|NotificationsFireAlertDeduped("
+  "$SCAN|-F|NotificationsFireAlert("
+  "$SCAN|-F|FROM sites WHERE id = \$1"
   "$SCAN|-F|ssl_renewal"
   "$SCAN|-F|ssl_renewal_at = NULL"
   "$SCAN|-F|ssl_renewal_checked_at = NULL"
@@ -855,9 +870,9 @@ else
   bad "§A's server-runtime arm no longer fires on a real request handler — the stripper is eating code"
 fi
 
-cp "$SITES" "$FIXDIR/x_sites.rs"
-printf '\n        "url": format!("https://{cms_domain}"),\n' >> "$FIXDIR/x_sites.rs"
-if has_code "$FIXDIR/x_sites.rs" -F -e '"url": format!("https'; then
+cp "$SITES" "$FIXDIR/x_sites.go"
+printf '\n\t\t\t"url": "https://" + j.domain, "title": j.title,\n' >> "$FIXDIR/x_sites.go"
+if has_code "$FIXDIR/x_sites.go" -F -e '"url": "https'; then
   ok "§B's secure-install-URL arm still fires when the URL is really in code"
 else
   bad "§B's secure-install-URL arm no longer fires on a real https install URL — the stripper is eating code"
@@ -871,24 +886,11 @@ else
   bad "§E's bare-is-active arm no longer fires on a real bare is-active — the stripper is eating code"
 fi
 
-cp "$SCAN" "$FIXDIR/x_scanner.rs"
-# Insert BEFORE any `#[cfg(test)]` boundary rather than blindly appending at
-# literal EOF: `prod_count` blanks everything from that marker onward (see the
-# K7 comment above), so a plain `>>` would land the planted defect inside the
-# blanked region for any subject whose own test module sits at the true end of
-# the file — which security_scanner.rs does since the s413 stack-SSL work.
-SCAN_TEST_LINE=$(grep -n '^#\[cfg(test)\]' "$FIXDIR/x_scanner.rs" | head -1 | cut -d: -f1)
-if [ -n "$SCAN_TEST_LINE" ]; then
-  {
-    head -n "$((SCAN_TEST_LINE - 1))" "$FIXDIR/x_scanner.rs"
-    printf '    let row = sqlx::query("SELECT id FROM sites WHERE domain = ?").fetch_one(pool).await?;\n'
-    tail -n "+$SCAN_TEST_LINE" "$FIXDIR/x_scanner.rs"
-  } > "$FIXDIR/x_scanner.rs.new"
-  mv "$FIXDIR/x_scanner.rs.new" "$FIXDIR/x_scanner.rs"
-else
-  printf '\n    let row = sqlx::query("SELECT id FROM sites WHERE domain = ?").fetch_one(pool).await?;\n' >> "$FIXDIR/x_scanner.rs"
-fi
-if [ "$(prod_count "$FIXDIR/x_scanner.rs" -F -e 'FROM sites WHERE domain')" -gt 0 ]; then
+cp "$SCAN" "$FIXDIR/x_scanner.go"
+# Go keeps its tests in _test.go files, so a plain append lands in production
+# code (the Rust subject needed the plant inserted above its `#[cfg(test)]`).
+printf '\n\trow, err := queryOne[Site](ctx, db, "SELECT * FROM sites WHERE domain = $1", domain)\n' >> "$FIXDIR/x_scanner.go"
+if [ "$(prod_count "$FIXDIR/x_scanner.go" -E -e 'FROM sites WHERE (lower\()?domain')" -gt 0 ]; then
   ok "§F's host-blind-re-read arm still fires when the query is really in code"
 else
   bad "§F's host-blind-re-read arm no longer fires on a real domain-keyed re-read — the stripper is eating code"
@@ -936,52 +938,51 @@ echo "── K: a mail host's certificate never destroys the one already there �
 # file carries unit tests that spell each of these symbols — counting raw source
 # would let the TEST DATA satisfy the pin (the trap that has cost this repo a
 # green suite over a restored defect more than once).
-MAILF="$REPO/panel/backend/src/routes/mail.rs"
+MAILF="$GOAPI/rt_mail.go"
 
 if [ ! -f "$MAILF" ]; then
-  bad "K0 mail.rs is missing — every arm below would pass having examined nothing"
+  bad "K0 rt_mail.go is missing — every arm below would pass having examined nothing"
 else
   # Extract the guarded issuer's own body. Everything below reads THIS, not the
   # file, so an arm cannot be satisfied by a sibling function 1500 lines away.
-  PROV_BODY=$(prod_lines "$MAILF" \
-    | awk '/^async fn provision_mail_host_cert\(/ {inb=1} inb {print} inb && /^\}$/ {exit}')
+  PROV_BODY=$(go_fnbody "$MAILF" rtMailProvisionMailHostCert)
   PROV_N=$(grep -c . <<< "$PROV_BODY")
 
   # H0 — the extractor's own control. An anchor that stops matching yields an
   # EMPTY body, under which every `hasnt`-shaped arm below passes green. Floor it
   # and make the break say so in its own words.
   if [ "$PROV_N" -ge 20 ]; then
-    ok "K0 provision_mail_host_cert extracted — $PROV_N lines"
+    ok "K0 rtMailProvisionMailHostCert extracted — $PROV_N lines"
   else
-    bad "K0 provision_mail_host_cert extracted — only $PROV_N lines (the extractor broke; the arms below examined nothing)"
+    bad "K0 rtMailProvisionMailHostCert extracted — only $PROV_N lines (the extractor broke; the arms below examined nothing)"
   fi
 
   # H1 — ONE door. The raw agent provision call must exist exactly once in the
   # file, i.e. only inside the guarded helper. Two auto-DNS providers reached this
   # through byte-identical blocks before v2.156.0, and a guard applied to one leg
   # and not the other is this project's most-repeated regression shape.
-  RAW_PROV=$(prod_count "$MAILF" -cE 'format!\("/ssl/provision/')
+  RAW_PROV=$(prod_count "$MAILF" -cF '"/ssl/provision/"+')
   if [ "$RAW_PROV" -eq 1 ]; then
-    ok "K1 the agent provision call appears once in mail.rs — both providers share the guarded path"
+    ok "K1 the agent provision call appears once in rt_mail.go — both providers share the guarded path"
   else
-    bad "K1 the agent provision call appears once in mail.rs — found $RAW_PROV, so a leg issues unguarded"
+    bad "K1 the agent provision call appears once in rt_mail.go — found $RAW_PROV, so a leg issues unguarded"
   fi
 
   # H2 — and both legs actually reach it. One definition plus two call sites.
   # Counted on the bare name so rustfmt wrapping the argument list cannot make a
   # correct tree read as a broken one.
-  PROV_REFS=$(prod_count "$MAILF" -c 'provision_mail_host_cert')
+  PROV_REFS=$(prod_count "$MAILF" -c 'rtMailProvisionMailHostCert(')
   if [ "$PROV_REFS" -eq 3 ]; then
-    ok "K2 provision_mail_host_cert is defined once and called from both auto-DNS legs"
+    ok "K2 rtMailProvisionMailHostCert is defined once and called from both auto-DNS legs"
   else
-    bad "K2 provision_mail_host_cert is defined once and called from both auto-DNS legs — $PROV_REFS references (expected 3)"
+    bad "K2 rtMailProvisionMailHostCert is defined once and called from both auto-DNS legs — $PROV_REFS references (expected 3)"
   fi
 
   # H3 — the verdict is consulted BEFORE the call, not after it and not at all.
   # Position, because a guard whose result is computed and then ignored reads
   # identically to one that is absent.
-  V_AT=$(grep -n 'mail_cert_verdict' <<< "$PROV_BODY" | head -1 | cut -d: -f1)
-  P_AT=$(grep -n '/ssl/provision/' <<< "$PROV_BODY" | head -1 | cut -d: -f1)
+  V_AT=$(grep -n 'rtMailMailCertVerdict(' <<< "$PROV_BODY" | head -1 | cut -d: -f1)
+  P_AT=$(grep -n '"/ssl/provision/"' <<< "$PROV_BODY" | head -1 | cut -d: -f1)
   if [ -n "$V_AT" ] && [ -n "$P_AT" ] && [ "$V_AT" -lt "$P_AT" ]; then
     ok "K3 the verdict is taken before the certificate is ordered (verdict line $V_AT, order line $P_AT)"
   else
@@ -996,8 +997,16 @@ else
   # match, not three. A fixed -A window is not a branch (#172) — this asks the
   # only question that matters and cannot be fooled by formatting: the refusal
   # returns BEFORE the order is placed.
-  R_AT=$(grep -n 'MailCertVerdict::Refuse' <<< "$PROV_BODY" | head -1 | cut -d: -f1)
-  RET_AT=$(grep -nE '^\s+return;' <<< "$PROV_BODY" | head -1 | cut -d: -f1)
+  # Go shape: `if blocker, refuse := rtMailMailCertVerdict(...); refuse {`.
+  R_AT=$(grep -nE 'rtMailMailCertVerdict\(.*; refuse \{' <<< "$PROV_BODY" | head -1 | cut -d: -f1)
+  # The return must close THE REFUSE BLOCK: the first `return` or `}` after the
+  # verdict line has to be a `return`. A plain "first return in the body" was
+  # measured green with the refuse block's return deleted — the no-site leg's
+  # own return further down satisfied it.
+  RET_AT=""
+  if [ -n "$R_AT" ]; then
+    RET_AT=$(awk -v from="$R_AT" 'NR > from && /^[[:space:]]*(return[[:space:]]*$|\})/ { if ($0 ~ /return/) print NR; exit }' <<< "$PROV_BODY")
+  fi
   if [ -n "$R_AT" ] && [ -n "$RET_AT" ] && [ -n "$P_AT" ] \
      && [ "$R_AT" -lt "$RET_AT" ] && [ "$RET_AT" -lt "$P_AT" ]; then
     ok "K4 a refusal returns before the certificate is ordered (refuse $R_AT, return $RET_AT, order $P_AT)"
@@ -1009,13 +1018,12 @@ else
   # is blind to (foreign_cert_issuer collapses ours-and-unknown to None); the
   # issuer catches the uploaded certificate the columns cannot see. Deleting
   # either half leaves a guard that still looks like a guard.
-  VERDICT_BODY=$(prod_lines "$MAILF" \
-    | awk '/^pub fn mail_cert_verdict\(/ {inb=1} inb {print} inb && /^\}$/ {exit}')
+  VERDICT_BODY=$(go_fnbody "$MAILF" rtMailMailCertVerdict)
   VERDICT_N=$(grep -c . <<< "$VERDICT_BODY")
   if [ "$VERDICT_N" -lt 8 ]; then
-    bad "K5-control mail_cert_verdict extracted — only $VERDICT_N lines (the extractor broke)"
+    bad "K5-control rtMailMailCertVerdict extracted — only $VERDICT_N lines (the extractor broke)"
   else
-    ok "K5-control mail_cert_verdict extracted — $VERDICT_N lines"
+    ok "K5-control rtMailMailCertVerdict extracted — $VERDICT_N lines"
     # ⚠ FIRST CUT OF THIS ARM WAS WEAK AND A MUTATION PROVED IT. It grepped the
     # three INPUT NAMES, and `foreign_issuer` is also the parameter's name — so
     # deleting the whole issuer check left the signature behind and the arm passed
@@ -1024,11 +1032,13 @@ else
     # DECISION: both blocker variants must be returned from this body, which no
     # signature can satisfy.
     K5_MISS=""
-    grep -qE 'ssl_wildcard'   <<< "$VERDICT_BODY" || K5_MISS="$K5_MISS ssl_wildcard"
-    grep -qE 'dns-01'         <<< "$VERDICT_BODY" || K5_MISS="$K5_MISS dns-01"
-    grep -qE 'foreign_issuer' <<< "$VERDICT_BODY" || K5_MISS="$K5_MISS foreign_issuer"
-    grep -qE 'MailCertBlocker::Wildcard' <<< "$VERDICT_BODY" || K5_MISS="$K5_MISS refuses-wildcard"
-    grep -qE 'MailCertBlocker::Foreign'  <<< "$VERDICT_BODY" || K5_MISS="$K5_MISS refuses-foreign"
+    # Go: the inputs must be READ in a condition (`*sslWildcard`, `== "dns-01"`,
+    # `foreignIssuer != nil`), and each blocker must be RETURNED.
+    grep -qF '*sslWildcard'            <<< "$VERDICT_BODY" || K5_MISS="$K5_MISS ssl_wildcard"
+    grep -qF '== "dns-01"'             <<< "$VERDICT_BODY" || K5_MISS="$K5_MISS dns-01"
+    grep -qF 'foreignIssuer != nil'    <<< "$VERDICT_BODY" || K5_MISS="$K5_MISS foreign_issuer"
+    grep -qE 'return rtMailMailCertBlockerWildcard, true' <<< "$VERDICT_BODY" || K5_MISS="$K5_MISS refuses-wildcard"
+    grep -qE 'return rtMailMailCertBlockerForeign, true'  <<< "$VERDICT_BODY" || K5_MISS="$K5_MISS refuses-foreign"
     if [ -z "$K5_MISS" ]; then
       ok "K5 the verdict consults the wildcard columns AND the issuer — neither half alone covers the other's case"
     else
@@ -1039,7 +1049,7 @@ else
   # H6 — a refusal is ANNOUNCED. Silence here is indistinguishable from the ACME
   # failure the Err arm reports, so the operator could not tell a refusal that
   # saved their wildcard from a network error they should retry.
-  if grep -qE 'announce_mail_cert_conflict' <<< "$PROV_BODY"; then
+  if grep -qE 'rtMailAnnounceMailCertConflict\(' <<< "$PROV_BODY"; then
     ok "K6 a refusal is announced to the operator, not skipped silently"
   else
     bad "K6 a refusal is announced to the operator — the refuse branch tells nobody"
@@ -1054,8 +1064,9 @@ else
   # was RED against correct code. The module was moved to the end of that file in
   # the same commit; scoping to the range as well means the arm survives it coming
   # back. Same defect as routes/ssl.rs at s388 (#669).
-  DEF_MHC=$(sed -n '/^pub mod ssl_renewal_key {/,/^}/p' "$NOTIF" | grep -c 'MAIL_HOST_CONFLICT')
-  USE_MHC=$(prod_count "$MAILF" -c 'MAIL_HOST_CONFLICT')
+  # Go: the key module became a const block of NotificationsSslRenewalKey* names.
+  DEF_MHC=$(code_count "$NOTIF" -E -e '^[[:space:]]+NotificationsSslRenewalKeyMailHostConflict = "')
+  USE_MHC=$(prod_count "$MAILF" -c 'NotificationsSslRenewalKeyMailHostConflict')
   if [ "$DEF_MHC" -ge 1 ] && [ "$USE_MHC" -ge 1 ]; then
     ok "K7 the mail-conflict dedup key is both defined and raised (def=$DEF_MHC use=$USE_MHC)"
   else
@@ -1070,7 +1081,7 @@ else
   # against for the site-owning leg, just on the other branch of the same `if`.
   # Two calls in one function body is the only shape that proves both branches
   # reach it — K6 alone is satisfied by either one.
-  ANNOUNCE_N=$(grep -c 'announce_mail_cert_conflict' <<< "$PROV_BODY")
+  ANNOUNCE_N=$(grep -c 'rtMailAnnounceMailCertConflict(' <<< "$PROV_BODY")
   if [ "$ANNOUNCE_N" -eq 2 ]; then
     ok "K8 both the site leg and the no-site leg announce a refusal ($ANNOUNCE_N call sites)"
   else
@@ -1081,12 +1092,11 @@ else
   # `site_id` were forced back to a non-optional `Uuid` and the no-site branch
   # invented an id to satisfy it — a shape that compiles, calls the function
   # twice, and reintroduces exactly what H8's comment describes. Pin the type.
-  ANNOUNCE_SIG=$(prod_lines "$MAILF" \
-    | awk '/^async fn announce_mail_cert_conflict\(/ {inb=1} inb {print} inb && /^\) \{$/ {exit}')
-  if grep -qE 'site_id: Option<uuid::Uuid>' <<< "$ANNOUNCE_SIG"; then
-    ok "K9 announce_mail_cert_conflict's site id is Option — the no-site leg cannot be served by an invented id"
+  ANNOUNCE_SIG=$(prod_lines "$MAILF" | grep -E '^func rtMailAnnounceMailCertConflict\(')
+  if grep -qE 'siteID \*uuid\.UUID' <<< "$ANNOUNCE_SIG"; then
+    ok "K9 rtMailAnnounceMailCertConflict's site id is a pointer (Option) — the no-site leg cannot be served by an invented id"
   else
-    bad "K9 announce_mail_cert_conflict's site id is no longer Option — the no-site leg may be back to inventing one, or gone"
+    bad "K9 rtMailAnnounceMailCertConflict's site id is no longer a pointer (Option) — the no-site leg may be back to inventing one, or gone"
   fi
 fi
 

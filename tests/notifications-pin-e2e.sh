@@ -34,6 +34,10 @@
 #   * §4 resolves every link a producer can emit against the SPA's own route
 #     table, so a notification can never point at a screen that is not there.
 #
+# The API is the Go port now: `notify_panel` is NotificationsNotifyPanel and
+# NOTIF_TX is notificationsNotifTx (panel/go/internal/api/svc_notifications.go);
+# the list endpoint is rt_notifications.go.
+#
 # Pure source analysis: no box, no network, no build.
 
 set -uo pipefail
@@ -43,15 +47,79 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-ROUTE=panel/backend/src/routes/notifications.rs
-SVC=panel/backend/src/services/notifications.rs
+ROUTE=panel/go/internal/api/rt_notifications.go
+SVC=panel/go/internal/api/svc_notifications.go
 PAGE=panel/frontend/src/pages/Notifications.tsx
 HOOK=panel/frontend/src/hooks/useLayoutState.ts
 MAIN=panel/frontend/src/main.tsx
 ICONS=panel/frontend/src/data/icons.ts
 NAV=panel/frontend/src/data/navItems.ts
 GUIDE=docs/guides/notifications.md
-BACKEND=panel/backend/src
+BACKEND=panel/go/internal/api
+# Every NotificationsNotifyPanel(ctx, db, recipient, title, message, severity,
+# category, link) call site in the api package (tests excluded), one per line:
+#   CALL <file> <line> <recipient> <link-path|nil|UNRESOLVED-EXPR> <args...>
+# The link is resolved from `new("/x")`, `rtGitDeploysPtr("/x")`, or `&link`
+# (the nearest preceding `link := "/x"` / `link := fmt.Sprintf("/x"`), with
+# `"/x/"+expr` and `%s` turned into a placeholder segment.
+CALLS=$(python3 - "$BACKEND" <<'PY'
+import os, re, sys
+root = sys.argv[1]
+def lit(expr):
+    m = re.match(r'(?:new|\w*Ptr)\(\s*(?:fmt\.Sprintf\()?"(/[^"?]*)[^"]*"(\s*\+)?', expr)
+    if not m:
+        return None
+    p = m.group(1) + ("x" if m.group(2) else "")
+    return re.sub(r"%[a-z]", "x", p)
+for fn in sorted(os.listdir(root)):
+    if not fn.endswith(".go") or fn.endswith("_test.go"):
+        continue
+    src = open(os.path.join(root, fn)).read()
+    for m in re.finditer(r"NotificationsNotifyPanel\s*\(", src):
+        head = src.rfind("\n", 0, m.start())
+        line = src[head + 1 : m.start()].lstrip()
+        if line.startswith(("//", "*", "func ")):
+            continue
+        i, depth = m.end(), 1
+        while depth and i < len(src):
+            depth += {"(": 1, ")": -1}.get(src[i], 0)
+            i += 1
+        args, parts, cur, depth = src[m.end() : i - 1], [], "", 0
+        quote = None
+        for ch in args:
+            # A comma inside a string literal ("Deploy failed, rolled back")
+            # is not an argument separator.
+            if quote:
+                if ch == quote and not cur.endswith("\\"): quote = None
+                cur += ch; continue
+            if ch in (chr(34), chr(96)): quote = ch
+            if ch in "([{": depth += 1
+            if ch in ")]}": depth -= 1
+            if ch == "," and depth == 0:
+                parts.append(cur); cur = ""
+            else:
+                cur += ch
+        parts.append(cur)
+        parts = [p.strip() for p in parts if p.strip()]
+        lineno = src[: m.start()].count("\n") + 1
+        if len(parts) != 8:
+            print("ARITY", fn, lineno, len(parts)); continue
+        recipient, link = parts[2], parts[-1]
+        if link == "nil":
+            path = "nil"
+        elif link.startswith("&"):
+            var = re.escape(link[1:])
+            assigns = list(re.finditer(rf"\b{var} :?= (.+)", src[: m.start()]))
+            path = lit("new(" + assigns[-1].group(1)) if assigns else None
+        else:
+            path = lit(link)
+        # The category/title args ride along for the arms that inspect them.
+        print("CALL", fn, lineno, recipient.replace(" ", ""), path or "UNRESOLVED-EXPR",
+              " ".join(p.replace("\n", " ") for p in parts[3:7]))
+PY
+)
+NCALLS=$(echo "$CALLS" | /usr/bin/grep -c "^CALL" || true)
+NARITY=$(echo "$CALLS" | /usr/bin/grep -c "^ARITY" || true)
 
 for f in "$ROUTE" "$SVC" "$PAGE" "$HOOK" "$MAIN" "$ICONS" "$NAV" "$GUIDE"; do
   [ -f "$f" ] || { echo "missing source file: $f"; exit 1; }
@@ -66,7 +134,7 @@ echo "── 1. every column the API returns is rendered, or waived with a reaso
 COLS=$(python3 - "$ROUTE" <<'PY'
 import re, sys
 src = open(sys.argv[1]).read()
-m = re.search(r'"SELECT ([^"]+?)\s*\\\s*\n\s*FROM panel_notifications', src)
+m = re.search(r'"SELECT ([^"]+?)\s*"\s*\+\s*\n\s*"FROM panel_notifications', src)
 if not m:
     print("PARSE-FAILED"); raise SystemExit
 print(" ".join(c.strip() for c in m.group(1).split(",")))
@@ -128,7 +196,7 @@ fi
 echo
 echo "── 2. notify_panel is the only writer of panel_notifications ──"
 
-WRITERS=$(/usr/bin/grep -rn "INSERT INTO panel_notifications" "$BACKEND" --include=*.rs | wc -l)
+WRITERS=$(/usr/bin/grep -rn "INSERT INTO panel_notifications" panel/go --include=*.go | wc -l)
 IN_SVC=$(/usr/bin/grep -c "INSERT INTO panel_notifications" "$SVC")
 
 if [ "$WRITERS" -eq 0 ]; then
@@ -136,20 +204,21 @@ if [ "$WRITERS" -eq 0 ]; then
 elif [ "$WRITERS" -eq "$IN_SVC" ]; then
   ok "N2 all $WRITERS INSERT sites live in the notifications service"
 else
-  OUTSIDE=$(/usr/bin/grep -rn "INSERT INTO panel_notifications" "$BACKEND" --include=*.rs \
-            | /usr/bin/grep -v "services/notifications.rs" | cut -d: -f1-2 | tr '\n' ' ')
+  OUTSIDE=$(/usr/bin/grep -rn "INSERT INTO panel_notifications" panel/go --include=*.go \
+            | /usr/bin/grep -v "internal/api/svc_notifications.go" | cut -d: -f1-2 | tr '\n' ' ')
   bad "N2 $((WRITERS - IN_SVC)) INSERT site(s) bypass notify_panel: $OUTSIDE"
 fi
 
 # The broadcast is half of what a bypassing writer loses, so pin it to the same
-# place. If NOTIF_TX is sent from anywhere else, a second delivery path exists.
+# place. If notificationsNotifTx (the Go NOTIF_TX) is loaded or set from
+# anywhere else, a second delivery path exists.
 # Keyed on the CALL, not the name: the name appears in comments that explain why
 # a writer must not bypass it, and an arm that counts those is measuring prose.
-TX_FILES=$(/usr/bin/grep -rlnE "NOTIF_TX\.(get|set)\(" "$BACKEND" --include=*.rs | tr '\n' ' ')
+TX_FILES=$(/usr/bin/grep -rlE "notificationsNotifTx\.(Load|Store|Swap|CompareAndSwap)\(" panel/go --include=*.go | tr '\n' ' ')
 if [ "$(echo "$TX_FILES" | wc -w)" -eq 1 ]; then
-  ok "N2 NOTIF_TX is touched in exactly one file: $TX_FILES"
+  ok "N2 notificationsNotifTx is touched in exactly one file: $TX_FILES"
 else
-  bad "N2 NOTIF_TX is touched in more than one file: $TX_FILES"
+  bad "N2 notificationsNotifTx is not touched in exactly one file: $TX_FILES"
 fi
 
 # The INSERT must report its own failure. It used to be `let _ = …`, so a
@@ -163,71 +232,22 @@ fi
 echo
 echo "── 3. every producer passes a link ──"
 
-LINKS=$(python3 - "$BACKEND" <<'PY'
-import os, re, sys
-root = sys.argv[1]
 # Allow-listed: the subject of the notification no longer exists, so any link
 # would resolve to the catch-all route and land the operator on the Dashboard
 # without saying why. Recorded here so it stays a decision.
-ALLOW = {("routes/sites.rs", "Site deleted")}
-missing, total, allowed = [], 0, 0
-for dirpath, _, files in os.walk(root):
-    for fn in files:
-        if not fn.endswith(".rs"):
-            continue
-        path = os.path.join(dirpath, fn)
-        rel = os.path.relpath(path, root)
-        src = open(path).read()
-        for m in re.finditer(r"notify_panel\s*\(", src):
-            # Skip the definition itself and any prose mention in a comment.
-            head = src.rfind("\n", 0, m.start())
-            line = src[head + 1 : m.start()].lstrip()
-            if line.startswith("//") or line.startswith("*") or "fn notify_panel" in src[m.start() - 30 : m.start()]:
-                continue
-            i, depth = m.end(), 1
-            while depth and i < len(src):
-                if src[i] == "(":
-                    depth += 1
-                elif src[i] == ")":
-                    depth -= 1
-                i += 1
-            args, parts, cur, depth = src[m.end() : i - 1], [], "", 0
-            for ch in args:
-                if ch in "([{":
-                    depth += 1
-                if ch in ")]}":
-                    depth -= 1
-                if ch == "," and depth == 0:
-                    parts.append(cur); cur = ""
-                else:
-                    cur += ch
-            parts.append(cur)
-            # A trailing comma leaves an empty final element. Drop blanks before
-            # taking the last argument, or the arm inspects whitespace.
-            parts = [p for p in parts if p.strip()]
-            if len(parts) < 7:
-                continue
-            total += 1
-            if parts[-1].strip().startswith("None"):
-                ctx = args[:200]
-                if any(rel == a and tag in ctx for a, tag in ALLOW):
-                    allowed += 1
-                else:
-                    missing.append(f"{rel}:{src[:m.start()].count(chr(10)) + 1}")
-print(f"TOTAL={total} ALLOWED={allowed}")
-for x in missing:
-    print("MISSING", x)
-PY
-)
-
-TOTAL=$(echo "$LINKS" | sed -n 's/^TOTAL=\([0-9]*\).*/\1/p')
-ALLOWED=$(echo "$LINKS" | sed -n 's/.*ALLOWED=\([0-9]*\).*/\1/p')
-NMISS=$(echo "$LINKS" | /usr/bin/grep -c "^MISSING" || true)
+NILLINKS=$(echo "$CALLS" | awk '$1 == "CALL" && $5 == "nil"')
+ALLOWED=$(echo "$NILLINKS" | /usr/bin/grep -cE '^CALL rt_sites\.go [0-9]+ [^ ]+ nil "Site deleted' || true)
+NMISS=$(( $(echo "$NILLINKS" | /usr/bin/grep -c '^CALL' || true) - ALLOWED ))
+TOTAL=$NCALLS
+LINKS=$(echo "$NILLINKS" | /usr/bin/grep -vE '^CALL rt_sites\.go [0-9]+ [^ ]+ nil "Site deleted' | awk '$1 == "CALL" {print "MISSING", $2 ":" $3}')
+if [ "$NARITY" -ne 0 ]; then
+  bad "N3 $NARITY NotificationsNotifyPanel call(s) did not parse as 8 arguments: $(echo "$CALLS" | /usr/bin/grep '^ARITY' | tr '\n' ' ')"
+fi
 
 if [ -z "${TOTAL:-}" ] || [ "${TOTAL:-0}" -lt 20 ]; then
-  bad "N3 found only ${TOTAL:-0} notify_panel call sites — the parse is wrong, not the code"
+  bad "N3 found only ${TOTAL:-0} NotificationsNotifyPanel call sites — the parse is wrong, not the code"
 else
-  ok "N3 parsed $TOTAL notify_panel call sites"
+  ok "N3 parsed $TOTAL NotificationsNotifyPanel call sites"
   if [ "$NMISS" -eq 0 ]; then
     ok "N3 every producer passes a link ($ALLOWED reasoned exception(s))"
   else
@@ -248,9 +268,9 @@ echo "── 4. every link a producer can emit resolves to a real screen ──"
 # The failure this prevents is a notification that takes you somewhere that is
 # not there. Both sides are derived: the link literals from the backend, the
 # route table from the SPA's own router.
-ROUTES=$(python3 - "$MAIN" "$BACKEND" <<'PY'
+ROUTES=$(CALLS="$CALLS" python3 - "$MAIN" <<'PY'
 import os, re, sys
-routes = set(re.findall(r'path="([^"]+)"', open(sys.argv[1]).read()))
+routes = set(re.findall(r"path=\"([^\"]+)\"", open(sys.argv[1]).read()))
 if len(routes) < 20:
     print("ROUTES-PARSE-FAILED"); raise SystemExit
 
@@ -263,20 +283,16 @@ def resolves(path):
             return True
     return False
 
-bad = []
-seen = 0
-for dirpath, _, files in os.walk(sys.argv[2]):
-    for fn in files:
-        if not fn.endswith(".rs"):
-            continue
-        src = open(os.path.join(dirpath, fn)).read()
-        for m in re.finditer(r'Some\((?:&format!\()?"(/[^"?]*)[^"]*"', src):
-            p = m.group(1)
-            # `/sites/{id}` in a format! string is `/sites/:id` to the router.
-            probe = re.sub(r"\{[a-z_.]+\}", "x", p)
-            seen += 1
-            if not resolves(probe):
-                bad.append(f"{os.path.relpath(os.path.join(dirpath, fn), sys.argv[2])} -> {p}")
+bad, seen = [], 0
+for line in os.environ["CALLS"].splitlines():
+    f = line.split()
+    if not f or f[0] != "CALL" or f[4] == "nil":
+        continue
+    seen += 1
+    # An unresolvable link expression is a failure, not a skip: the arm
+    # cannot vouch for a destination it cannot read.
+    if f[4] == "UNRESOLVED-EXPR" or not resolves(f[4]):
+        bad.append(f"{f[1]}:{f[2]} -> {f[4]}")
 print(f"SEEN={seen}")
 for b in sorted(set(bad)):
     print("UNRESOLVED", b)
@@ -301,62 +317,32 @@ echo
 echo "── 4b. no per-user notification links at a door its recipient cannot open ──"
 
 # A notification addressed to ONE user can reach a non-admin; one addressed to
-# `None` fans out to admins only. So a link into an `adminOnly` screen is safe in
+# `nil` fans out to admins only. So a link into an `adminOnly` screen is safe in
 # the second case and a 403 in the first. Both sides derived: the admin-only set
-# from the nav registry, the recipient from the call's own second argument.
-GATED=$(python3 - "$NAV" "$BACKEND" <<'PY'
+# from the nav registry, the recipient from the call's own third argument.
+GATED=$(CALLS="$CALLS" python3 - "$NAV" <<'PY'
 import os, re, sys
 nav = open(sys.argv[1]).read()
-admin_only = {m.group(1) for m in re.finditer(r'to:\s*"([^"]+)"[^}]*adminOnly:\s*true', nav)}
+admin_only = {m.group(1) for m in re.finditer(r"to:\s*\"([^\"]+)\"[^}]*adminOnly:\s*true", nav)}
 if len(admin_only) < 3:
     print("NAV-PARSE-FAILED"); raise SystemExit
 # `git_deploys` rows are created behind `require_admin` and store the creating
-# admin's id, so `Some(user_id)` there is always an administrator. Recorded so it
-# stays a decision rather than an oversight.
-ALLOW = {("routes/git_deploys.rs", "/git-deploys")}
+# admin id, so a per-user recipient there is always an administrator. Recorded
+# so it stays a decision rather than an oversight.
+ALLOW = {("rt_git_deploys.go", "/git-deploys")}
 bad, checked = [], 0
-for dirpath, _, files in os.walk(sys.argv[2]):
-    for fn in files:
-        if not fn.endswith(".rs"):
+for line in os.environ["CALLS"].splitlines():
+    f = line.split()
+    if not f or f[0] != "CALL" or not f[4].startswith("/"):
+        continue
+    fn, recipient = f[1], f[3]
+    target = "/" + f[4].strip("/").split("/")[0]
+    checked += 1
+    # nil fans out to admins only; anything else may reach a non-admin.
+    if target in admin_only and recipient != "nil":
+        if (fn, target) in ALLOW:
             continue
-        path = os.path.join(dirpath, fn)
-        rel = os.path.relpath(path, sys.argv[2])
-        src = open(path).read()
-        for m in re.finditer(r"notify_panel\s*\(", src):
-            head = src.rfind(chr(10), 0, m.start())
-            if src[head + 1 : m.start()].lstrip().startswith(("//", "*")):
-                continue
-            i, depth = m.end(), 1
-            while depth and i < len(src):
-                if src[i] == "(":
-                    depth += 1
-                elif src[i] == ")":
-                    depth -= 1
-                i += 1
-            args, parts, cur, depth = src[m.end() : i - 1], [], "", 0
-            for ch in args:
-                if ch in "([{":
-                    depth += 1
-                if ch in ")]}":
-                    depth -= 1
-                if ch == "," and depth == 0:
-                    parts.append(cur); cur = ""
-                else:
-                    cur += ch
-            parts.append(cur)
-            parts = [p for p in parts if p.strip()]
-            if len(parts) < 7:
-                continue
-            recipient, link = parts[1].strip(), parts[-1].strip()
-            lm = re.search(r'"(/[^"?]*)', link)
-            if not lm:
-                continue
-            target = "/" + lm.group(1).strip("/").split("/")[0]
-            checked += 1
-            if target in admin_only and not recipient.startswith("None"):
-                if (rel, target) in ALLOW:
-                    continue
-                bad.append(f"{rel} -> {target} for {recipient[:28]}")
+        bad.append(f"{fn}:{f[2]} -> {target} for {recipient[:28]}")
 print(f"CHECKED={checked}")
 for b in sorted(set(bad)):
     print("ROLE-RISK", b)
@@ -568,8 +554,10 @@ else
 fi
 
 # The stream is only useful to a list if the payload can BE a list row.
-for field in '"id": id' '"created_at": created_at' '"read_at"'; do
-  if /usr/bin/grep -qF "$field" "$SVC"; then
+# Go shape: the json.Marshal(map[string]any{...}) in notificationsInsertAndBroadcast,
+# id/created_at from the INSERT's RETURNING row.
+for field in '"id": +row\.A' '"created_at": +row\.B' '"read_at": +nil'; do
+  if /usr/bin/grep -qE "$field" "$SVC"; then
     ok "N6 the SSE payload carries $field"
   else
     bad "N6 the SSE payload dropped $field — a client cannot render what arrives"
@@ -652,20 +640,16 @@ else
 fi
 
 # Every category the guide tables must be a category some producer really passes.
-CATMISS=$(python3 - "$GUIDE" "$BACKEND" <<'PY'
+CATMISS=$(CALLS="$CALLS" python3 - "$GUIDE" <<'PY'
 import os, re, sys
 doc = open(sys.argv[1]).read()
 claimed = set(re.findall(r"^\| `([a-z_]+)` \|", doc, re.M))
 if len(claimed) < 5:
     print("PARSE-FAILED"); raise SystemExit
 real = set()
-for dirpath, _, files in os.walk(sys.argv[2]):
-    for fn in files:
-        if fn.endswith(".rs"):
-            src = open(os.path.join(dirpath, fn)).read()
-            for m in re.finditer(r'notify_panel\s*\(', src):
-                seg = src[m.end() : m.end() + 900]
-                real |= set(re.findall(r'"(alert|monitor|security|deploy|site|incident|backup|ssl|auto_heal|system)"', seg))
+for line in os.environ["CALLS"].splitlines():
+    if line.startswith("CALL "):
+        real |= set(re.findall(r"\"(alert|monitor|security|deploy|site|incident|backup|ssl|auto_heal|system)\"", line))
 print(f"CLAIMED={len(claimed)}")
 for c in sorted(claimed - real):
     print("PHANTOM", c)
@@ -689,14 +673,22 @@ echo "── 8. the security events that had no audience ──"
 # `get_user_channels` returns None for a user with no alert_rules row, which is
 # every user on a fresh install. Three security paths delivered ONLY through it,
 # so on a stock panel they reached nobody. Each must also reach the feed.
-for pair in "panel/backend/src/services/security_hardening.rs:alert_lockdown" \
-            "panel/backend/src/services/auto_healer.rs:CANARY TRIGGERED" \
-            "panel/backend/src/services/uptime.rs:send_alerts"; do
-  f=${pair%%:*}; anchor=${pair#*:}
-  if /usr/bin/grep -qE "notifications::notify_panel\(" "$f"; then
-    ok "N8 $(basename "$f") reaches the notification feed (${anchor})"
+# Keyed on the producing function's own body (comments stripped), not the file.
+for pair in "svc_security_hardening.go:SecurityHardeningAlertLockdown" \
+            "svc_auto_healer.go:autoHealerSecurityCheckCanaryFiles" \
+            "svc_uptime.go:uptimeSendAlerts"; do
+  f=$BACKEND/${pair%%:*}; fn=${pair#*:}
+  body=$(awk -v fn="$fn" '
+    !inside && (index($0, "func " fn "(") == 1 || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) { inside=1 }
+    inside { sub(/\/\/.*/, ""); print; if ($0 ~ /^}/) exit }
+  ' "$f")
+  if [ -z "$body" ]; then
+    bad "N8 $fn not found in $(basename "$f") — the pattern is wrong, not the code"
+  elif echo "$body" | /usr/bin/grep -qE "NotificationsNotifyPanel\(" \
+       && echo "$body" | /usr/bin/grep -qE "NotificationsSendNotification\("; then
+    ok "N8 $(basename "$f") reaches the notification feed as well as external channels (${fn})"
   else
-    bad "N8 $(basename "$f") delivers only to external channels — silent on a stock install"
+    bad "N8 $(basename "$f") delivers only to external channels — silent on a stock install (${fn})"
   fi
 done
 

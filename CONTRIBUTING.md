@@ -66,7 +66,7 @@ panel/
 │   ├── internal/cli/            # CLI tool (Cobra)
 │   └── internal/mcp/            # read-only MCP server
 └── frontend/    # React 19 + TypeScript + Tailwind 4
-    └── src/pages/      # Lazy-loaded page components (52 files)
+    └── src/pages/      # Lazy-loaded page components (53 files)
 ```
 
 **Agent** handles host-level operations: Docker, Nginx config, SSL certificates, file system, terminal (PTY), backups. Runs as root. Communicates via Unix socket (local) or HTTPS (remote servers).

@@ -3,50 +3,39 @@
 #
 # Standing carry from s465 (project_dockpanel_tech_debt_p204): the demo
 # deploy's own `systemctl stop dockpanel-api` triggered the graceful-shutdown
-# watchdog (main.rs::shutdown_signal, GRACEFUL_SHUTDOWN_TIMEOUT = 20s) for the
-# FIRST time in 12 sessions of monitoring — a real forced exit
-# (`std::process::exit(1)`, systemd `status=1/FAILURE`), not another clean
-# non-trigger.
+# watchdog (then main.rs::shutdown_signal, GRACEFUL_SHUTDOWN_TIMEOUT = 20s;
+# now panel/go/internal/api/core_state.go::Serve, gracefulShutdownTimeout)
+# for the FIRST time in 12 sessions of monitoring — a real forced exit
+# (`os.Exit(1)`, systemd `status=1/FAILURE`), not another clean non-trigger.
 #
-# Root cause: `axum::serve(...).with_graceful_shutdown(...)` waits for every
-# IN-FLIGHT connection to close on its OWN; a WebSocket or SSE handler that
-# only exits when the CLIENT disconnects (or, for the 5 provision-log SSE
-# streams, when the underlying job finishes) can hold that drain open past
-# the 20s window, because axum spawns each connection onto its own task that
-# the shutdown signal resolving does not cancel.
+# Root cause: the graceful drain (axum's with_graceful_shutdown then,
+# http.Server.Shutdown now) waits for every IN-FLIGHT connection to close on
+# its OWN; a WebSocket or SSE handler that only exits when the CLIENT
+# disconnects (or, for the provision-log SSE streams, when the underlying job
+# finishes) can hold that drain open past the 20s window. http.Server.Shutdown
+# does not cancel hijacked or still-streaming handlers either.
 #
 # Fixed by threading a shutdown broadcast into every long-lived connection
-# handler in the crate:
+# handler. In the Go port that broadcast is a context:
 #
-#   §A AppState gained `shutdown_tx: tokio::sync::broadcast::Sender<()>`,
-#      populated from the SAME channel `spawn_supervised` already hands every
-#      background service (main.rs) — the channel's creation moved earlier so
-#      the AppState struct literal can hold a clone of it.
-#   §B New shared helper `helpers::shutdown_signal_fut(&AppState)` — a future
-#      that resolves on the first shutdown broadcast. Feeds either
-#      `StreamExt::take_until` (SSE) or a `tokio::select!` race (WebSocket).
-#   §C ws_metrics.rs::handle_socket — the ONLY axum `WebSocketUpgrade`/
-#      `on_upgrade` site in the whole backend crate. `routes/terminal.rs` and
-#      `routes/logs.rs` DO exist in this crate, but only mint short-lived
-#      signed JWT tickets — the actual WebSocket is dialed by the BROWSER
-#      directly against the agent (nginx pins that path to the agent socket;
-#      the panel deliberately does not proxy it), so neither file ever holds
-#      a connection open through this process. Now races its whole
-#      per-tick fetch/send/recv cycle against
-#      the shutdown signal via `tokio::select!`, not just a check at the top
-#      of the loop: a single `agent.get()` call already budgets up to 60s
-#      (`AgentClient::request`), which alone exceeds the 20s drain window.
-#   §D All 6 SSE handlers in the crate (the complete set — confirmed by
-#      grepping for every `Sse::new` site) now end with
-#      `.take_until(shutdown_signal_fut(&state))`:
-#      `notifications.rs::stream` (keyed on the PROCESS-LIFETIME `notif_tx`
-#      broadcast — this one would otherwise never end on its own; every admin
-#      tab with the panel open holds one), plus the 5 provision-log-shaped
-#      streams (`sites.rs::provision_log`, `git_deploys.rs::deploy_log`,
-#      `docker_apps.rs::deploy_log`, `system.rs::install_log`,
-#      `migration.rs::progress`) whose channel closes on its own once the job
-#      finishes, but which can still run well past the drain window while a
-#      job is in progress at shutdown time.
+#   §A AppState.Shutdown context.Context — the SAME ctx spawnSupervised hands
+#      every background service (core_state.go::Serve), created before
+#      NewAppState so the state can hold it, and cancelled the instant the OS
+#      signal arrives (not after the drain that waits on its subscribers).
+#   §B (the Rust helpers::shutdown_signal_fut — retired: ctx.Done() IS the
+#      shared future in Go.)
+#   §C rt_ws_metrics.go::rtWsMetricsHandleSocket — the ONLY websocket.Accept
+#      site in the api. Its per-tick fetch/send/recv cycle runs under a ctx
+#      cancelled by st.Shutdown (context.AfterFunc), not just a check at the
+#      top of the loop: a single agent.Get already budgets up to 60s, which
+#      alone exceeds the 20s drain window.
+#   §D Every SSE handler (the complete set — every function that sets
+#      Content-Type text/event-stream) selects on st.Shutdown.Done():
+#      rtNotificationsStream (the PROCESS-LIFETIME notification broadcast —
+#      it would otherwise never end; every admin tab holds one), plus the
+#      provision-log-shaped streams rtSitesServeSSE (shared by the sites
+#      provision log and rtSystemInstallLog), rtGitDeploysServeSSE,
+#      rtDockerAppsServeSSE and rtMigrationProgress.
 #
 # Adversarially reviewed via a 3-lens skeptic workflow (correctness,
 # completeness-vs-independent-grep, blast-radius) before shipping — see
@@ -65,12 +54,12 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
+# Go comments out (whole-line // and /* */ blocks), code intact.
 code() {
   [ -f "$1" ] || return 0
   perl -0777 -pe '
     s{^[ \t]*/\*.*?\*/[ \t]*$}{}gms;
     s{^\s*//.*$}{}gm;
-    s{^\s*///.*$}{}gm;
   ' "$1"
 }
 
@@ -78,9 +67,10 @@ has()    { grep -qE -- "$2" <<< "$1"; }
 lacks()  { ! grep -qE -- "$2" <<< "$1"; }
 count()  { grep -cE -- "$2" <<< "$1"; }
 
+# One Go func (plain or method) by name, brace-depth bounded.
 fnbody() {
   awk -v fn="$2" '
-    index($0, "fn " fn "(") && !started { started=1 }
+    !started && (index($0, "func " fn "(") == 1 || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) { started=1 }
     started {
       n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
       if (opened || n>0) opened=1
@@ -89,214 +79,186 @@ fnbody() {
   ' <<< "$1"
 }
 
-MAIN=panel/backend/src/main.rs
-MAIN_C=$(code "$MAIN")
-HELPERS=panel/backend/src/helpers.rs
-HELPERS_C=$(code "$HELPERS")
-WS_METRICS=panel/backend/src/routes/ws_metrics.rs
+API=panel/go/internal/api
+CORE=$API/core_state.go
+CORE_C=$(code "$CORE")
+WS_METRICS=$API/rt_ws_metrics.go
 WS_METRICS_C=$(code "$WS_METRICS")
-NOTIFICATIONS=panel/backend/src/routes/notifications.rs
-NOTIFICATIONS_C=$(code "$NOTIFICATIONS")
-SITES=panel/backend/src/routes/sites.rs
-SITES_C=$(code "$SITES")
-GIT_DEPLOYS=panel/backend/src/routes/git_deploys.rs
-GIT_DEPLOYS_C=$(code "$GIT_DEPLOYS")
-DOCKER_APPS=panel/backend/src/routes/docker_apps.rs
-DOCKER_APPS_C=$(code "$DOCKER_APPS")
-SYSTEM=panel/backend/src/routes/system.rs
-SYSTEM_C=$(code "$SYSTEM")
-MIGRATION=panel/backend/src/routes/migration.rs
-MIGRATION_C=$(code "$MIGRATION")
+NOTIFICATIONS_C=$(code "$API/rt_notifications.go")
+SITES_C=$(code "$API/rt_sites.go")
+GIT_DEPLOYS_C=$(code "$API/rt_git_deploys.go")
+DOCKER_APPS_C=$(code "$API/rt_docker_apps.go")
+SYSTEM_C=$(code "$API/rt_system.go")
+MIGRATION_C=$(code "$API/rt_migration.go")
+
+for f in "$CORE" "$WS_METRICS"; do [ -f "$f" ] || bad "MISSING SUBJECT FILE: $f"; done
+
+SERVE_BODY=$(fnbody "$CORE_C" "Serve")
+[ -n "$SERVE_BODY" ] || bad "could not bound func Serve() in $CORE — every §A arm below is unreachable"
 
 # ── §A AppState carries a shutdown broadcast ────────────────────────────────
-echo "── §A main.rs: AppState carries the same shutdown broadcast every background service gets ──"
+echo "── §A core_state.go: AppState carries the same shutdown ctx every background service gets ──"
 
-if has "$MAIN_C" 'pub shutdown_tx: tokio::sync::broadcast::Sender<\(\)>,'; then
-  ok "A1 AppState has a shutdown_tx: broadcast::Sender<()> field"
+if has "$CORE_C" '^[[:space:]]*Shutdown context\.Context$'; then
+  ok "A1 AppState has a Shutdown context.Context field"
 else
-  bad "A1 AppState is missing the shutdown_tx field"
+  bad "A1 AppState is missing the Shutdown context.Context field"
 fi
 
-CHANNEL_LINE=$(grep -nE 'let \(shutdown_tx, _\) = tokio::sync::broadcast::channel::<\(\)>\(1\);' "$MAIN" | head -1 | cut -d: -f1)
-STATE_LITERAL_LINE=$(grep -nE '^\s*let state = AppState \{' "$MAIN" | head -1 | cut -d: -f1)
-CHANNEL_COUNT=$(grep -cE 'let \(shutdown_tx, _\) = tokio::sync::broadcast::channel::<\(\)>\(1\);' "$MAIN")
+CHANNEL_RE='shutdown, cancelShutdown := context\.WithCancel\(context\.Background\(\)\)'
+CHANNEL_LINE=$(grep -nE "$CHANNEL_RE" <<< "$SERVE_BODY" | head -1 | cut -d: -f1)
+STATE_LITERAL_LINE=$(grep -nE 'st := NewAppState\(db, cfg, agent, agents, shutdown\)' <<< "$SERVE_BODY" | head -1 | cut -d: -f1)
+CHANNEL_COUNT=$(count "$CORE_C" "$CHANNEL_RE")
 
 if [ "$CHANNEL_COUNT" -eq 1 ]; then
-  ok "A2 the shutdown_tx channel is created exactly once (no leftover duplicate declaration)"
+  ok "A2 the shutdown ctx is created exactly once (no leftover duplicate declaration)"
 else
-  bad "A2 expected exactly 1 shutdown_tx channel::<()>(1) creation, found $CHANNEL_COUNT"
+  bad "A2 expected exactly 1 'shutdown, cancelShutdown := context.WithCancel(...)', found $CHANNEL_COUNT"
 fi
 
 if [ -n "$CHANNEL_LINE" ] && [ -n "$STATE_LITERAL_LINE" ] && [ "$CHANNEL_LINE" -lt "$STATE_LITERAL_LINE" ]; then
-  ok "A3 shutdown_tx is created BEFORE the AppState struct literal (so the literal can hold a clone)"
+  ok "A3 the shutdown ctx is created BEFORE NewAppState(..., shutdown) (so the state can hold it)"
 else
-  bad "A3 shutdown_tx creation is not positioned before 'let state = AppState {' — the literal cannot reference it"
+  bad "A3 the shutdown ctx is not created before 'st := NewAppState(db, cfg, agent, agents, shutdown)'"
 fi
 
-if has "$MAIN_C" 'shutdown_tx: shutdown_tx\.clone\(\),'; then
-  ok "A4 the AppState literal carries shutdown_tx: shutdown_tx.clone()"
+NEWSTATE_BODY=$(fnbody "$CORE_C" "NewAppState")
+if has "$NEWSTATE_BODY" 'Shutdown:[[:space:]]+shutdown,'; then
+  ok "A4 NewAppState stores the shutdown ctx in AppState.Shutdown"
 else
-  bad "A4 the AppState literal no longer clones shutdown_tx into itself"
+  bad "A4 NewAppState no longer stores the shutdown ctx into AppState.Shutdown"
 fi
 
 # Positive control: the pre-existing background-service wiring is untouched.
-if has "$MAIN_C" 'spawn_supervised\("backup_scheduler", &shutdown_tx,' && has "$MAIN_C" 'spawn_supervised\("cleanup", &shutdown_tx,'; then
-  ok "A5 (control) spawn_supervised still wires background services to shutdown_tx by reference"
+if has "$SERVE_BODY" 'spawnSupervised\(shutdown, "backup_scheduler",' && has "$SERVE_BODY" 'spawnSupervised\(shutdown, "cleanup",'; then
+  ok "A5 (control) spawnSupervised still wires background services to the same shutdown ctx"
 else
-  bad "A5 (control) spawn_supervised's shutdown_tx wiring was altered"
+  bad "A5 (control) spawnSupervised's shutdown wiring was altered"
 fi
 
 # ── A6/A7: the CRITICAL fix-of-the-fix — where the broadcast actually fires ─
 #
 # The first cut of this fix (caught by an adversarial skeptic workflow before
-# shipping) sent `shutdown_tx.send(())` AFTER
-# `axum::serve(...).with_graceful_shutdown(...).await` returned. That await
-# does not return until every in-flight connection's task has ended — so a
-# route handler racing itself against `shutdown_tx` for exactly that reason
-# was waiting on a signal that could only be sent once it, and every sibling
-# connection, had already closed some OTHER way. Circular: the fix was a
-# no-op for its own stated purpose. The real fix moves the send INSIDE
-# `shutdown_signal()`, which is the `signal` future axum polls FIRST — before
-# it stops accepting connections or starts draining existing ones — so
-# subscribers get the broadcast the instant the OS signal arrives, not after
-# the drain that's waiting on them has already finished.
-if has "$MAIN_C" 'async fn shutdown_signal\(shutdown_tx: tokio::sync::broadcast::Sender<\(\)>\)' \
-  && has "$MAIN_C" '\.with_graceful_shutdown\(shutdown_signal\(shutdown_tx\.clone\(\)\)\)'; then
-  ok "A6 shutdown_signal takes shutdown_tx and is invoked with a clone of it"
+# shipping) sent the broadcast AFTER the drain returned. The drain does not
+# return until every in-flight connection's handler has ended — so a handler
+# racing itself against the broadcast was waiting on a signal that could only
+# be sent once it, and every sibling connection, had already closed some
+# OTHER way. Circular: a no-op for its own stated purpose. The real fix fires
+# the broadcast the instant the OS signal arrives, BEFORE the drain starts.
+SIG_ARM=$(awk '/case s := <-sig:/{f=1} f' <<< "$SERVE_BODY")
+if has "$SERVE_BODY" 'signal\.Notify\(sig, os\.Interrupt, syscall\.SIGTERM\)' && [ -n "$SIG_ARM" ]; then
+  ok "A6 Serve() subscribes to SIGINT/SIGTERM and has a 'case s := <-sig:' shutdown arm"
 else
-  bad "A6 shutdown_signal no longer takes/receives shutdown_tx — the send-timing fix regressed"
+  bad "A6 Serve() no longer has the signal.Notify + 'case s := <-sig:' shutdown arm"
 fi
 
-SHUTDOWN_SIGNAL_BODY=$(fnbody "$MAIN_C" "shutdown_signal")
-# Relative line numbers WITHIN the extracted function body only (never
-# whole-file line numbers — shutdown_signal's own select! is not the first
-# tokio::select! in main.rs, spawn_supervised and the cleanup task both have
-# one earlier), so ordering here can't be fooled by an unrelated select!
-# elsewhere in the file.
-SELECT_REL=$(grep -nE 'tokio::select! \{' <<< "$SHUTDOWN_SIGNAL_BODY" | head -1 | cut -d: -f1)
-SEND_REL=$(grep -nE 'let _ = shutdown_tx\.send\(\(\)\);' <<< "$SHUTDOWN_SIGNAL_BODY" | head -1 | cut -d: -f1)
-WATCHDOG_REL=$(grep -nE 'tokio::spawn\(async \{' <<< "$SHUTDOWN_SIGNAL_BODY" | head -1 | cut -d: -f1)
-if [ -n "$SELECT_REL" ] && [ -n "$SEND_REL" ] && [ -n "$WATCHDOG_REL" ] \
-  && [ "$SEND_REL" -gt "$SELECT_REL" ] && [ "$SEND_REL" -lt "$WATCHDOG_REL" ]; then
-  ok "A7 inside shutdown_signal(), the send fires AFTER the OS-signal select! and BEFORE the watchdog spawn — not after the drain in main()"
+CANCEL_REL=$(grep -nE '^[[:space:]]*cancelShutdown\(\)$' <<< "$SIG_ARM" | head -1 | cut -d: -f1)
+WATCHDOG_REL=$(grep -nE 'go func\(\) \{' <<< "$SIG_ARM" | head -1 | cut -d: -f1)
+DRAIN_REL=$(grep -nE 'srv\.Shutdown\(' <<< "$SIG_ARM" | head -1 | cut -d: -f1)
+if [ -n "$CANCEL_REL" ] && [ -n "$WATCHDOG_REL" ] && [ -n "$DRAIN_REL" ] \
+  && [ "$CANCEL_REL" -lt "$WATCHDOG_REL" ] && [ "$WATCHDOG_REL" -lt "$DRAIN_REL" ]; then
+  ok "A7 in the signal arm, cancelShutdown() fires BEFORE the watchdog and BEFORE srv.Shutdown()'s drain — not after it"
 else
-  bad "A7 shutdown_tx.send(()) is not correctly ordered inside shutdown_signal() — the circular-wait bug may have returned"
+  bad "A7 cancelShutdown() is not ordered before the watchdog and srv.Shutdown() in the signal arm — the circular-wait bug may have returned"
 fi
 
-# Positive control: main() no longer sends a second, too-late broadcast after
-# the serve-await returns (that was the actual defect this A6/A7 pair fixes).
-POST_SERVE_MAIN_TAIL=$(fnbody "$MAIN_C" "main")
-if lacks "$POST_SERVE_MAIN_TAIL" 'Sending shutdown signal to background services'; then
-  ok "A8 (control) main() no longer claims to send the shutdown signal itself post-drain"
+# Control: nothing after the drain starts claims to (re)send the broadcast.
+POST_DRAIN=$(awk '/srv\.Shutdown\(/{f=1} f' <<< "$SERVE_BODY")
+if [ -n "$POST_DRAIN" ] && lacks "$POST_DRAIN" 'cancelShutdown\(\)|Sending shutdown signal to background services'; then
+  ok "A8 (control) Serve() no longer sends the shutdown broadcast itself post-drain"
 else
-  bad "A8 (control) the misleading post-drain 'sending shutdown signal' log/send reappeared in main()"
+  bad "A8 (control) a post-drain cancelShutdown()/'sending shutdown signal' reappeared (or srv.Shutdown is gone)"
 fi
 
 # ── §B helpers::shutdown_signal_fut ─────────────────────────────────────────
-echo "── §B helpers.rs: the shared shutdown-future helper ──"
+# B1 retired (obsolete in Go): the Rust shutdown_signal_fut helper (and its `+ use<>` capture opt-out) has no Go analogue; ctx.Done() is the shared future.
+# B2 retired (obsolete in Go): subscribe-then-recv on a broadcast is replaced by selecting on st.Shutdown.Done(), pinned per handler in §C/§D.
 
-if has "$HELPERS_C" 'pub fn shutdown_signal_fut\(state: &crate::AppState\) -> impl std::future::Future<Output = \(\)> \+ use<>'; then
-  ok "B1 shutdown_signal_fut has the expected signature (+ use<>, opting out of Rust 2024's default RPITIT capture)"
+# ── §C ws_metrics: the metrics websocket races shutdown mid-cycle ──────────
+echo "── §C rt_ws_metrics.go: rtWsMetricsHandleSocket races its whole per-tick cycle against shutdown ──"
+
+if has "$WS_METRICS_C" 'rtWsMetricsHandleSocket\(st, conn, agent, claims\)'; then
+  ok "C1 the handler hands AppState (and with it st.Shutdown) to rtWsMetricsHandleSocket"
 else
-  bad "B1 shutdown_signal_fut signature missing or changed"
+  bad "C1 the handler no longer passes st into rtWsMetricsHandleSocket"
 fi
 
-FUT_BODY=$(fnbody "$HELPERS_C" "shutdown_signal_fut")
-if has "$FUT_BODY" 'state\.shutdown_tx\.subscribe\(\)' && has "$FUT_BODY" 'rx\.recv\(\)\.await'; then
-  ok "B2 shutdown_signal_fut subscribes and awaits the broadcast"
+HANDLE_SOCKET_BODY=$(fnbody "$WS_METRICS_C" "rtWsMetricsHandleSocket")
+if has "$HANDLE_SOCKET_BODY" 'ctx, cancel := context\.WithCancel\(' && has "$HANDLE_SOCKET_BODY" 'context\.AfterFunc\(st\.Shutdown, cancel\)'; then
+  ok "C2 rtWsMetricsHandleSocket derives its cycle ctx from st.Shutdown (context.AfterFunc)"
 else
-  bad "B2 shutdown_signal_fut no longer subscribes/awaits correctly"
+  bad "C2 rtWsMetricsHandleSocket no longer ties its cycle ctx to st.Shutdown"
 fi
 
-# ── §C ws_metrics.rs: the metrics websocket races shutdown mid-cycle ───────
-echo "── §C ws_metrics.rs: handle_socket races its whole per-tick cycle against shutdown, not just at loop-top ──"
-
-if has "$WS_METRICS_C" 'let shutdown_rx = state\.shutdown_tx\.subscribe\(\);' && has "$WS_METRICS_C" 'handle_socket\(socket, agent, state, claims, shutdown_rx\)'; then
-  ok "C1 handler() subscribes and hands shutdown_rx to handle_socket"
+if has "$HANDLE_SOCKET_BODY" 'agent\.Get\(ctx, p\)' && has "$HANDLE_SOCKET_BODY" 'conn\.Write\(ctx,' && has "$HANDLE_SOCKET_BODY" 'case <-ctx\.Done\(\):'; then
+  ok "C3 the per-tick fetch, send and 5s wait all run under the shutdown-cancelled ctx"
 else
-  bad "C1 handler() no longer wires shutdown_rx into handle_socket"
-fi
-
-HANDLE_SOCKET_BODY=$(fnbody "$WS_METRICS_C" "handle_socket")
-if has "$HANDLE_SOCKET_BODY" 'mut shutdown_rx: tokio::sync::broadcast::Receiver<\(\)>,'; then
-  ok "C2 handle_socket takes shutdown_rx as a broadcast::Receiver<()> parameter"
-else
-  bad "C2 handle_socket no longer takes a shutdown_rx parameter"
-fi
-
-if has "$HANDLE_SOCKET_BODY" 'let tick = async \{' && has "$HANDLE_SOCKET_BODY" 'keep_going = tick =>' && has "$HANDLE_SOCKET_BODY" '_ = shutdown_rx\.recv\(\) =>'; then
-  ok "C3 the per-tick work is raced against shutdown_rx.recv() via tokio::select!"
-else
-  bad "C3 the tokio::select! race between the per-tick work and shutdown is missing"
+  bad "C3 the per-tick fetch/send/wait is no longer raced against shutdown"
 fi
 
 # Positive control: the 4 concurrent agent fetches this loop exists to make
 # are unchanged — this fix restructures control flow, not the payload.
-AGENT_GET_CALLS=$(count "$HANDLE_SOCKET_BODY" 'agent\.get\("/(system/info|system/processes|system/network|apps/gpu-info)"\)')
-if [ "$AGENT_GET_CALLS" -eq 4 ]; then
-  ok "C4 (control) all 4 agent.get() endpoints are still fetched per tick"
+AGENT_GET_CALLS=$(grep -oE '"/(system/info|system/processes|system/network|apps/gpu-info)"' <<< "$HANDLE_SOCKET_BODY" | sort -u | wc -l | tr -d ' ')
+if [ "$AGENT_GET_CALLS" -eq 4 ] && has "$HANDLE_SOCKET_BODY" 'results := make\(\[\]any, 4\)'; then
+  ok "C4 (control) all 4 agent endpoints are still fetched per tick"
 else
-  bad "C4 (control) expected 4 agent.get() calls in handle_socket, found $AGENT_GET_CALLS"
+  bad "C4 (control) expected 4 agent endpoints fetched in rtWsMetricsHandleSocket, found $AGENT_GET_CALLS"
 fi
 
 # C5 — adversarial-review follow-up: the trailing close-frame send is timed,
-# so a black-holed peer can't stall this connection's own task (and with it,
-# axum's drain wait for it) past the shutdown signal that just fired.
-if has "$HANDLE_SOCKET_BODY" 'tokio::time::timeout\(Duration::from_secs\(2\), socket\.send\(Message::Close\(None\)\)\)\.await'; then
-  ok "C5 the trailing close-frame send is wrapped in a 2s timeout, not a bare await"
+# so a black-holed peer can't stall this connection's own handler (and with
+# it, the drain wait for it) past the shutdown signal that just fired.
+CLOSE_TAIL=$(awk '/conn\.Close\(websocket\.StatusNormalClosure/{f=1} f' <<< "$HANDLE_SOCKET_BODY")
+if has "$CLOSE_TAIL" 'case <-time\.After\(2 \* time\.Second\):' && has "$CLOSE_TAIL" 'conn\.CloseNow\(\)'; then
+  ok "C5 the trailing close-frame send is bounded by a 2s timeout (then CloseNow), not a bare call"
 else
   bad "C5 the trailing close-frame send is unbounded again — a black-holed peer could stall this connection's own drain"
 fi
 
-# ── §D every SSE stream in the crate ends on shutdown too ──────────────────
-echo "── §D all 6 SSE handlers in the crate race their stream against shutdown ──"
+# ── §D every SSE stream ends on shutdown too ───────────────────────────────
+echo "── §D every SSE handler races its stream against shutdown ──"
 
-if has "$NOTIFICATIONS_C" '\.take_until\(crate::helpers::shutdown_signal_fut\(&state\)\)'; then
-  ok "D1 notifications.rs::stream (the process-lifetime notif_tx feed) takes_until shutdown"
+# A body races shutdown if it selects on st.Shutdown.Done() directly, or on a
+# channel it assigned from it.
+races() {
+  has "$1" 'case <-st\.Shutdown\.Done\(\):' \
+    || { has "$1" 'shutdown = st\.Shutdown\.Done\(\)' && has "$1" 'case <-shutdown:'; }
+}
+sse_arm() { # id file-content func label
+  local b; b=$(fnbody "$2" "$3")
+  if [ -z "$b" ]; then bad "$1 could not find func $3"
+  elif ! has "$b" 'text/event-stream'; then bad "$1 $3 no longer serves text/event-stream — re-derive this arm"
+  elif races "$b"; then ok "$1 $3 ($4) selects on st.Shutdown.Done()"
+  else bad "$1 $3 ($4) is missing the shutdown race"; fi
+}
+sse_arm D1 "$NOTIFICATIONS_C" rtNotificationsStream "the process-lifetime notification feed"
+sse_arm D2 "$SITES_C"         rtSitesServeSSE       "sites provision log"
+sse_arm D3 "$GIT_DEPLOYS_C"   rtGitDeploysServeSSE  "git deploy log"
+sse_arm D4 "$DOCKER_APPS_C"   rtDockerAppsServeSSE  "docker app deploy log"
+
+INSTALL_BODY=$(fnbody "$SYSTEM_C" "rtSystemInstallLog")
+if has "$INSTALL_BODY" 'rtSitesServeSSE\(st, w, r, history, live\)'; then
+  ok "D5 rtSystemInstallLog streams through rtSitesServeSSE (raced in D2)"
 else
-  bad "D1 notifications.rs::stream is missing the shutdown race"
+  bad "D5 rtSystemInstallLog no longer streams through the shutdown-raced rtSitesServeSSE"
 fi
+sse_arm D6 "$MIGRATION_C"     rtMigrationProgress   "migration progress"
 
-if has "$SITES_C" '\.take_until\(crate::helpers::shutdown_signal_fut\(&state\)\)'; then
-  ok "D2 sites.rs::provision_log takes_until shutdown"
+# Package-wide completeness control: every func that sets text/event-stream
+# races shutdown — a new SSE handler added without the race is caught here.
+SSE_REPORT=$(for f in "$API"/rt_*.go; do
+  code "$f" | awk -v F="$(basename "$f")" '
+    /^func /{ if (fn != "" && sse) print F, fn, raced; fn=$0; sse=0; raced=0 }
+    /text\/event-stream/ { sse=1 }
+    /case <-st\.Shutdown\.Done\(\):|shutdown = st\.Shutdown\.Done\(\)/ { raced=1 }
+    END { if (fn != "" && sse) print F, fn, raced }'
+done)
+SSE_SITES=$(grep -c . <<< "$SSE_REPORT")
+SHUTDOWN_RACED=$(grep -c ' 1$' <<< "$SSE_REPORT")
+if [ "$SSE_SITES" -eq 5 ] && [ "$SHUTDOWN_RACED" -eq 5 ]; then
+  ok "D7 (package-wide control) all 5 text/event-stream funcs race shutdown — no gap, no drift"
 else
-  bad "D2 sites.rs::provision_log is missing the shutdown race"
-fi
-
-if has "$GIT_DEPLOYS_C" '\.take_until\(crate::helpers::shutdown_signal_fut\(&state\)\)'; then
-  ok "D3 git_deploys.rs::deploy_log takes_until shutdown"
-else
-  bad "D3 git_deploys.rs::deploy_log is missing the shutdown race"
-fi
-
-if has "$DOCKER_APPS_C" '\.take_until\(crate::helpers::shutdown_signal_fut\(&state\)\)'; then
-  ok "D4 docker_apps.rs::deploy_log takes_until shutdown"
-else
-  bad "D4 docker_apps.rs::deploy_log is missing the shutdown race"
-fi
-
-if has "$SYSTEM_C" '\.take_until\(crate::helpers::shutdown_signal_fut\(&state\)\)'; then
-  ok "D5 system.rs::install_log takes_until shutdown"
-else
-  bad "D5 system.rs::install_log is missing the shutdown race"
-fi
-
-if has "$MIGRATION_C" '\.take_until\(crate::helpers::shutdown_signal_fut\(&state\)\)'; then
-  ok "D6 migration.rs::progress takes_until shutdown"
-else
-  bad "D6 migration.rs::progress is missing the shutdown race"
-fi
-
-# Whole-crate completeness control: exactly 6 Sse::new sites exist and exactly
-# 6 take_until(shutdown_signal_fut(...)) sites exist — if a 7th SSE handler is
-# ever added without this race, this count catches it; if take_until count
-# ever drops below Sse::new count, a regression removed the race somewhere.
-SSE_SITES=$(grep -rlE 'Sse::new' panel/backend/src/routes/*.rs | wc -l | tr -d ' ')
-SHUTDOWN_RACED_FILES=$(grep -rlE '\.take_until\(crate::helpers::shutdown_signal_fut\(&state\)\)' panel/backend/src/routes/*.rs | wc -l | tr -d ' ')
-if [ "$SSE_SITES" -eq 6 ] && [ "$SHUTDOWN_RACED_FILES" -eq 6 ]; then
-  ok "D7 (crate-wide control) all 6 Sse::new sites are exactly the 6 files racing shutdown — no gap, no drift"
-else
-  bad "D7 (crate-wide control) Sse::new sites=$SSE_SITES, shutdown-raced files=$SHUTDOWN_RACED_FILES — mismatch, investigate"
+  bad "D7 (package-wide control) SSE funcs=$SSE_SITES, shutdown-raced=$SHUTDOWN_RACED — mismatch, investigate: $(grep ' 0$' <<< "$SSE_REPORT" | tr '\n' ';')"
 fi
 
 echo

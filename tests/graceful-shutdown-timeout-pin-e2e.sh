@@ -42,25 +42,29 @@
 # reintroduction of the wrong first attempt: every arm below is required to
 # go RED against at least one of them.
 #
-#   §A  the watchdog is armed AFTER the signal resolves, inside
-#       shutdown_signal() — never wrapping axum::serve(...) itself
-#   §B  the bound is a small, named, finite constant, shared by the sleep and
-#       the log message — not unbounded, not duplicated
-#   §C  the watchdog actually calls std::process::exit(...) — a real hard
-#       exit, not a log-only no-op
-#   §D  NEGATIVE CONTROL: axum::serve(...).with_graceful_shutdown(...) is NOT
-#       wrapped in any tokio::time::timeout anywhere in this file — this is
-#       the exact whole-lifetime-wrap regression from the first fix attempt
-#   §E  the original bare `if let Err(e) = axum::serve(...)
-#       .with_graceful_shutdown(shutdown_signal()).await` shape is still
-#       there, still logging the same message — the fix must not have
-#       touched main()'s own error handling to add the watchdog
-#   §F  the watchdog is tokio::spawn'd (an independent task), not awaited
-#       inline — inline would delay shutdown_signal() itself from resolving,
-#       which would delay axum's drain from even starting
+# THE GO PORT (panel/go/internal/api/core_state.go::Serve). There is no
+# separate shutdown_signal(): Serve() runs `go func() { served <- srv.Serve(ln) }()`
+# and selects on that vs `case s := <-sig:`. The watchdog lives INSIDE the
+# signal arm: `go func() { time.Sleep(gracefulShutdownTimeout); slog.Warn(...);
+# os.Exit(1) }()`, then `srv.Shutdown(context.Background())` drains. Same two
+# mutation families, Go shapes:
 #
-# Pure source analysis over panel/backend/src/main.rs: no box, no network, no
-# build required.
+#   §A  the watchdog is armed AFTER the signal resolves, inside the
+#       `case s := <-sig:` arm — never from boot
+#   §B  the bound is a small, named, finite constant (gracefulShutdownTimeout),
+#       shared by the sleep and the log message — not unbounded, not duplicated
+#   §C  the watchdog actually calls os.Exit(...) — a real hard exit, not a
+#       log-only no-op
+#   §D  NEGATIVE CONTROL: srv.Serve(ln) is NOT bounded by any timeout,
+#       deadline or AfterFunc in Serve() — the Go analogue of the
+#       whole-lifetime-wrap regression from the first fix attempt
+#   §E  the `case err := <-served:` arm still logs "API server error: ..." —
+#       the fix must not have touched the server's own error handling
+#   §F  the watchdog is a goroutine (`go func`), not slept inline — inline
+#       would delay srv.Shutdown()'s drain from even starting
+#
+# Pure source analysis over panel/go/internal/api/core_state.go: no box, no
+# network, no build required.
 #
 # NO PIPES INTO `grep -q`. Under `set -o pipefail` grep -q closes the pipe on
 # its first match, the upstream dies of SIGPIPE (141), and pipefail reports
@@ -74,15 +78,13 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-MAIN_RS=panel/backend/src/main.rs
+CORE_GO=panel/go/internal/api/core_state.go
 
-[ -f "$MAIN_RS" ] || bad "MISSING SUBJECT FILE: $MAIN_RS"
+[ -f "$CORE_GO" ] || bad "MISSING SUBJECT FILE: $CORE_GO"
 
-# Comments out, CODE INTACT — a bare comment-stripping regex can eat real code
-# whenever a string literal contains `/*`.
+# Go comments out (whole-line // and /* */ blocks), CODE INTACT.
 code() {
   perl -0777 -pe '
-    s{\{/\*.*?\*/\}}{}gs;
     s{^[ \t]*/\*.*?\*/[ \t]*$}{}gms;
     s{^\s*//.*$}{}gm;
   ' "$1"
@@ -90,150 +92,138 @@ code() {
 subj()  { local t; t=$(code "$1"); [ -n "$t" ] || return 1; printf '%s' "$t"; }
 has()   { grep -qE -- "$2" <<< "$1"; }
 count() { grep -cE -- "$2" <<< "$1" || true; }
-flat()  { tr '\n' ' ' <<< "$1" | tr -s ' '; }
+flat()  { tr -s '[:space:]' ' ' <<< "$1"; }
 # One function's body, bounded by its OWN closing brace in column 0 — not the
 # whole file.
 fn_body() { awk -v pat="$1" '$0 ~ pat {f=1} f {print} f && /^\}/ {exit}' <<< "$2"; }
 
-FULL_S=$(subj "$MAIN_RS" || true)
+FULL_S=$(subj "$CORE_GO" || true)
 FULL_FLAT=$(flat "$FULL_S")
 
-# Anchored on the function name alone (no '() {' in the pattern) — awk's
-# `-v pat=` assignment runs its OWN escape pass before the regex engine sees
-# the string, so a bash-escaped '\(' arrives as a bare '(' and is read as an
-# ERE grouping metacharacter rather than a literal paren.
-MAIN_FN=$(fn_body '^async fn main' "$FULL_S")
-MAIN_FLAT=$(flat "$MAIN_FN")
-SHUTDOWN_FN=$(fn_body '^async fn shutdown_signal' "$FULL_S")
-SHUTDOWN_FLAT=$(flat "$SHUTDOWN_FN")
+SERVE_FN=$(fn_body '^func Serve[(]' "$FULL_S")
+SERVE_FLAT=$(flat "$SERVE_FN")
+# The post-signal arm of Serve()'s select — everything from `case s := <-sig:`.
+SIG_ARM=$(awk '/case s := <-sig:/{f=1} f' <<< "$SERVE_FN")
+SIG_FLAT=$(flat "$SIG_ARM")
 
-if [ -z "$MAIN_FN" ]; then
-  bad "could not bound async fn main() in $MAIN_RS — every §D/§E arm below is unreachable"
+if [ -z "$SERVE_FN" ]; then
+  bad "could not bound func Serve() in $CORE_GO — every arm below is unreachable"
 fi
-if [ -z "$SHUTDOWN_FN" ]; then
-  bad "could not bound async fn shutdown_signal() in $MAIN_RS — every §A/§B/§C/§F arm below is unreachable"
+if [ -z "$SIG_ARM" ]; then
+  bad "could not find the 'case s := <-sig:' arm in Serve() — every §A/§B/§C/§F arm below is unreachable"
 fi
 
-echo "§A  the watchdog is armed AFTER the signal resolves, inside shutdown_signal()"
+echo "§A  the watchdog is armed AFTER the signal resolves, inside the signal arm of Serve()"
 
-# A1 — a tokio::spawn(...) block exists AFTER the tokio::select! block within
-# shutdown_signal(), containing a sleep on GRACEFUL_SHUTDOWN_TIMEOUT. Ordering
-# matters: this proves the watchdog's clock starts once the signal has ALREADY
-# fired, not from process start.
-if [ -z "$SHUTDOWN_FN" ]; then
-  bad "A1 SKIPPED: could not bound shutdown_signal()"
+# A1 — a `go func() {` watchdog sleeping on gracefulShutdownTimeout sits
+# INSIDE the `case s := <-sig:` arm, and no watchdog sleep exists before it.
+# Ordering matters: the clock starts once the signal has ALREADY fired, not
+# from process start.
+if [ -z "$SIG_ARM" ]; then
+  bad "A1 SKIPPED: could not find the signal arm"
 else
-  SELECT_LN=$(grep -n 'tokio::select! {' <<< "$SHUTDOWN_FN" | head -1 | cut -d: -f1)
-  SPAWN_LN=$(grep -n 'tokio::spawn(async' <<< "$SHUTDOWN_FN" | head -1 | cut -d: -f1)
-  SLEEP_LN=$(grep -n 'tokio::time::sleep(GRACEFUL_SHUTDOWN_TIMEOUT)' <<< "$SHUTDOWN_FN" | head -1 | cut -d: -f1)
-  if [ -z "${SELECT_LN:-}" ] || [ -z "${SPAWN_LN:-}" ] || [ -z "${SLEEP_LN:-}" ]; then
-    bad "A1 could not locate one of: tokio::select!, tokio::spawn(async, or the GRACEFUL_SHUTDOWN_TIMEOUT sleep inside shutdown_signal()"
-  elif [ "$SELECT_LN" -lt "$SPAWN_LN" ] && [ "$SPAWN_LN" -lt "$SLEEP_LN" ]; then
-    ok "A1 a tokio::spawn'd watchdog sleeping on GRACEFUL_SHUTDOWN_TIMEOUT sits AFTER tokio::select! inside shutdown_signal() — its clock starts once the signal has already fired"
+  PRE_SIG=$(awk '/case s := <-sig:/{exit} {print}' <<< "$SERVE_FN")
+  SPAWN_LN=$(grep -n 'go func() {' <<< "$SIG_ARM" | head -1 | cut -d: -f1)
+  SLEEP_LN=$(grep -n 'time.Sleep(gracefulShutdownTimeout)' <<< "$SIG_ARM" | head -1 | cut -d: -f1)
+  if [ -z "${SPAWN_LN:-}" ] || [ -z "${SLEEP_LN:-}" ]; then
+    bad "A1 could not locate the 'go func() {' watchdog or its gracefulShutdownTimeout sleep inside the signal arm"
+  elif has "$PRE_SIG" 'gracefulShutdownTimeout'; then
+    bad "A1 gracefulShutdownTimeout is used BEFORE the signal arm — the bound may now start from process start"
+  elif [ "$SPAWN_LN" -lt "$SLEEP_LN" ]; then
+    ok "A1 a goroutine watchdog sleeping on gracefulShutdownTimeout sits inside 'case s := <-sig:' — its clock starts once the signal has already fired"
   else
-    bad "A1 the watchdog is missing or is not strictly after tokio::select! inside shutdown_signal() — the bound may no longer start from the signal"
+    bad "A1 the watchdog sleep is not inside its goroutine in the signal arm"
   fi
 fi
 
 echo "§B  the bound is a small, named, finite constant, shared by the sleep and the log"
 
-# B1 — a plain, finite Duration::from_secs(N) constant exists, N is small.
-if has "$FULL_FLAT" \
-  'const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs\([0-9]+\);'; then
-  DUR_N=$(grep -oE 'const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs\([0-9]+\)' <<< "$FULL_FLAT" \
+# B1 — a plain, finite `N * time.Second` constant exists, N is small.
+if has "$FULL_FLAT" 'const gracefulShutdownTimeout = [0-9]+ \* time\.Second'; then
+  DUR_N=$(grep -oE 'const gracefulShutdownTimeout = [0-9]+ \* time\.Second' <<< "$FULL_FLAT" \
             | grep -oE '[0-9]+' | tail -1)
   if [ -n "${DUR_N:-}" ] && [ "$DUR_N" -gt 0 ] 2>/dev/null && [ "$DUR_N" -le 30 ] 2>/dev/null; then
-    ok "B1 GRACEFUL_SHUTDOWN_TIMEOUT is a finite constant of ${DUR_N}s (0 < N <= 30) — short enough to exit well inside systemd's kill window"
+    ok "B1 gracefulShutdownTimeout is a finite constant of ${DUR_N}s (0 < N <= 30) — short enough to exit well inside systemd's kill window"
   else
-    bad "B1 GRACEFUL_SHUTDOWN_TIMEOUT is ${DUR_N:-unknown}s — not a short bound any more"
+    bad "B1 gracefulShutdownTimeout is ${DUR_N:-unknown}s — not a short bound any more"
   fi
 else
-  bad "B1 no finite 'const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(N)' found — the bound may be missing, dynamic, or Duration::MAX"
+  bad "B1 no finite 'const gracefulShutdownTimeout = N * time.Second' found — the bound may be missing or dynamic"
 fi
 
 # B2 — the SAME constant drives both the watchdog's sleep and the warning it
-# logs on firing, via .as_secs(). Independently-spelled durations could drift.
-if [ -z "$SHUTDOWN_FN" ]; then
-  bad "B2 SKIPPED: could not bound shutdown_signal()"
-elif has "$SHUTDOWN_FLAT" 'GRACEFUL_SHUTDOWN_TIMEOUT\.as_secs\(\)' \
-  && [ "$(count "$SHUTDOWN_FN" 'GRACEFUL_SHUTDOWN_TIMEOUT')" -ge 2 ]; then
-  ok "B2 the logged duration reads .as_secs() off the same constant the watchdog sleeps on — no duplicated literal to drift"
+# logs on firing, via .Seconds(). Independently-spelled durations could drift.
+if [ -z "$SIG_ARM" ]; then
+  bad "B2 SKIPPED: could not find the signal arm"
+elif has "$SIG_FLAT" 'gracefulShutdownTimeout\.Seconds\(\)' \
+  && [ "$(count "$SIG_ARM" 'gracefulShutdownTimeout')" -ge 2 ]; then
+  ok "B2 the logged duration reads .Seconds() off the same constant the watchdog sleeps on — no duplicated literal to drift"
 else
   bad "B2 the watchdog's log message no longer derives from the same named constant it sleeps on"
 fi
 
-echo "§C  the watchdog actually calls std::process::exit — a real hard exit"
+echo "§C  the watchdog actually calls os.Exit — a real hard exit"
 
-# C1 — after the sleep, the watchdog calls std::process::exit(...), not just
-# a log. A soft log-only "watchdog" would not save us from a hung per-
-# connection task or a stalled shutdown_db.close().await — see the file
-# header. It must also log first (an operator needs to see WHY the process
+# C1 — after the sleep, the watchdog calls os.Exit(...), not just a log. A
+# soft log-only "watchdog" would not save us from a hung handler or a stalled
+# drain. It must also log first (an operator needs to see WHY the process
 # just vanished), so both must be present, log before exit.
-if [ -z "$SHUTDOWN_FN" ]; then
-  bad "C1 SKIPPED: could not bound shutdown_signal()"
+if [ -z "$SIG_ARM" ]; then
+  bad "C1 SKIPPED: could not find the signal arm"
 else
-  WARN_LN=$(grep -n 'tracing::warn!(' <<< "$SHUTDOWN_FN" | head -1 | cut -d: -f1)
-  EXIT_LN=$(grep -n 'std::process::exit(' <<< "$SHUTDOWN_FN" | head -1 | cut -d: -f1)
+  WD=$(awk '/go func\(\) \{/{f=1} f{print} f && /^[[:space:]]*\}\(\)/{exit}' <<< "$SIG_ARM")
+  WARN_LN=$(grep -n 'slog.Warn(' <<< "$WD" | head -1 | cut -d: -f1)
+  EXIT_LN=$(grep -n 'os.Exit(' <<< "$WD" | head -1 | cut -d: -f1)
   if [ -z "${WARN_LN:-}" ] || [ -z "${EXIT_LN:-}" ]; then
-    bad "C1 could not find both a tracing::warn! and a std::process::exit inside shutdown_signal() — the watchdog may be a no-op"
+    bad "C1 could not find both a slog.Warn and an os.Exit inside the watchdog goroutine — it may be a no-op"
   elif [ "$WARN_LN" -lt "$EXIT_LN" ]; then
-    ok "C1 the watchdog logs via tracing::warn! THEN calls std::process::exit — an operator sees why, and the process actually terminates"
+    ok "C1 the watchdog logs via slog.Warn THEN calls os.Exit — an operator sees why, and the process actually terminates"
   else
-    bad "C1 std::process::exit appears before the warning is logged, or the ordering could not be established"
+    bad "C1 os.Exit appears before the warning is logged, or the ordering could not be established"
   fi
 fi
 
-echo "§D  NEGATIVE CONTROL: axum::serve(...).with_graceful_shutdown(...) is never wrapped in a timeout"
+echo "§D  NEGATIVE CONTROL: srv.Serve(ln) is never bounded by a timeout"
 
-# D1 — THE EXACT REGRESSION THIS SUITE MUST CATCH. If axum::serve(...)
-# .with_graceful_shutdown(...) is ever nested inside a tokio::time::timeout(...)
-# again, that bounds the SERVER'S ENTIRE LIFETIME (the future does not resolve
-# until the shutdown signal ALSO fires), not just the post-signal drain — the
-# process would exit ~N seconds after every boot, shutdown or not. A regex
-# checking only for the watchdog's PRESENCE (§A-§C) would stay green even if
-# this catastrophic shape were reintroduced ALONGSIDE it.
-if has "$FULL_FLAT" \
-  'tokio::time::timeout\([^)]*axum::serve\(listener, app\)\.with_graceful_shutdown\(shutdown_signal\(\)\)'; then
-  bad "D1 axum::serve(...).with_graceful_shutdown(...) is wrapped in a tokio::time::timeout — this bounds the WHOLE SERVER LIFETIME, not just shutdown, and would force-exit the process ~N seconds after every single boot"
+# D1 — THE EXACT REGRESSION THIS SUITE MUST CATCH. Go's analogue of wrapping
+# axum::serve in tokio::time::timeout is bounding the server goroutine (or
+# the select that waits on it) with a deadline/AfterFunc/time.After that runs
+# from boot: the process would exit ~N seconds after every start, shutdown or
+# not. Positive anchor: the server goroutine itself must be found.
+if [ -z "$SERVE_FN" ] || ! has "$SERVE_FN" 'go func\(\) \{ served <- srv\.Serve\(ln\) \}\(\)'; then
+  bad "D1 could not find 'go func() { served <- srv.Serve(ln) }()' in Serve() — the negative check below would be vacuous"
+elif has "$SERVE_FN" 'context\.WithTimeout|context\.WithDeadline|time\.AfterFunc|case <-time\.After\(|WriteTimeout|IdleTimeout:.*gracefulShutdownTimeout' \
+  || has "$(awk '/case s := <-sig:/{exit} {print}' <<< "$SERVE_FN")" 'os\.Exit'; then
+  bad "D1 Serve() bounds the server's lifetime with a timeout/deadline (or exits before the signal arm) — this would force-exit the process ~N seconds after every single boot"
 else
-  ok "D1 axum::serve(...).with_graceful_shutdown(...) is never wrapped in a tokio::time::timeout — the server's normal lifetime is unbounded, as it must be"
+  ok "D1 srv.Serve(ln) runs unbounded; the only timer is the post-signal watchdog — the server's normal lifetime is unbounded, as it must be"
 fi
 
-echo "§E  the original bare error-handling shape around axum::serve is still there"
+echo "§E  the original bare error-handling shape around the server is still there"
 
-# E1 — the pre-existing `if let Err(e) = axum::serve(...)
-# .with_graceful_shutdown(shutdown_signal()).await { tracing::error!(...) }`
-# shape, UNCHANGED, still logs the same message. Adding the watchdog inside
-# shutdown_signal() must not have touched main()'s own error handling.
-# s466 CORR: shutdown_signal() now takes shutdown_tx (a separate fix — it
-# needs the sender to broadcast the instant the OS signal arrives, not after
-# this same await already returned — see shutdown-drain-race-pin-e2e.sh §A6/A7)
-# so the call site gained an argument; the shape this arm actually cares about
-# (the bare if-let-Err wrapping THIS SAME await, logging the same message) is
-# unchanged regardless of what's inside the parens.
-if [ -z "$MAIN_FN" ]; then
-  bad "E1 SKIPPED: could not bound main()"
-elif has "$MAIN_FLAT" \
-  'if let Err\(e\) = axum::serve\(listener, app\)[[:space:]]*\.with_graceful_shutdown\(shutdown_signal\(shutdown_tx\.clone\(\)\)\)[[:space:]]*\.await' \
-  && has "$MAIN_FLAT" 'tracing::error!\("API server error: \{e\}"\)'; then
-  ok "E1 the bare 'if let Err(e) = axum::serve(...).with_graceful_shutdown(...).await { tracing::error!(...) }' shape is intact"
+# E1 — the server-error arm `case err := <-served:` still logs the same
+# message. Adding the watchdog to the signal arm must not have touched it.
+if [ -z "$SERVE_FN" ]; then
+  bad "E1 SKIPPED: could not bound Serve()"
+elif has "$SERVE_FLAT" 'case err := <-served: slog\.Error\(fmt\.Sprintf\("API server error: %v", err\)\)'; then
+  ok "E1 the 'case err := <-served: slog.Error(\"API server error: ...\")' shape is intact"
 else
-  bad "E1 the original server-error handling around axum::serve is gone or no longer logs the same message"
+  bad "E1 the original server-error handling around srv.Serve is gone or no longer logs the same message"
 fi
 
-echo "§F  the watchdog is spawned as an independent task, not awaited inline"
+echo "§F  the watchdog is spawned as an independent goroutine, not slept inline"
 
-# F1 — 'tokio::spawn(async {' precedes the sleep/warn/exit body, so
-# shutdown_signal() itself returns immediately once spawned, letting axum's
-# drain begin in parallel with the watchdog's countdown. Awaiting the sleep
-# inline (no tokio::spawn) would delay the signal future from resolving at
-# all until the FULL bound elapsed, defeating graceful shutdown entirely.
-if [ -z "$SHUTDOWN_FN" ]; then
-  bad "F1 SKIPPED: could not bound shutdown_signal()"
-elif has "$SHUTDOWN_FLAT" 'tokio::spawn\(async \{[^}]*tokio::time::sleep\(GRACEFUL_SHUTDOWN_TIMEOUT\)\.await'; then
-  ok "F1 the watchdog's sleep+warn+exit body is tokio::spawn'd — shutdown_signal() returns immediately so axum's drain starts in parallel"
+# F1 — `go func() {` precedes the sleep/warn/exit body, so the signal arm
+# proceeds straight to srv.Shutdown() and the drain begins in parallel with
+# the watchdog's countdown. Sleeping inline would delay the drain from even
+# starting until the full bound elapsed.
+if [ -z "$SIG_ARM" ]; then
+  bad "F1 SKIPPED: could not find the signal arm"
+elif has "$SIG_FLAT" 'go func\(\) \{ time\.Sleep\(gracefulShutdownTimeout\)' \
+  && has "$SIG_FLAT" '\}\(\) if err := srv\.Shutdown\('; then
+  ok "F1 the watchdog's sleep+warn+exit body is a goroutine — srv.Shutdown()'s drain starts in parallel"
 else
-  bad "F1 the watchdog's sleep is not inside a tokio::spawn — shutdown_signal() may block on it directly, delaying the drain from ever starting"
+  bad "F1 the watchdog's sleep is not in its own goroutine ahead of srv.Shutdown() — the drain may be delayed from ever starting"
 fi
 
 echo

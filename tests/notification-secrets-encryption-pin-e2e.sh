@@ -7,131 +7,170 @@
 # `monitors.alert_slack_url`/`alert_discord_url` were plain columns, with zero
 # `secrets_crypto` reference anywhere in the files that wrote or read them.
 #
-#   §A  alerts.rs::upsert_rules ENCRYPTS all four notify_* fields (via
-#       encrypt_credential, the credential-shaped derivation — NOT the vault's
-#       encrypt/decrypt) before they ever reach SQL, on plaintext already
-#       validated by the SSRF check above it.
-#   §B  alerts.rs::get_rules DECRYPTS the same four fields (via
-#       decrypt_credential_or_legacy, the migration-safe fallback) before
-#       serializing the response — the same-account caller reading their own
-#       settings back is the expected case that function exists for.
-#   §C  notifications.rs::get_user_channels and uptime.rs::send_alerts — both
-#       take only a PgPool (no AppState/jwt_secret) — decrypt via
-#       decrypt_credential_from_env, matching that function's own documented
-#       use case.
-#   §D  monitors.rs's create/update ENCRYPT alert_slack_url/alert_discord_url;
+#   §A  rt_alerts.go::rtAlertsUpsertRules ENCRYPTS all four notify_* fields
+#       (via SecretsCryptoEncryptCredential, the credential-shaped derivation —
+#       NOT the vault's encrypt/decrypt) before they ever reach SQL, on
+#       plaintext already validated by the SSRF check above it.
+#   §B  rt_alerts.go::rtAlertsGetRules DECRYPTS the same four fields (via
+#       SecretsCryptoDecryptCredentialOrLegacy, the migration-safe fallback)
+#       before serializing the response — the same-account caller reading their
+#       own settings back is the expected case that function exists for.
+#   §C  svc_notifications.go::NotificationsGetUserChannels and
+#       svc_uptime.go::uptimeSendAlerts — both take only a pool (no
+#       AppState/jwt_secret) — decrypt via SecretsCryptoDecryptCredentialFromEnv,
+#       matching that function's own documented use case.
+#   §D  rt_monitors.go's create/update ENCRYPT alert_slack_url/alert_discord_url;
 #       list/create/update DECRYPT them back via the shared
-#       decrypt_monitor_alert_urls helper. create's "inherit from global
+#       rtMonitorsDecryptMonitorAlertURLs helper. create's "inherit from global
 #       alert_rules" fallback decrypts BEFORE the SSRF check runs on it.
-#   §E  credential_reencrypt.rs's self-enforcing registry carries all 6 new
-#       subjects in SIMPLE_SUBJECTS and pairs each writer module in
-#       COVERED_MODULES — `every_credential_writer_is_covered` and
-#       `subject_tokens_match_the_sweep` (both in that file's own test module)
+#   §E  svc_credential_reencrypt.go's self-enforcing registry carries all 6 new
+#       subjects in its simple-subjects table and pairs each writer module in
+#       its covered-modules table — TestEveryCredentialWriterIsCovered and
+#       TestSubjectTokensMatchTheSweep (svc_credential_reencrypt_test.go)
 #       assert this mechanically; §E here just pins the specific entries so a
-#       regression names which one went missing, not just "a Rust test failed".
+#       regression names which one went missing, not just "a Go test failed".
 #
 # Pure source analysis: no box, no network, no build.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-ALERTS=panel/backend/src/routes/alerts.rs
-MONITORS=panel/backend/src/routes/monitors.rs
-NOTIFICATIONS=panel/backend/src/services/notifications.rs
-UPTIME=panel/backend/src/services/uptime.rs
-REENCRYPT=panel/backend/src/services/credential_reencrypt.rs
+API=panel/go/internal/api
+ALERTS=$API/rt_alerts.go
+MONITORS=$API/rt_monitors.go
+NOTIFICATIONS=$API/svc_notifications.go
+UPTIME=$API/svc_uptime.go
+REENCRYPT=$API/svc_credential_reencrypt.go
+for f in "$ALERTS" "$MONITORS" "$NOTIFICATIONS" "$UPTIME" "$REENCRYPT"; do
+  [ -f "$f" ] || { echo "missing source file: $f"; exit 1; }
+done
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 has()  { grep -qE -- "$2" "$1" 2>/dev/null && ok "$3" || bad "$3"; }
 count() { grep -oE -- "$2" "$1" 2>/dev/null | wc -l | tr -d ' '; }
+# fnbody FILE FUNC — the body of a top-level Go func (or method) named FUNC,
+# with // line comments stripped, so prose that names a call cannot satisfy it.
+fnbody() {
+  awk -v fn="$2" '
+    !inside && (index($0, "func " fn "(") == 1 || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) { inside=1 }
+    inside { sub(/\/\/.*/, ""); print; if ($0 ~ /^}/) exit }
+  ' "$1"
+}
 
-echo "== §A  alerts.rs::upsert_rules encrypts all four notify_* fields =="
+echo "== §A  rt_alerts.go::rtAlertsUpsertRules encrypts all four notify_* fields =="
 
-N=$(count "$ALERTS" 'encrypt_credential\(s, jwt_secret\)')
+UPSERT=$(fnbody "$ALERTS" rtAlertsUpsertRules)
+[ -n "$UPSERT" ] || bad "A0 rtAlertsUpsertRules not found in $ALERTS"
+N=$(printf '%s\n' "$UPSERT" | grep -cE 'SecretsCryptoEncryptCredential\(\*v, st\.Config\.JWTSecret\)')
 if [ "$N" -ge 1 ]; then
-  ok "A1 upsert_rules calls encrypt_credential (shared closure, $N call site)"
+  ok "A1 rtAlertsUpsertRules calls SecretsCryptoEncryptCredential (shared closure, $N call site)"
 else
-  bad "A1 upsert_rules calls encrypt_credential"
+  bad "A1 rtAlertsUpsertRules calls SecretsCryptoEncryptCredential"
 fi
-has "$ALERTS" 'let enc_slack_url = encrypt_opt\(&body\.notify_slack_url\)\?' \
+uhas() { printf '%s\n' "$UPSERT" | grep >/dev/null -cE -- "$1" && ok "$2" || bad "$2"; }
+uhas 'encSlackURL := encryptOpt\(body\.NotifySlackURL\)' \
   "A2 notify_slack_url is routed through the encrypting closure"
-has "$ALERTS" 'let enc_discord_url = encrypt_opt\(&body\.notify_discord_url\)\?' \
+uhas 'encDiscordURL := encryptOpt\(body\.NotifyDiscordURL\)' \
   "A3 notify_discord_url is routed through the encrypting closure"
-has "$ALERTS" 'let enc_pagerduty_key = encrypt_opt\(&body\.notify_pagerduty_key\)\?' \
+uhas 'encPagerdutyKey := encryptOpt\(body\.NotifyPagerdutyKey\)' \
   "A4 notify_pagerduty_key is routed through the encrypting closure"
-has "$ALERTS" 'let enc_webhook_url = encrypt_opt\(&body\.notify_webhook_url\)\?' \
+uhas 'encWebhookURL := encryptOpt\(body\.NotifyWebhookURL\)' \
   "A5 notify_webhook_url is routed through the encrypting closure"
-has "$ALERTS" '\.bind\(&enc_slack_url\)' \
-  "A6 the SQL bind chain uses the ENCRYPTED local, not the raw body field"
+# The execSQL argument list ($1..$27), from `execSQL(ctx, st.DB, query,` to
+# the `); err != nil` that closes it.
+ARGS=$(printf '%s\n' "$UPSERT" | awk '/execSQL\(ctx, st\.DB, query,/{on=1} on{print} on && /\); err != nil/{exit}')
+if printf '%s\n' "$ARGS" | grep >/dev/null -cE 'encSlackURL, encDiscordURL, body\.CooldownMinutes, encPagerdutyKey, encWebhookURL'; then
+  ok "A6 the SQL argument list uses the ENCRYPTED locals, not the raw body fields"
+else
+  bad "A6 the SQL argument list uses the ENCRYPTED locals, not the raw body fields"
+fi
 # Negative control: the raw plaintext must not still be what gets bound.
-if grep -qE '\.bind\(&body\.notify_slack_url\)' "$ALERTS"; then
-  bad "A7 CONTROL: raw body.notify_slack_url is no longer bound directly (old plaintext bind removed)"
+# Positive anchor: the argument block was found (it carries body.CPUThreshold).
+if ! printf '%s\n' "$ARGS" | grep >/dev/null -c 'body\.CPUThreshold'; then
+  bad "A7 CONTROL: could not locate the execSQL argument list — the pattern is wrong, not the code"
+elif printf '%s\n' "$ARGS" | grep >/dev/null -cE 'body\.Notify(Slack|Discord|Webhook)URL|body\.NotifyPagerdutyKey'; then
+  bad "A7 CONTROL: a raw body.Notify* field is bound directly again (plaintext bind)"
 else
-  ok "A7 CONTROL: raw body.notify_slack_url is no longer bound directly"
+  ok "A7 CONTROL: no raw body.Notify* field is bound directly"
 fi
 
 echo
-echo "== §B  alerts.rs::get_rules decrypts all four before serializing =="
+echo "== §B  rt_alerts.go::rtAlertsGetRules decrypts all four before serializing =="
 
-N=$(count "$ALERTS" 'decrypt_credential_or_legacy')
-if [ "$N" -ge 4 ]; then
-  ok "B1 get_rules calls decrypt_credential_or_legacy at least 4 times ($N found)"
+GETR=$(fnbody "$ALERTS" rtAlertsGetRules)
+N=$(printf '%s\n' "$GETR" | grep -cE 'rules\[i\]\.Notify(SlackURL|DiscordURL|PagerdutyKey|WebhookURL) = dec\(rules\[i\]\.Notify')
+if [ "$N" -ge 4 ] && printf '%s\n' "$GETR" | grep >/dev/null -cE 'SecretsCryptoDecryptCredentialOrLegacy\(\*p, st\.Config\.JWTSecret\)'; then
+  ok "B1 rtAlertsGetRules decrypts all 4 fields via SecretsCryptoDecryptCredentialOrLegacy ($N in-place decrypts)"
 else
-  bad "B1 get_rules calls decrypt_credential_or_legacy at least 4 times (found $N)"
+  bad "B1 rtAlertsGetRules decrypts all 4 fields via SecretsCryptoDecryptCredentialOrLegacy (found $N in-place decrypts)"
 fi
-has "$ALERTS" 'r\.notify_slack_url = r\.notify_slack_url' "B2 notify_slack_url is decrypted in place"
-has "$ALERTS" 'r\.notify_pagerduty_key = r\.notify_pagerduty_key' "B3 notify_pagerduty_key is decrypted in place"
+printf '%s\n' "$GETR" | grep >/dev/null -cE 'rules\[i\]\.NotifySlackURL = dec\(rules\[i\]\.NotifySlackURL\)' \
+  && ok "B2 notify_slack_url is decrypted in place" || bad "B2 notify_slack_url is decrypted in place"
+printf '%s\n' "$GETR" | grep >/dev/null -cE 'rules\[i\]\.NotifyPagerdutyKey = dec\(rules\[i\]\.NotifyPagerdutyKey\)' \
+  && ok "B3 notify_pagerduty_key is decrypted in place" || bad "B3 notify_pagerduty_key is decrypted in place"
 
 echo
-echo "== §C  contexts with only a PgPool decrypt via decrypt_credential_from_env =="
+echo "== §C  contexts with only a pool decrypt via SecretsCryptoDecryptCredentialFromEnv =="
 
-has "$NOTIFICATIONS" 'decrypt_credential_from_env' \
-  "C1 notifications::get_user_channels decrypts via the AppState-free helper"
-N=$(count "$NOTIFICATIONS" 'decrypt_credential_from_env')
-if [ "$N" -ge 4 ]; then
-  ok "C2 get_user_channels decrypts all 4 fields ($N call sites)"
+CHAN=$(fnbody "$NOTIFICATIONS" NotificationsGetUserChannels)
+printf '%s\n' "$CHAN" | grep >/dev/null -cE 'SecretsCryptoDecryptCredentialFromEnv\(\*p\)' \
+  && ok "C1 NotificationsGetUserChannels decrypts via the AppState-free helper" \
+  || bad "C1 NotificationsGetUserChannels decrypts via the AppState-free helper"
+# notificationsRuleCols selects notify_email, slack, discord, pagerduty, webhook,
+# muted_types — so B..E are the four credential columns.
+N=$(printf '%s\n' "$CHAN" | grep -oE 'dec\(rule\.[BCDE]\)' | sort -u | wc -l | tr -d ' ')
+if [ "$N" -ge 4 ] && grep -qE 'notificationsRuleCols = "SELECT notify_email, notify_slack_url, notify_discord_url, notify_pagerduty_key, notify_webhook_url' "$NOTIFICATIONS"; then
+  ok "C2 NotificationsGetUserChannels decrypts all 4 fields ($N decrypted columns)"
 else
-  bad "C2 get_user_channels decrypts all 4 fields (found $N, want >=4)"
+  bad "C2 NotificationsGetUserChannels decrypts all 4 fields (found $N, want >=4, or the column order moved)"
 fi
-has "$UPTIME" 'decrypt_credential_from_env as decrypt_env' \
-  "C3 uptime::send_alerts imports the same AppState-free helper"
-N=$(count "$UPTIME" 'decrypt_env')
+SEND=$(fnbody "$UPTIME" uptimeSendAlerts)
+printf '%s\n' "$SEND" | grep >/dev/null -cE 'SecretsCryptoDecryptCredentialFromEnv\(\*p\)' \
+  && ok "C3 uptimeSendAlerts uses the same AppState-free helper" \
+  || bad "C3 uptimeSendAlerts uses the same AppState-free helper"
+N=0
+for f in 'SlackURL: dec\(m\.AlertSlackURL\)' 'DiscordURL: dec\(m\.AlertDiscordURL\)' 'PagerdutyKey: dec\(pdKey\)' 'WebhookURL: dec\(webhook\)'; do
+  printf '%s\n' "$SEND" | grep >/dev/null -cE "$f" && N=$((N+1))
+done
 if [ "$N" -ge 4 ]; then
-  ok "C4 send_alerts decrypts pagerduty/webhook/slack/discord ($N uses)"
+  ok "C4 uptimeSendAlerts decrypts pagerduty/webhook/slack/discord ($N uses)"
 else
-  bad "C4 send_alerts decrypts pagerduty/webhook/slack/discord (found $N, want >=4)"
+  bad "C4 uptimeSendAlerts decrypts pagerduty/webhook/slack/discord (found $N, want >=4)"
 fi
 
 echo
-echo "== §D  monitors.rs: encrypt on write, decrypt on every read =="
+echo "== §D  rt_monitors.go: encrypt on write, decrypt on every read =="
 
-has "$MONITORS" 'fn decrypt_monitor_alert_urls' \
+has "$MONITORS" '^func rtMonitorsDecryptMonitorAlertURLs\(' \
   "D1 a shared decrypt helper exists for Monitor's two alert-url fields"
-N=$(count "$MONITORS" 'decrypt_monitor_alert_urls\(')
+N=$(count "$MONITORS" 'rtMonitorsDecryptMonitorAlertURLs\(')
 if [ "$N" -ge 4 ]; then
   ok "D2 the helper is called from list/create/update (>=1 call each, $N total call sites incl. its own definition)"
 else
   bad "D2 the helper is called enough times (found $N call sites incl. definition, want >=4)"
 fi
-has "$MONITORS" 'let enc_slack_url = encrypt_opt\(&slack_url\)\?' \
-  "D3 create() encrypts before the INSERT"
-has "$MONITORS" 'let enc_slack_url = encrypt_opt\(&body\.alert_slack_url\)\?' \
-  "D4 update() encrypts before the UPDATE"
-has "$MONITORS" 'let global_slack = global_slack\.as_deref\(\)\.map' \
-  "D5 create()'s inherit-from-global fallback decrypts BEFORE the SSRF check runs on it"
+CREATE=$(fnbody "$MONITORS" rtMonitorsCreate)
+UPDATE=$(fnbody "$MONITORS" rtMonitorsUpdate)
+printf '%s\n' "$CREATE" | grep >/dev/null -cE 'encSlack, err := encryptOpt\(slackURL\)' \
+  && ok "D3 create() encrypts before the INSERT" || bad "D3 create() encrypts before the INSERT"
+printf '%s\n' "$UPDATE" | grep >/dev/null -cE 'encSlack, err := encryptOpt\(body\.AlertSlackURL\)' \
+  && ok "D4 update() encrypts before the UPDATE" || bad "D4 update() encrypts before the UPDATE"
+printf '%s\n' "$CREATE" | grep >/dev/null -cE 'slackURL = dec\(global\.A\)' \
+  && ok "D5 create()'s inherit-from-global fallback decrypts BEFORE the SSRF check runs on it" \
+  || bad "D5 create()'s inherit-from-global fallback decrypts BEFORE the SSRF check runs on it"
 # Ordering control: the decrypt of the inherited global value must appear
-# BEFORE the SSRF validate_url_not_internal call that consumes slack_url.
-DECRYPT_LINE=$(grep -n 'let global_slack = global_slack\.as_deref' "$MONITORS" | head -1 | cut -d: -f1)
-SSRF_LINE=$(grep -n 'Invalid Slack alert URL' "$MONITORS" | head -1 | cut -d: -f1)
+# BEFORE the SSRF validateURLNotInternal call that consumes slackURL.
+DECRYPT_LINE=$(printf '%s\n' "$CREATE" | grep -n 'slackURL = dec(global\.A)' | head -1 | cut -d: -f1)
+SSRF_LINE=$(printf '%s\n' "$CREATE" | grep -n 'Invalid Slack alert URL' | head -1 | cut -d: -f1)
 if [ -n "$DECRYPT_LINE" ] && [ -n "$SSRF_LINE" ] && [ "$DECRYPT_LINE" -lt "$SSRF_LINE" ]; then
-  ok "D6 the decrypt (line $DECRYPT_LINE) runs BEFORE the SSRF check (line $SSRF_LINE), not after"
+  ok "D6 the decrypt (body line $DECRYPT_LINE) runs BEFORE the SSRF check (body line $SSRF_LINE), not after"
 else
   bad "D6 decrypt-before-SSRF-check ordering (decrypt=$DECRYPT_LINE ssrf=$SSRF_LINE)"
 fi
 
 echo
-echo "== §E  credential_reencrypt.rs's registry carries all 6 new subjects =="
+echo "== §E  svc_credential_reencrypt.go's registry carries all 6 new subjects =="
 
 for subj in \
   '"alert_rules", "id", "notify_pagerduty_key"' \
@@ -141,10 +180,10 @@ for subj in \
   '"monitors", "id", "alert_slack_url"' \
   '"monitors", "id", "alert_discord_url"'; do
   esc=$(printf '%s' "$subj" | sed 's/[.[\*^$()+?{|]/\\&/g')
-  if grep -qE -- "\($esc\)" "$REENCRYPT"; then
-    ok "E1 SIMPLE_SUBJECTS contains ($subj)"
+  if grep -qE -- "\{$esc\}" "$REENCRYPT"; then
+    ok "E1 simple subjects contain {$subj}"
   else
-    bad "E1 SIMPLE_SUBJECTS contains ($subj)"
+    bad "E1 simple subjects contain {$subj}"
   fi
 done
 
@@ -156,10 +195,10 @@ for pair in \
   '"monitors", "monitors.alert_slack_url"' \
   '"monitors", "monitors.alert_discord_url"'; do
   esc=$(printf '%s' "$pair" | sed 's/[.[\*^$()+?{|]/\\&/g')
-  if grep -qE -- "\($esc\)" "$REENCRYPT"; then
-    ok "E2 COVERED_MODULES pairs ($pair)"
+  if grep -qE -- "\{$esc\}" "$REENCRYPT"; then
+    ok "E2 covered modules pair {$pair}"
   else
-    bad "E2 COVERED_MODULES pairs ($pair)"
+    bad "E2 covered modules pair {$pair}"
   fi
 done
 

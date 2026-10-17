@@ -2,7 +2,7 @@
 # Regression pins for s332 — a control must not report a state it never established,
 # and a lockout must have a way back that does not require the thing that broke.
 #
-#   R1  THE BOOTSTRAP DOOR LEFT ITS OWN ADMINISTRATOR UNVERIFIABLE. `auth::setup`
+#   R1  THE BOOTSTRAP DOOR LEFT ITS OWN ADMINISTRATOR UNVERIFIABLE. `auth::setup` (now rtAuthSetup)
 #       inserted only (email, password_hash, role), so the first administrator of
 #       every install landed `email_verified = FALSE` with `email_token = NULL`.
 #       `login` refuses an unverified account whenever `smtp_host` is merely
@@ -33,7 +33,9 @@
 # purpose: they assert I removed the INERT allowlist rather than the enforcing one,
 # and that the verification gate itself was not weakened to "fix" the lockout.
 #
-# Pure source analysis: no box, no network, no build.
+# Pure source analysis: no box, no network, no build. Subjects are the shipped Go
+# API (panel/go/internal/api) and agent (panel/go/internal/agent); the Rust tree
+# this suite was written against is no longer built.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # s338 — WHAT THIS SUITE MEASURED, AND WHAT IT ONLY APPEARED TO
@@ -100,7 +102,7 @@ bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 # NEGATIVE arm (match ⇒ bad) silently green, which is the direction that ships.
 comment_marker_for() {
   case "$1" in
-    *.rs|*.mjs|*.js|*.ts|*.tsx)                echo '//' ;;
+    *.go|*.mjs|*.js|*.ts|*.tsx)                echo '//' ;;
     *.sql)                                     echo '--' ;;  # SQL line comment
     *.json|*.md)                               echo ''   ;;  # no comment syntax; `#` is a heading
     *)                                         echo '#'  ;;  # .sh, .service, .gitignore, .toml
@@ -127,16 +129,19 @@ code_lines() {
     #
     # A trailing `//` is stripped, but only when the text before it has BALANCED
     # double quotes — otherwise `let u = "https://host"` would lose its tail.
-    # Backslash escapes are skipped so `\"` does not flip the parity.
+    # Backslash escapes are skipped so `\"` does not flip the parity, and a Go
+    # backtick raw string (on one line) is opaque, so a `//` inside it survives.
     awk '
       /^[[:space:]]*\/\*/ &&  /\*\/[[:space:]]*$/ { print ""; next }
       /^[[:space:]]*\/\*/                         { inblk = 1; print ""; next }
       inblk { if ($0 ~ /\*\/[[:space:]]*$/) inblk = 0; print ""; next }
       /^[[:space:]]*\/\//                         { print ""; next }
       {
-        line = $0; out = line; n = length(line); q = 0; i = 1
+        line = $0; out = line; n = length(line); q = 0; bq = 0; i = 1
         while (i <= n) {
           c = substr(line, i, 1)
+          if (c == "`" && q == 0) { bq = 1 - bq; i++; continue }
+          if (bq == 1) { i++; continue }
           if (c == "\\") { i += 2; continue }
           if (c == "\"") { q = 1 - q; i++; continue }
           if (q == 0 && c == "/" && substr(line, i + 1, 1) == "/") { out = substr(line, 1, i - 1); break }
@@ -177,27 +182,28 @@ code_lineno() { local f="$1"; shift; code_lines "$f" | grep -n "$@" 2>/dev/null 
 # a future arm cannot reach raw source by accident and look like these three.
 raw_count() { local f="$1"; shift; grep -c "$@" "$f" 2>/dev/null || true; }
 
-BE=panel/backend/src
-AG=panel/agent/src
+BE=panel/go/internal/api
+AG=panel/go/internal/agent
 FE=panel/frontend/src
+MIGDIR=panel/go/internal/api/migrations
 
 # Read RAW on purpose, everywhere it appears below: this is a markdown document,
 # every heading in it begins with the shell comment marker, and a stripper aimed
 # at it would blank the prose these arms exist to measure.
 GUIDE=docs/guides/security-hardening.md
 
-for d in "$BE" "$AG" "$FE" panel/backend/migrations docs; do
+for d in "$BE" "$AG" "$FE" "$MIGDIR" docs; do
   [ -d "$d" ] || { echo "missing dir: $d — refusing to report a clean sweep"; exit 1; }
 done
 
 # Fail at the door rather than through an empty stream. code_lines returns
 # nothing for a file that is not there, and "nothing" reads exactly like "no
 # match" at every call site.
-for f in "$BE/routes/auth.rs" "$BE/routes/oauth.rs" "$BE/routes/passkeys.rs" \
-         "$BE/routes/mod.rs" "$BE/routes/security.rs" "$BE/routes/users.rs" \
-         "$BE/routes/reseller_dashboard.rs" "$BE/routes/whmcs.rs" \
-         "$BE/services/activity.rs" "$BE/services/auto_healer.rs" \
-         "$AG/routes/security.rs" "$GUIDE"; do
+for f in "$BE/rt_auth.go" "$BE/rt_oauth.go" "$BE/rt_passkeys.go" \
+         "$BE/rt_security.go" "$BE/rt_users.go" \
+         "$BE/rt_reseller_dashboard.go" "$BE/rt_whmcs.go" \
+         "$BE/svc_auto_healer.go" \
+         "$AG/routes/security.go" "$GUIDE"; do
   [ -f "$f" ] || { echo "missing file: $f — refusing to report a clean sweep"; exit 1; }
 done
 
@@ -209,10 +215,11 @@ done
 # slice boundary lands exactly where it did before — while a commented-out block
 # stops being findable inside the slice, which is the whole point.
 
-# Slice a Rust fn body by brace balance, from `fn <name>` to its matching close.
+# Slice a Go func body by brace balance, from `func <name>(` (or a method
+# `func (x *T) <name>(`) to its matching close.
 fn_body() {
   code_lines "$1" | perl -0777 -ne '
-    if (/\bfn\s+'"$2"'\b/g) {
+    if (/^func\s+(?:\([^)]*\)\s*)?'"$2"'\(/mg) {
       my $s = pos($_); my $i = index($_, "{", $s); my $d = 0;
       for (my $j = $i; $j < length($_); $j++) {
         my $c = substr($_, $j, 1);
@@ -244,7 +251,7 @@ inserts_in() {
 # exactly what this stream no longer contains — so the anchor is the code.
 retention_window() {
   code_lines "$1" | perl -0777 -ne '
-    if (/audit_dir = "\/var\/lib\/dockpanel\/audit"/g) {
+    if (/auditDir := "\/var\/lib\/dockpanel\/audit"/g) {
       my $s = pos($_); my $i = index($_, "{", $s); my $d = 0;
       for (my $j = $i; $j < length($_); $j++) {
         my $c = substr($_, $j, 1);
@@ -256,7 +263,7 @@ retention_window() {
 
 echo "── §A #100: the bootstrap door verifies the administrator it creates ──"
 
-SETUP_BODY=$(fn_body "$BE/routes/auth.rs" setup)
+SETUP_BODY=$(fn_body "$BE/rt_auth.go" rtAuthSetup)
 if [ -z "$SETUP_BODY" ]; then
   bad "could not slice auth::setup — the extractor found nothing, so every §A arm below would pass vacuously"
 else
@@ -290,7 +297,7 @@ fi
 # commentary spells the predicate. Counted in CODE, so the explanation cannot
 # stand in for the statement.
 MIG=""
-for m in panel/backend/migrations/*.sql; do
+for m in "$MIGDIR"/*.sql; do
   [ "$(code_count "$m" -F -e 'email_token IS NULL')" -gt 0 ] || continue
   [ "$(code_count "$m" -F -e 'email_verified')" -gt 0 ]     || continue
   MIG="$m"; break
@@ -309,15 +316,15 @@ fi
 # entirely real and unrelated route in the same file also carries, so that half of
 # the AND could not go red whatever happened to the admin route — the arm was one
 # assertion wearing two.
-if [ "$(code_count "$BE/routes/mod.rs" -F -e 'security::verify_user_email')" -gt 0 ] \
-   && [ "$(code_count "$BE/routes/security.rs" -E -e 'fn verify_user_email')" -gt 0 ]; then
+if [ "$(code_count "$BE/rt_security.go" -F -e 'h(rtSecurityVerifyUserEmail)')" -gt 0 ] \
+   && [ "$(code_count "$BE/rt_security.go" -E -e '^func rtSecurityVerifyUserEmail\(')" -gt 0 ]; then
   ok "A4 an admin-side writer for email_verified exists, routed and implemented"
 else
   bad "A4 no administrator can mark an address verified — the only exits from the lockout need the mail that is broken"
 fi
 
 # A5. The listing must tell the operator WHICH accounts are beyond self-rescue.
-UNV=$(fn_body "$BE/routes/security.rs" unverified_users)
+UNV=$(fn_body "$BE/rt_security.go" rtSecurityUnverifiedUsers)
 if [ -n "$UNV" ] && [ "$(printf '%s' "$UNV" | grep -c 'email_token IS NOT NULL')" -gt 0 ]; then
   ok "A5 the unverified listing discriminates accounts that hold no token from those with a live link"
 else
@@ -336,8 +343,9 @@ fi
 
 # A7 — CONTROL, green at BOTH tags. Fixing the lockout must not have removed the
 # gate. If this ever goes red the 'fix' deleted a security check.
-LOGIN=$(fn_body "$BE/routes/auth.rs" login)
-if [ -n "$LOGIN" ] && [ "$(printf '%s' "$LOGIN" | grep -c 'email_verified')" -gt 0 ]; then
+LOGIN=$(fn_body "$BE/rt_auth.go" rtAuthLogin)
+# Go reads the column through the User struct, so the gate is `!user.EmailVerified`.
+if [ -n "$LOGIN" ] && [ "$(printf '%s' "$LOGIN" | grep -c '!user.EmailVerified')" -gt 0 ]; then
   ok "A7 CONTROL login still refuses an unverified account — the gate was repaired, not removed"
 else
   bad "A7 CONTROL login no longer consults email_verified — the lockout was 'fixed' by deleting the check"
@@ -354,7 +362,7 @@ echo "── §B the inert panel-whitelist chain is gone ──"
 # not a shortcut: code is a subset of raw, so the raw pass can only ever be a
 # superset, and it keeps this off a full walk of the frontend tree.
 
-CHAIN_CANDS=$(grep -rl 'panel-whitelist' panel/ --include='*.rs' --include='*.tsx' --include='*.ts' 2>/dev/null \
+CHAIN_CANDS=$(grep -rl 'panel-whitelist' panel/ --include='*.go' --include='*.tsx' --include='*.ts' 2>/dev/null \
               | grep -v '/dist/' | grep -v node_modules || true)
 chain=0
 for f in $CHAIN_CANDS; do
@@ -366,7 +374,7 @@ else
   bad "B1 $chain shipped source file(s) still reference panel-whitelist — a control that writes a file nothing reads"
 fi
 
-CONF_CANDS=$(grep -rl 'panel-whitelist\.conf' panel/ scripts/ --include='*.rs' --include='*.sh' --include='*.tsx' 2>/dev/null \
+CONF_CANDS=$(grep -rl 'panel-whitelist\.conf' panel/ scripts/ --include='*.go' --include='*.sh' --include='*.tsx' 2>/dev/null \
              | grep -v '/dist/' || true)
 conf=0
 for f in $CONF_CANDS; do
@@ -386,8 +394,9 @@ fi
 # reading 6 and green, because the declaration is the sixth reference and five
 # comments made up the rest — the arm was measuring text, not wiring.
 doors=0
-for f in "$BE"/routes/*.rs; do
-  doors=$(( doors + $(code_count "$f" -F -e 'enforce_panel_ip_allowlist') ))
+for f in "$BE"/rt_*.go; do
+  case "$f" in *_test.go) continue ;; esac
+  doors=$(( doors + $(code_count "$f" -F -e 'rtAuthEnforcePanelIPAllowlist(') ))
 done
 if [ "$doors" -ge 6 ]; then
   ok "B3 CONTROL the enforcing IP allowlist is still wired at $doors sites (helper + every minting door)"
@@ -397,9 +406,9 @@ fi
 
 echo "── §C the canary reports whether it is actually armed ──"
 
-CAN=$(fn_body "$BE/services/auto_healer.rs" security_check_canary_files)
+CAN=$(fn_body "$BE/svc_auto_healer.go" autoHealerSecurityCheckCanaryFiles)
 if [ -z "$CAN" ]; then
-  bad "C0 could not slice security_check_canary_files — §C would pass vacuously"
+  bad "C0 could not slice autoHealerSecurityCheckCanaryFiles — §C would pass vacuously"
 else
   # C1. Absent and unreadable are different facts. They used to share one silent
   # `continue`, which is how a tripwire under ProtectHome=yes reads as all-clear.
@@ -410,19 +419,19 @@ else
   # (lesson #555): a helper that draws the distinction perfectly is worth nothing
   # if the sweeper stopped calling it. C1a checks the distinction where it now
   # lives; C1b checks that this function still REACHES it.
-  CLASSIFY=$(fn_body "$BE/services/auto_healer.rs" classify_canary)
+  CLASSIFY=$(fn_body "$BE/svc_auto_healer.go" AutoHealerClassifyCanary)
   if [ -z "$CLASSIFY" ]; then
-    bad "C1a could not slice classify_canary — the three-way canary decision has no measurable home"
-  elif [ "$(printf '%s' "$CLASSIFY" | grep -c 'ErrorKind::NotFound')" -gt 0 ]; then
+    bad "C1a could not slice AutoHealerClassifyCanary — the three-way canary decision has no measurable home"
+  elif [ "$(printf '%s' "$CLASSIFY" | grep -c 'fs.ErrNotExist')" -gt 0 ]; then
     ok "C1a the canary classifier distinguishes a canary that was never created from one it cannot read"
   else
     bad "C1a the canary classifier treats unreadable exactly like absent — a blind spot reported as all-clear"
   fi
 
-  if [ "$(printf '%s' "$CAN" | grep -c 'classify_canary(')" -gt 0 ]; then
-    ok "C1b the two-minute sweeper still routes every path through classify_canary"
+  if [ "$(printf '%s' "$CAN" | grep -c 'AutoHealerClassifyCanary(')" -gt 0 ]; then
+    ok "C1b the two-minute sweeper still routes every path through AutoHealerClassifyCanary"
   else
-    bad "C1b the sweeper no longer calls classify_canary — it is classifying paths on its own again, and C1a is measuring dead code"
+    bad "C1b the sweeper no longer calls AutoHealerClassifyCanary — it is classifying paths on its own again, and C1a is measuring dead code"
   fi
 
   # C2. And it must say when nothing at all is being watched. Scoped to the
@@ -448,12 +457,12 @@ echo "── §D s333: the OTHER doors that create an account, and the doors tha
 # member and test it).
 #
 # The enumeration reads CODE. §D searches for a SQL statement by its text, and prose
-# that merely NARRATES the statement is not a statement — there is a doc comment in
-# services/activity.rs that spells the statement while describing it, and counting
-# that as a door would fail this suite on a file that has no door in it. §F11 pins
-# that exact file as the live proof the stripper is doing it.
+# that merely NARRATES the statement is not a statement — the Rust tree had a doc
+# comment that spelled the statement while describing it, and counting that as a
+# door would fail this suite on a file that has no door in it. §F11 pins a live
+# prose-only mention in the Go tree as proof the stripper is doing it.
 
-INSERTS=$(for f in $(grep -rl 'INSERT INTO users' "$BE" --include=*.rs 2>/dev/null); do   # RAW-ENUM-OK: discovery, not an assertion; each hit is re-read through inserts_in
+INSERTS=$(for f in $(grep -rl 'INSERT INTO users' "$BE" --include='*.go' --exclude='*_test.go' 2>/dev/null); do   # RAW-ENUM-OK: discovery, not an assertion; each hit is re-read through inserts_in
   inserts_in "$f"
 done)
 n_ins=$(printf '%s' "$INSERTS" | grep -c . || true)
@@ -487,7 +496,7 @@ fi
 # verified: the self-service registration door is SUPPOSED to leave the account
 # unverified, and it earns that by issuing a token. If this ever goes red alongside a
 # green D1, someone "fixed" D1 by deleting the verification ceremony.
-REG_BODY=$(fn_body "$BE/routes/auth.rs" register)
+REG_BODY=$(fn_body "$BE/rt_auth.go" rtAuthRegisterUser)
 reg_ins=$(printf '%s' "$REG_BODY" | perl -0777 -ne 'print $1 if /(INSERT INTO users[^"]*)/s')
 if [ -n "$reg_ins" ] && [ "$(printf '%s' "$reg_ins" | grep -c 'email_token')" -gt 0 ]; then
   ok "D5 (control) self-service registration still issues a verification token rather than self-approving"
@@ -506,7 +515,7 @@ fi
 # Commenting the seven lines of the OAuth gate out left this arm green: brace balance
 # is preserved by commenting, so the slice was identical and the gate's own SQL was
 # found in the prose. The slice now comes off the blanked stream, where it is not.
-for door in "routes/auth.rs:login" "routes/passkeys.rs:auth_complete" "routes/oauth.rs:callback"; do
+for door in "rt_auth.go:rtAuthLogin" "rt_passkeys.go:rtPasskeysAuthComplete" "rt_oauth.go:rtOauthCallback"; do
   df=${door%%:*}; dn=${door##*:}
   BODY=$(fn_body "$BE/$df" "$dn")
   if [ -z "$BODY" ]; then
@@ -527,9 +536,9 @@ for door in "routes/auth.rs:login" "routes/passkeys.rs:auth_complete" "routes/oa
   fi
 done
 
-OAUTH_CB=$(fn_body "$BE/routes/oauth.rs" callback)
+OAUTH_CB=$(fn_body "$BE/rt_oauth.go" rtOauthCallback)
 if [ -z "$OAUTH_CB" ]; then
-  bad "D4 could not slice oauth::callback"
+  bad "D4 could not slice rtOauthCallback"
 elif [ "$(printf '%s' "$OAUTH_CB" | grep -c 'security_approval_required')" -gt 0 ]; then
   ok "D4 an OAuth signup honours Registration Approval Mode instead of admitting itself"
 else
@@ -549,7 +558,7 @@ echo "── §E s333: the audit log claims only what it enforces ──"
 # NEGATIVE, and counted in CODE: a tombstone comment naming the route is not a mount,
 # and an over-strip would report the mount gone while it was still there. §H plants it.
 NEEDLE="/security/$(printf 'init')"
-if [ "$(code_count "$AG/routes/security.rs" -F -e "$NEEDLE")" -eq 0 ]; then
+if [ "$(code_count "$AG/routes/security.go" -F -e "$NEEDLE")" -eq 0 ]; then
   ok "E1 the uncalled security-hardening initialiser is gone from the agent's shipped routes"
 else
   bad "E1 the agent still mounts the one-shot initialiser whose only unique action mis-places the append-only attribute"
@@ -562,9 +571,9 @@ fi
 # The block used to be sliced on the heading comment above it, which is the one thing
 # a comment-stripped stream cannot contain. It is anchored on the directory constant
 # now — code, and the only code in the function that names this directory.
-RET=$(retention_window "$BE/services/auto_healer.rs")
-if [ -n "$RET" ] && [ "$(printf '%s' "$RET" | grep -c 'let _ = std::fs::remove_file')" -eq 0 ] \
-   && [ "$(printf '%s' "$RET" | grep -c 'audit_failed')" -gt 0 ]; then
+RET=$(retention_window "$BE/svc_auto_healer.go")
+if [ -n "$RET" ] && [ "$(printf '%s' "$RET" | grep -cE '_ = os\.Remove(All)?\(')" -eq 0 ] \
+   && [ "$(printf '%s' "$RET" | grep -c 'auditFailed')" -gt 0 ]; then
   ok "E2 the audit retention sweep reports a delete it could not perform instead of discarding it"
 else
   bad "E2 the audit retention sweep discards its delete result — under an append-only directory it fails forever and says nothing"
@@ -599,16 +608,17 @@ run_the TOKENWORD --now
 echo "a literal hash # inside a string keeps TOKENSTR"
 FIX
 
-cat > "$FIXDIR/f.rs" <<'FIX'
+cat > "$FIXDIR/f.go" <<'FIX'
 // TOKENWORD in a line comment
 /*
  * TOKENWORD in a block comment
  */
-let live = call(TOKENWORD);
-let trail = other(); // TOKENWORD trailing
-let url = "https://example.invalid/TOKENURL";
-let glob = "COPY /app/target/release/*";
-let after_glob = keep(TOKENAFTER);
+live := call(TOKENWORD)
+trail := other() // TOKENWORD trailing
+url := "https://example.invalid/TOKENURL"
+raw := `https://example.invalid/TOKENRAW`
+glob := "COPY /app/target/release/*"
+afterGlob := keep(TOKENAFTER)
 FIX
 
 cat > "$FIXDIR/f.sql" <<'FIX'
@@ -636,25 +646,31 @@ else
   bad "F2 shell: the stripper ate a '#' inside a string — a negative arm would now pass on broken code"
 fi
 
-if [ "$(code_count "$FIXDIR/f.rs" -F -e 'TOKENWORD')" -eq 1 ]; then
-  ok "F3 rust: '//' line, '/* */' block and trailing '//' all blanked (1 code hit of 4)"
+if [ "$(code_count "$FIXDIR/f.go" -F -e 'TOKENWORD')" -eq 1 ]; then
+  ok "F3 go: '//' line, '/* */' block and trailing '//' all blanked (1 code hit of 4)"
 else
-  bad "F3 rust: expected exactly 1 code hit for TOKENWORD, got $(code_count "$FIXDIR/f.rs" -F -e 'TOKENWORD')"
+  bad "F3 go: expected exactly 1 code hit for TOKENWORD, got $(code_count "$FIXDIR/f.go" -F -e 'TOKENWORD')"
 fi
 
-if [ "$(code_count "$FIXDIR/f.rs" -F -e 'TOKENURL')" -eq 1 ]; then
-  ok "F4 rust: '//' inside a quoted string survives — a URL is not a comment"
+if [ "$(code_count "$FIXDIR/f.go" -F -e 'TOKENURL')" -eq 1 ]; then
+  ok "F4 go: '//' inside a quoted string survives — a URL is not a comment"
 else
-  bad "F4 rust: the stripper cut a line at the '//' of a URL inside a string literal"
+  bad "F4 go: the stripper cut a line at the '//' of a URL inside a string literal"
+fi
+
+if [ "$(code_count "$FIXDIR/f.go" -F -e 'TOKENRAW')" -eq 1 ]; then
+  ok "F4b go: '//' inside a backtick raw string survives"
+else
+  bad "F4b go: the stripper cut a line at the '//' inside a backtick raw string"
 fi
 
 # s294: a `/*` inside a string literal opened a block comment that ran to the next
 # `*/` and deleted 485 lines of git_build.rs. The guard is that a block is recognised
 # only where one is WRITTEN — opening at line start.
-if [ "$(code_count "$FIXDIR/f.rs" -F -e 'TOKENAFTER')" -eq 1 ]; then
-  ok "F5 rust: a '/*' inside a string literal does not open a block (the s294 guard holds)"
+if [ "$(code_count "$FIXDIR/f.go" -F -e 'TOKENAFTER')" -eq 1 ]; then
+  ok "F5 go: a '/*' inside a string literal does not open a block (the s294 guard holds)"
 else
-  bad "F5 rust: a string containing '/*' swallowed the code after it — the s294 stripper defect is back"
+  bad "F5 go: a string containing '/*' swallowed the code after it — the s294 stripper defect is back"
 fi
 
 if [ "$(code_count "$FIXDIR/f.json" -F -e 'TOKENWORD')" -eq 1 ]; then
@@ -690,11 +706,11 @@ fi
 # Blanking, not deleting. §I reads a line number out of this stream and the two body
 # slicers depend on the height and brace balance of the original being preserved.
 LINEDRIFT=""
-for f in "$BE/routes/auth.rs" "$BE/routes/oauth.rs" "$BE/routes/passkeys.rs" \
-         "$BE/routes/mod.rs" "$BE/routes/security.rs" "$BE/routes/users.rs" \
-         "$BE/routes/reseller_dashboard.rs" "$BE/routes/whmcs.rs" \
-         "$BE/services/activity.rs" "$BE/services/auto_healer.rs" \
-         "$AG/routes/security.rs" "$GUIDE" tests/access-recovery-pin-e2e.sh; do
+for f in "$BE/rt_auth.go" "$BE/rt_oauth.go" "$BE/rt_passkeys.go" \
+         "$BE/rt_security.go" "$BE/rt_users.go" \
+         "$BE/rt_reseller_dashboard.go" "$BE/rt_whmcs.go" \
+         "$BE/svc_auto_healer.go" \
+         "$AG/routes/security.go" "$GUIDE" tests/access-recovery-pin-e2e.sh; do
   a=$(wc -l < "$f"); b=$(code_lines "$f" | wc -l)
   [ "$a" != "$b" ] && LINEDRIFT="$LINEDRIFT $f($a≠$b)"
 done
@@ -704,15 +720,17 @@ else
   bad "F10 code_lines changed the line count of:$LINEDRIFT — the body slicers and the §I ordering check are measuring the wrong lines"
 fi
 
-# The live proof, in the repository rather than in a fixture. services/activity.rs
-# NARRATES the statement §D enumerates and contains no such statement. Raw, it is a
-# seventh door; stripped, it is what it is.
-act_raw=$(raw_count "$BE/services/activity.rs" -F -e 'INSERT INTO users')
-act_code=$(code_count "$BE/services/activity.rs" -F -e 'INSERT INTO users')
+# The live proof, in the repository rather than in a fixture. rt_users.go NARRATES
+# email_token — one of the two columns D1 accepts as "this door lets the account
+# verify" — and never writes it. Raw, its door would look like it issues a token;
+# stripped, it is what it is. (The Rust tree's subject, a doc comment in
+# services/activity.rs spelling the INSERT itself, did not survive the Go port.)
+act_raw=$(raw_count "$BE/rt_users.go" -F -e 'email_token')
+act_code=$(code_count "$BE/rt_users.go" -F -e 'email_token')
 if [ "$act_raw" -gt 0 ] && [ "$act_code" -eq 0 ]; then
-  ok "F11 services/activity.rs spells the enumerated statement $act_raw time(s) in prose and 0 in code — the stripper is doing this on the real tree, not only on fixtures"
+  ok "F11 rt_users.go spells email_token $act_raw time(s) in prose and 0 in code — the stripper is doing this on the real tree, not only on fixtures"
 else
-  bad "F11 activity.rs raw=$act_raw code=$act_code — either the prose mention is gone (retire this arm deliberately) or the stripper is not reaching it and §D is counting a comment as a door"
+  bad "F11 rt_users.go raw=$act_raw code=$act_code — either the prose mention is gone (retire this arm deliberately) or the stripper is not reaching it and §D could read a comment as a token"
 fi
 
 echo ""
@@ -726,32 +744,34 @@ echo "── §G every pinned pattern is live CODE, and a comment cannot satisfy
 # test bug rather than the defect it is), then turn each matching code line into a
 # comment in a throwaway copy and assert the count falls to zero. If it does not, some
 # arm above is still reading the file raw.
-MIG_PIN=${MIG:-panel/backend/migrations/__A3_found_no_migration__.sql}
+MIG_PIN=${MIG:-$MIGDIR/__A3_found_no_migration__.sql}
 
 PINNED=(
-  "$BE/routes/auth.rs|-F|INSERT INTO users"
-  "$BE/routes/auth.rs|-F|email_verified"
-  "$BE/routes/auth.rs|-F|email_token"
-  "$BE/routes/auth.rs|-F|enforce_panel_ip_allowlist"
-  "$BE/routes/auth.rs|-F|COALESCE(approved"
-  "$BE/routes/auth.rs|-F|\"suspended\""
-  "$BE/routes/passkeys.rs|-F|enforce_panel_ip_allowlist"
-  "$BE/routes/passkeys.rs|-F|COALESCE(approved"
-  "$BE/routes/passkeys.rs|-F|\"suspended\""
-  "$BE/routes/oauth.rs|-F|enforce_panel_ip_allowlist"
-  "$BE/routes/oauth.rs|-F|COALESCE(approved"
-  "$BE/routes/oauth.rs|-F|\"suspended\""
-  "$BE/routes/oauth.rs|-F|security_approval_required"
-  "$BE/routes/mod.rs|-F|security::verify_user_email"
-  "$BE/routes/security.rs|-E|fn verify_user_email"
-  "$BE/routes/security.rs|-F|email_token IS NOT NULL"
-  "$BE/services/auto_healer.rs|-F|ErrorKind::NotFound"
-  "$BE/services/auto_healer.rs|-F|NOT ARMED"
-  "$BE/services/auto_healer.rs|-F|audit_failed"
-  "$BE/services/auto_healer.rs|-F|audit_dir = \"/var/lib/dockpanel/audit\""
-  "$BE/routes/users.rs|-F|INSERT INTO users"
-  "$BE/routes/reseller_dashboard.rs|-F|INSERT INTO users"
-  "$BE/routes/whmcs.rs|-F|INSERT INTO users"
+  "$BE/rt_auth.go|-F|INSERT INTO users"
+  "$BE/rt_auth.go|-F|email_verified"
+  "$BE/rt_auth.go|-F|email_token"
+  "$BE/rt_auth.go|-F|!user.EmailVerified"
+  "$BE/rt_auth.go|-F|rtAuthEnforcePanelIPAllowlist("
+  "$BE/rt_auth.go|-F|COALESCE(approved"
+  "$BE/rt_auth.go|-F|\"suspended\""
+  "$BE/rt_passkeys.go|-F|rtAuthEnforcePanelIPAllowlist("
+  "$BE/rt_passkeys.go|-F|COALESCE(approved"
+  "$BE/rt_passkeys.go|-F|\"suspended\""
+  "$BE/rt_oauth.go|-F|rtAuthEnforcePanelIPAllowlist("
+  "$BE/rt_oauth.go|-F|COALESCE(approved"
+  "$BE/rt_oauth.go|-F|\"suspended\""
+  "$BE/rt_oauth.go|-F|security_approval_required"
+  "$BE/rt_security.go|-F|h(rtSecurityVerifyUserEmail)"
+  "$BE/rt_security.go|-E|^func rtSecurityVerifyUserEmail\\("
+  "$BE/rt_security.go|-F|email_token IS NOT NULL"
+  "$BE/svc_auto_healer.go|-F|fs.ErrNotExist"
+  "$BE/svc_auto_healer.go|-F|AutoHealerClassifyCanary("
+  "$BE/svc_auto_healer.go|-F|NOT ARMED"
+  "$BE/svc_auto_healer.go|-F|auditFailed"
+  "$BE/svc_auto_healer.go|-F|auditDir := \"/var/lib/dockpanel/audit\""
+  "$BE/rt_users.go|-F|INSERT INTO users"
+  "$BE/rt_reseller_dashboard.go|-F|INSERT INTO users"
+  "$BE/rt_whmcs.go|-F|INSERT INTO users"
   "$MIG_PIN|-F|email_token IS NULL"
   "$MIG_PIN|-F|email_verified"
 )
@@ -821,25 +841,25 @@ echo "── §H the six NEGATIVE arms still fire on a real defect (s338) ──
 # a control cannot pass down a path the arm does not use.
 
 # H1 — B1. A live reference to the inert chain, in code.
-cat > "$FIXDIR/wl.rs" <<'FIX'
+cat > "$FIXDIR/wl.go" <<'FIX'
 // a tombstone naming panel-whitelist must NOT count as a reference
-pub async fn save_panel_whitelist() -> Json<Value> {
-    let path = build_route("/api/security/panel-whitelist");
-    Json(json!({ "ok": true, "path": path }))
+func rtSecuritySavePanelWhitelist(st *AppState, w http.ResponseWriter, r *http.Request) error {
+	path := buildRoute("/api/security/panel-whitelist")
+	return writeJSON(w, map[string]any{"ok": true, "path": path})
 }
 FIX
-if [ "$(chain_refs "$FIXDIR/wl.rs")" -gt 0 ]; then
+if [ "$(chain_refs "$FIXDIR/wl.go")" -gt 0 ]; then
   ok "H1 B1's chain scan still fires when the panel-whitelist endpoint is really in code"
 else
   bad "H1 B1's chain scan no longer sees a real panel-whitelist reference — the stripper is eating code and B1 is green on a live inert control"
 fi
 
 # H2 — B2. A live writer of the file nothing consumed.
-cat > "$FIXDIR/wlconf.rs" <<'FIX'
+cat > "$FIXDIR/wlconf.go" <<'FIX'
 // the tombstone may name panel-whitelist.conf; the writer below is the defect
-std::fs::write("/etc/dockpanel/panel-whitelist.conf", body)?;
+err := os.WriteFile("/etc/dockpanel/panel-whitelist.conf", body, 0o644)
 FIX
-if [ "$(conf_refs "$FIXDIR/wlconf.rs")" -gt 0 ]; then
+if [ "$(conf_refs "$FIXDIR/wlconf.go")" -gt 0 ]; then
   ok "H2 B2's file scan still fires when panel-whitelist.conf is really written in code"
 else
   bad "H2 B2's file scan no longer sees a real write of panel-whitelist.conf — B2 is green on a live writer"
@@ -848,9 +868,9 @@ fi
 # H3 — E1. The one-shot initialiser mounted again. The route literal is assembled from
 # the same runtime pieces the arm uses, so it is not spelled in this file either — the
 # prohibition that turned E1 red on a correct fix at s340 applies to the test too.
-cp "$AG/routes/security.rs" "$FIXDIR/agentsec.rs"
-printf '        .route("%s", post(harden_init))\n' "$NEEDLE" >> "$FIXDIR/agentsec.rs"
-if [ "$(code_count "$FIXDIR/agentsec.rs" -F -e "$NEEDLE")" -gt 0 ]; then
+cp "$AG/routes/security.go" "$FIXDIR/agentsec.go"
+printf '\tr.Handle("POST %s", securityHardenInit)\n' "$NEEDLE" >> "$FIXDIR/agentsec.go"
+if [ "$(code_count "$FIXDIR/agentsec.go" -F -e "$NEEDLE")" -gt 0 ]; then
   ok "H3 E1's absence arm still fires when the one-shot initialiser is really mounted in code"
 else
   bad "H3 E1's absence arm no longer sees a real mount of the initialiser — E1 is green on an agent that still mounts it"
@@ -858,20 +878,20 @@ fi
 
 # H4 — E2. The retention sweep with its delete result discarded again, sliced by the
 # same window function the arm uses.
-cat > "$FIXDIR/ret.rs" <<'FIX'
+cat > "$FIXDIR/ret.go" <<'FIX'
 // Clean old audit log files (>365 days) — this narration must not be the anchor
-fn sweep() {
-    let audit_dir = "/var/lib/dockpanel/audit";
-    if let Ok(entries) = std::fs::read_dir(audit_dir) {
-        let mut audit_failed: Vec<String> = Vec::new();
-        for entry in entries.flatten() {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
+func sweep() {
+	auditDir := "/var/lib/dockpanel/audit"
+	if entries, err := os.ReadDir(auditDir); err == nil {
+		var auditFailed []string
+		for _, e := range entries {
+			_ = os.Remove(filepath.Join(auditDir, e.Name()))
+		}
+	}
 }
 FIX
-RET_CTL=$(retention_window "$FIXDIR/ret.rs")
-if [ -n "$RET_CTL" ] && [ "$(printf '%s' "$RET_CTL" | grep -c 'let _ = std::fs::remove_file')" -gt 0 ]; then
+RET_CTL=$(retention_window "$FIXDIR/ret.go")
+if [ -n "$RET_CTL" ] && [ "$(printf '%s' "$RET_CTL" | grep -cE '_ = os\.Remove(All)?\(')" -gt 0 ]; then
   ok "H4 E2's discarded-result detector still fires when the delete result is really thrown away in code"
 else
   bad "H4 E2's window found no discarded delete in a file that has one (window=${#RET_CTL} chars) — E2 is green on a sweep that fails forever in silence"
@@ -890,14 +910,13 @@ fi
 
 # H6 — D1. A door that creates an account with neither column, run through the same
 # extractor and the same offender predicate.
-cat > "$FIXDIR/door.rs" <<'FIX'
+cat > "$FIXDIR/door.go" <<'FIX'
 // this door's comment may mention email_verified and email_token freely
-let row = sqlx::query_as(
-    "INSERT INTO users (email, password_hash, role) \
-     VALUES ($1, $2, 'user') RETURNING *",
-)
+user, err := queryOne[User](ctx, st.DB,
+	"INSERT INTO users (email, password_hash, role) "+
+		"VALUES ($1, $2, 'user') RETURNING *", email, hash)
 FIX
-ctl_off=$(inserts_in "$FIXDIR/door.rs" | grep -v 'email_verified' | grep -v 'email_token' | cut -f1 | sort -u)
+ctl_off=$(inserts_in "$FIXDIR/door.go" | grep -v 'email_verified' | grep -v 'email_token' | cut -f1 | sort -u)
 if [ -n "$ctl_off" ]; then
   ok "H6 D1's offender predicate still names a door that inserts neither column"
 else

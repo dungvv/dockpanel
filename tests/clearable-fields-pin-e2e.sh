@@ -6,13 +6,13 @@
 #   value was still there on reload. The form sent `null` for an empty box:
 #
 #       post_deploy_cmd: formPostDeploy.trim() || null,        (GitDeploys.tsx)
-#       post_deploy_cmd = COALESCE($12, post_deploy_cmd),      (git_deploys.rs)
+#       post_deploy_cmd = COALESCE($12, post_deploy_cmd),      (git_deploys.rs, now rt_git_deploys.go)
 #
 #   COALESCE(NULL, old) is old, so "the client omitted this key" and "the operator
 #   emptied this box" arrived identically and the second silently became the
 #   first. A post-deploy hook the operator had removed went on running.
 #
-# THE CLASS. A derivation over the crate found 125 COALESCE self-guarded columns
+# THE CLASS. A derivation over the (then Rust) backend found 125 COALESCE self-guarded columns
 # in 16 UPDATE statements across 13 files. Most are correct and must stay: an
 # agent check-in that omits a metric must not blank the stored one, and a NOT NULL
 # identifier has no "clear" to express. What makes a genuine defect is the PAIR —
@@ -29,14 +29,14 @@
 #   The empty string is a WIRE sentinel and is never stored. v2.120.0 fixed the
 #   same defect on the alert destinations by letting '' reach the column, which is
 #   safe THERE because every reader of those columns guards on non-empty. It is
-#   not safe here: `remove` reads the domain with `unwrap_or(&name)`, so a stored
+#   not safe here: `remove` falls back on the name only for a NULL domain, so a stored
 #   '' would hand the agent an empty site identifier. §3 pins the normaliser that
 #   keeps '' out of storage, and §4 pins the two readers that would otherwise ask
 #   the agent for a vhost named ".conf" or an ACME order with no address.
 #
 # §5 pins the refusal. Clearing a DOMAIN is answered rather than folded away,
 # because nothing in the git path takes an nginx vhost down — `unexpose_domain`
-# exists for Docker apps and git_build.rs names wiring it as separate work.
+# exists for Docker apps, and wiring it into the git path is separate work.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
@@ -48,9 +48,10 @@ eq()  { [ "$2" = "$3" ] && ok "$1" || bad "$1" "expected '$3', got '$2'"; }
 # ugrep's --ignore-files shim honours .gitignore, so use the real binary.
 G=/usr/bin/grep
 
-GD=panel/backend/src/routes/git_deploys.rs
+GD=panel/go/internal/api/rt_git_deploys.go
 GDUI=panel/frontend/src/pages/GitDeploys.tsx
-BACKEND=panel/backend/src/routes
+# The panel API's route handlers: the flat Go package's rt_*.go files.
+BACKEND=panel/go/internal/api
 SPA=panel/frontend/src/pages
 
 for f in "$GD" "$GDUI"; do
@@ -70,7 +71,7 @@ echo "── §1 the class: a COALESCE self-guard must not meet a null-for-empty
 # sends null for an empty box is just as broken against a fixed column as
 # against an unfixed one, and an arm that only knew the plain shape would go
 # quiet on exactly the columns this release repaired.
-guarded=$("$G" -rhoE 'COALESCE\(\$[0-9]+, [a-z_]+\)' "$BACKEND" --include=*.rs \
+guarded=$("$G" -rhoE 'COALESCE\(\$[0-9]+, [a-z_]+\)' "$BACKEND" --include='rt_*.go' --exclude='*_test.go' \
   | sed -E 's/^COALESCE\(\$[0-9]+, ([a-z_]+)\)$/\1/' | sort -u)
 
 # Frontend half: payload keys sent as `key: <expr> || null`, carrying the FILE
@@ -135,8 +136,8 @@ pairs=$(printf '%s\n' "$nulled" \
 #        domain@Apps.tsx (2nd),        s414's Stack EDIT modal (PUT /stacks/{id}),
 #        ssl_email@Apps.tsx (2nd)      alongside the pre-existing CREATE occurrence
 #                                      of each. Both verified SAFE against the
-#                                      ACTUAL target column — stacks.rs, not the
-#                                      git_deploys.rs column this arm's bare
+#                                      ACTUAL target column — rt_stacks.go, not the
+#                                      rt_git_deploys.go column this arm's bare
 #                                      column-name matching pairs them with:
 #                                        domain    — UpdateStackRequest.domain is
 #                                                     Option<Option<String>> via
@@ -144,7 +145,7 @@ pairs=$(printf '%s\n' "$nulled" \
 #                                                     three-state at the struct
 #                                                     level (absent=keep, explicit
 #                                                     null=vacate, per the field's
-#                                                     own doc comment); stacks.rs's
+#                                                     own doc comment); rt_stacks.go's
 #                                                     UPDATE has no COALESCE on
 #                                                     domain at all ("no COALESCE,
 #                                                     so the statement says exactly
@@ -186,34 +187,38 @@ done
 
 # The reverted form must be gone, not merely outnumbered.
 for col in ssl_email pre_build_cmd post_deploy_cmd deploy_cron; do
-  n=$("$G" -cE "^ +$col = COALESCE\(\\\$[0-9]+, $col\), \\\\$" "$GD" || true)
+  n=$("$G" -cE "$col = COALESCE\(\\\$[0-9]+, $col\)" "$GD" || true)
   eq "§2 $col no longer carries the plain self-guard" "$n" "0"
 done
 
 echo
 echo "── §3 the empty string is a wire sentinel and is never stored"
 
-n=$("$G" -c 'fn blank_to_none' "$GD" || true)
+n=$("$G" -c '^func rtGitDeploysBlankToNone(v \*string) \*string {' "$GD" || true)
 eq "§3 the normaliser exists" "$n" "1"
 
 # create and update post the SAME payload object, so create receives the blanks
 # too. Each of the four columns must go through the normaliser on the way in.
-for col in ssl_email pre_build_cmd post_deploy_cmd deploy_cron; do
-  n=$("$G" -c "blank_to_none(body\.$col\.as_deref())" "$GD" || true)
+for pair in ssl_email:SslEmail pre_build_cmd:PreBuildCmd post_deploy_cmd:PostDeployCmd deploy_cron:DeployCron; do
+  col=${pair%:*}; fld=${pair#*:}
+  n=$("$G" -c "rtGitDeploysBlankToNone(body\.$fld)" "$GD" || true)
   eq "§3 create normalises a blank $col to NULL" "$n" "1"
 done
 
 # The domain arm had the same defect and is easy to reintroduce, because the
-# obvious `None => body.domain.clone()` reads as a no-op.
-n=$("$G" -c 'None => body\.domain\.clone()' "$GD" || true)
+# obvious `domain := body.Domain` reads as a no-op.
+CREATE=$(awk '/^func rtGitDeploysCreate\(/{f=1} f{print} f&&/^}$/{exit}' "$GD")
+n=$(printf '%s\n' "$CREATE" | "$G" -c 'if body\.Domain != nil && \*body\.Domain != "" {' || true)
+eq "§3 create only takes a domain from a non-blank box" "$n" "1"
+n=$(printf '%s\n' "$CREATE" | "$G" -cE 'domain :?= body\.Domain' || true)
 eq "§3 create does not round-trip a blank domain back into the column" "$n" "0"
 
 echo
 echo "── §4 blank is absent at the two readers that hand a value to the agent"
 
-n=$("$G" -c 'b\.domain\.filter(|d| !d\.trim()\.is_empty())' "$GD" || true)
+n=$("$G" -c 'if b\.Domain != nil && strings\.TrimSpace(\*b\.Domain) != "" {' "$GD" || true)
 eq "§4 a blank domain does not become a vhost named '.conf'" "$n" "1"
-n=$("$G" -c 'b\.ssl_email\.filter(|e| !e\.trim()\.is_empty())' "$GD" || true)
+n=$("$G" -c 'if b\.SslEmail != nil && strings\.TrimSpace(\*b\.SslEmail) != "" {' "$GD" || true)
 eq "§4 a blank ssl_email does not open an ACME order with no account address" "$n" "1"
 
 echo
@@ -223,7 +228,8 @@ n=$("$G" -c 'Removing the domain is not supported yet' "$GD" || true)
 eq "§5 the refusal exists" "$n" "1"
 # It must name the domain it is refusing to drop; a generic sentence sends the
 # operator looking for a setting instead of telling them what is in the way.
-n=$("$G" -c 'cur_domain\.as_deref()\.unwrap_or("")' "$GD" || true)
+flat=$(tr -d ' \t\n' < "$GD" | sed 's/"+"//g')
+n=$(printf '%s' "$flat" | "$G" -o 'Removingthedomainisnotsupportedyet:thevhostfor%swouldbeleft[^"]*",\*cur.Domain))' | wc -l | tr -d ' ')
 eq "§5 the refusal names the vhost that would be left behind" "$n" "1"
 
 # And it must only fire when a domain is actually stored — a deploy that never
@@ -233,8 +239,7 @@ eq "§5 the refusal names the vhost that would be left behind" "$n" "1"
 # on one line; rustfmt then wrapped it across four and turned my own arm red for
 # a change that altered nothing (s374 #585). Match the OPERATION with the
 # newlines and indentation squeezed out, so the formatter cannot move it.
-flat=$(tr -d ' \n' < "$GD")
-n=$(printf '%s' "$flat" | "$G" -c 'cur_domain.as_deref().map(|c|!c.trim().is_empty()).unwrap_or(false)' || true)
+n=$(printf '%s' "$flat" | "$G" -o 'cased!=nil&&strings.TrimSpace(\*d)==""&&cur.Domain!=nil&&strings.TrimSpace(\*cur.Domain)!="":' | wc -l | tr -d ' ')
 eq "§5 the refusal is conditional on a domain being stored" "$n" "1"
 
 echo

@@ -25,16 +25,18 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-ORCH=panel/backend/src/routes/backup_orchestrator.rs
-EXEC=panel/backend/src/services/backup_policy_executor.rs
-SCHED=panel/backend/src/services/backup_scheduler.rs
-DEST=panel/backend/src/routes/backup_destinations.rs
-BACKUPS=panel/backend/src/routes/backups.rs
-PREREQ=panel/backend/src/services/prerequisites/backups.rs
+# The Go port (panel/go) is what ships; the API package is flat.
+API=panel/go/internal/api
+ORCH=$API/rt_backup_orchestrator.go
+EXEC=$API/svc_backup_policy_executor.go
+SCHED=$API/svc_backup_scheduler.go
+DEST=$API/rt_backup_destinations.go
+BACKUPS=$API/rt_backups.go
+PREREQ=$API/svc_prerequisites_backups.go
 UI=panel/frontend/src/pages/BackupOrchestrator.tsx
 GUIDE=docs/guides/backup-orchestrator.md
-CRYPTO=panel/backend/src/services/secrets_crypto.rs
-KEYVER_MIG=panel/backend/migrations/20260831000000_backup_encryption_key_version.sql
+CRYPTO=$API/svc_secrets_crypto.go
+KEYVER_MIG=$API/migrations/20260831000000_backup_encryption_key_version.sql
 
 for f in "$ORCH" "$EXEC" "$SCHED" "$DEST" "$BACKUPS" "$PREREQ" "$UI" "$GUIDE" "$CRYPTO" "$KEYVER_MIG"; do
   [ -f "$f" ] || bad "MISSING SUBJECT FILE: $f"
@@ -46,7 +48,7 @@ done
 # one: `/*` occurs INSIDE string literals (a Dockerfile's
 # `COPY --from=builder /app/target/release/*`, a glob, a regex), so it opened a
 # "block comment" that ran to the next `*/` and deleted real code —
-# git_build.rs 1214 -> 729 lines, agent/routes/nginx.rs 2263 -> 2145. A
+# the agent's git_build 1214 -> 729 lines, its nginx routes 2263 -> 2145. A
 # truncated subject makes an ABSENCE arm pass on code that was merely deleted by
 # the stripper, which is the worst way for a pin to be wrong.
 #
@@ -114,20 +116,20 @@ fi
 echo "== §2  a site that has NEVER been backed up is representable =="
 if S=$(subj "$ORCH"); then
   # The HAVING clause deliberately admits sites with no backup at all, and
-  # ORDER BY NULLS FIRST puts them on row 1 — so a non-Option row type fails the
-  # whole fetch, not just that row.
-  if has "$S" "last_backup: Option<chrono::DateTime"; then
-    ok "StaleBackup.last_backup is Option"
+  # ORDER BY NULLS FIRST puts them on row 1 — so a non-nullable row type fails
+  # the whole fetch, not just that row. (Rust Option → Go pointer.)
+  if has "$S" 'LastBackup \*time\.Time[[:space:]]+`json:"last_backup"`'; then
+    ok "StaleBackup.last_backup is nullable (*time.Time)"
   else
-    bad "StaleBackup.last_backup is not Option — a never-backed-up site cannot decode"
+    bad "StaleBackup.last_backup is not nullable — a never-backed-up site cannot decode"
   fi
-  if has "$S" "days_since: Option<i64>"; then
-    ok "StaleBackup.days_since is Option"
+  if has "$S" 'DaysSince +\*int64[[:space:]]+`json:"days_since"`'; then
+    ok "StaleBackup.days_since is nullable (*int64)"
   else
-    bad "StaleBackup.days_since is not Option"
+    bad "StaleBackup.days_since is not nullable"
   fi
-  if has "$S" "Vec<\(String, Option<chrono::DateTime"; then
-    ok "the stale-site query decodes into an Option"
+  if has "$S" 'staleSites, err := queryAll\[Tup2\[string, \*time\.Time\]\]'; then
+    ok "the stale-site query decodes into a nullable time"
   else
     bad "the stale-site query row type no longer admits NULL"
   fi
@@ -141,12 +143,18 @@ if S=$(subj "$UI"); then
 fi
 
 echo "== §3  no backup is reported as a success the panel cannot list =="
-# Dropping a Result requires spelling `let _ =` in front of the statement.
+# In Go a dropped error is a call at statement position, or one assigned to
+# blanks (`_, _ =` / `_ =`). A checked call binds a named error (`if _, err :=`,
+# `_, recErr :=`) and so never matches. The census of all backup INSERTs is the
+# positive control: zero INSERTs found would make the absence vacuous.
 for f in "$EXEC" "$SCHED" "$BACKUPS"; do
   if S=$(subj "$f"); then
-    W=$(grep -A1 -E 'let _ = sqlx::query\(' <<< "$S" || true)
+    ALL=$(count "$S" '"INSERT INTO (backups|database_backups|volume_backups) \(')
+    W=$(grep -A1 -E '^[[:space:]]*(_, _ :?= |_ :?= )?(execSQL|queryOne|queryOpt|queryScalar)[A-Za-z]*(\[[^]]*\])?\(' <<< "$S" || true)
     N=$(count "$W" '"INSERT INTO (backups|database_backups|volume_backups)')
-    if [ "$N" = "0" ]; then
+    if [ "$ALL" = "0" ]; then
+      bad "$(basename "$f"): no backup INSERT found at all — the discard check examined nothing"
+    elif [ "$N" = "0" ]; then
       ok "$(basename "$f"): no INSERT into a backup table discards its Result"
     else
       bad "$(basename "$f"): $N backup INSERT(s) still discard their Result"
@@ -184,7 +192,7 @@ if S=$(subj "$BACKUPS"); then
   W=$(grep -A3 "Backup not recorded" <<< "$S" || true)
   if [ -z "$W" ]; then
     bad "cannot check the unrecorded-backup branch: it is not there"
-  elif [ "$(count "$W" '^\s*return;')" = "0" ]; then
+  elif [ "$(count "$W" '^\s*return$')" = "0" ]; then
     ok "the unrecorded-backup branch falls through to the log cleanup"
   else
     bad "the unrecorded-backup branch returns early and leaks the provisioning log"
@@ -193,12 +201,8 @@ fi
 
 echo "== §4  a stored destination credential is never destroyed nor echoed =="
 if S=$(subj "$DEST"); then
-  if has "$S" "fn reject_empty_secrets"; then
-    ok "an empty secret is refused rather than written over the stored one"
-  else
-    bad "reject_empty_secrets is gone — an empty secret can destroy the credential again"
-  fi
-  M=$(count "$S" "mask_config_secrets\(&mut dest\)")
+  # reject-empty-secrets retired: covered by TestRtBackupDestinationsAnEmptySecretIsRefusedNotStored (panel/go/internal/api/rt_backup_destinations_test.go)
+  M=$(count "$S" "rtBackupDestinationsMaskConfigSecrets\(&?dest\)")
   if [ "$M" -ge 2 ]; then
     ok "create and update both mask before returning ($M)"
   else
@@ -207,42 +211,37 @@ if S=$(subj "$DEST"); then
   # test_connection must NOT mask — it feeds the agent the real credential.
   # Only meaningful once a masker exists; asserting its absence in a tree that
   # has no masker at all is a green about nothing.
-  W=$(grep -A25 "pub async fn test_connection" <<< "$S" || true)
+  W=$(awk '/^func rtBackupDestinationsTestConnection\(/,/^}/' <<< "$S")
   if [ "$M" -lt 2 ] || [ -z "$W" ]; then
     bad "cannot check test_connection: no masker to look for"
-  elif [ "$(count "$W" "mask_config_secrets")" = "0" ]; then
+  elif [ "$(count "$W" "rtBackupDestinationsMaskConfigSecrets")" = "0" ]; then
     ok "test_connection is deliberately unmasked"
   else
     bad "test_connection masks its row — the agent would authenticate with the sentinel"
   fi
-  if has "$S" "fn carry_unmentioned_keys"; then
-    ok "a stored key the form does not send survives an edit"
-  else
-    bad "carry_unmentioned_keys is gone — an unrelated edit erases key_path again"
-  fi
+  # carry-unmentioned-keys retired: covered by TestRtBackupDestinationsAStoredKeyTheFormDoesNotSendSurvivesAnEdit (panel/go/internal/api/rt_backup_destinations_test.go)
 fi
 
 echo "== §5  a policy can be edited, and an omitted field is not a reset =="
 if S=$(subj "$ORCH"); then
-  if has "$S" "struct UpdatePolicyRequest"; then
+  if [ "$(awk '/^func rtBackupOrchestratorUpdatePolicy\(/,/^}/' <<< "$S" | grep -cE 'var req rtBackupOrchestratorUpdatePolicyRequest$')" -gt 0 ]; then
     ok "update has its own request type"
   else
     bad "update shares CreatePolicyRequest again — absent and default collapse"
   fi
   # The three columns the UPDATE used to assign unconditionally.
-  for col in server_id destination_id retention_count; do
-    if has "$S" "req\.$col\.unwrap_or\(cur_"; then
+  # Go spelling: the double-option fields fall back via .or(existing.X), the
+  # pointer field via rtBackupOrchestratorOr(req.X, existing.Y).
+  UPD=$(awk '/^func rtBackupOrchestratorUpdatePolicy\(/,/^}/' <<< "$S")
+  for pair in server_id:'req\.ServerID\.or\(existing\.' destination_id:'req\.DestinationID\.or\(existing\.' retention_count:'rtBackupOrchestratorOr\(req\.RetentionCount, existing\.'; do
+    col=${pair%%:*}; re=${pair#*:}
+    if has "$UPD" "$re"; then
       ok "omitted keeps its current value: $col"
     else
       bad "reset-on-omission is back for $col"
     fi
   done
-  # Explicit null must still clear a destination, or local-only is unreachable.
-  if has "$S" "de_double_option"; then
-    ok "explicit null is distinguishable from omitted"
-  else
-    bad "explicit null and omitted are the same value again"
-  fi
+  # explicit-null-vs-omitted retired: covered by TestRtBackupOrchestratorUpdateRequestDoubleOption (panel/go/internal/api/rt_backup_orchestrator_test.go)
 fi
 if S=$(subj "$UI"); then
   if has "$S" 'api\.put\(.\/backup-orchestrator\/policies\/'; then
@@ -289,7 +288,7 @@ else
 fi
 # If a future change gives site/volume archives a real encryption path, THIS is
 # the arm that should go red first, so the copy above gets revisited with it.
-ENC_FILES=$(grep -rl "encrypt_file" panel/agent/src/ 2>/dev/null | wc -l)
+ENC_FILES=$(grep -rl --include='*.go' "EncryptionEncryptFile" panel/go/internal/agent/ 2>/dev/null | grep -vc '_test\.go$' || true)
 if [ "$ENC_FILES" -le 2 ]; then
   ok "agent-side encryption is still database-only ($ENC_FILES file(s))"
 else
@@ -305,18 +304,23 @@ for f in "$EXEC" "$SCHED"; do
     # in the file — and therefore kept the sibling arm green — while it could
     # never run. To read the response you have to open a block on it; no form of
     # discard does.
+    #
+    # Go: the response must be bound to a NAME (not `_`) on the call line, and
+    # that name must be read for its `message`.
     W=$(grep -A12 '"/backups/prune"' <<< "$S" || true)
+    RESP=$(grep -oE '[A-Za-z_]+, [A-Za-z_]+ :?= agent\.Post\(ctx, "/backups/prune"' <<< "$S" | head -1 | cut -d, -f1)
     if [ -z "$W" ]; then
       bad "$(basename "$f"): no prune call found at all"
-    elif [ "$(count "$W" '\.await \{')" = "0" ]; then
-      bad "$(basename "$f"): the prune response is not destructured — it cannot be read"
-    elif [ "$(count "$W" 'let _|\.ok\(\)|if false')" != "0" ]; then
+    elif [ -z "$RESP" ] || [ "$RESP" = "_" ] || [ "$(count "$W" "jsonGet\\($RESP, \"message\"\\)")" = "0" ]; then
+      bad "$(basename "$f"): the prune response is not bound and read — it cannot be read"
+    elif [ "$(count "$W" '_, _ :?=|if false')" != "0" ]; then
       bad "$(basename "$f"): the prune response is discarded or its handling is dead"
     else
       ok "$(basename "$f"): the prune response is destructured and read"
     fi
     # The message must reach a durable operator surface, not just a journal.
     #
+    # (Rust log_event → Go SystemLogLogEvent.)
     # ⚠ This used to look for `log_event` inside a fixed `grep -A12` window taken
     # FORWARD from the message, with a second forward window from the prune call
     # as a fallback. But the call WRAPS the message — `log_event(db, level,
@@ -332,7 +336,7 @@ for f in "$EXEC" "$SCHED"; do
     # log_event turns this red while its sibling file stays green.
     if [ "$(count "$S" 'emote retention was not enforced')" = "0" ]; then
       bad "$(basename "$f"): nothing records that retention was a no-op"
-    elif perl -0777 -ne 'exit(!(/log_event\s*\([^;]*?emote retention was not enforced/s))' <<< "$S"; then
+    elif perl -0777 -ne 'exit(!(/SystemLogLogEvent\s*\([^)]*?emote retention was not enforced/s))' <<< "$S"; then
       ok "$(basename "$f"): an unenforceable retention reaches system_log"
     else
       bad "$(basename "$f"): the unenforced-retention message never reaches system_log"
@@ -354,7 +358,7 @@ echo "== §8  the chain report states only what the panel actually recorded (s31
 # The column and its writers survive (dropping a column is a migration, and this
 # release does not need one). What must not come back is a RENDERED or SERVED
 # verdict. So these arms are about readers and outputs, never about the INSERTs.
-TYP=panel/backend/templates/chain-report.typ
+TYP=$API/templates/chain-report.typ
 if [ ! -f "$TYP" ]; then
   bad "MISSING SUBJECT FILE: $TYP"
 else
@@ -387,7 +391,7 @@ fi
 
 if S=$(subj "$ORCH"); then
   # Every surviving mention must be a WRITE. A reader is what puts the verdict
-  # back on a surface — the struct field, the SELECT list, the .unwrap_or(true).
+  # back on a surface — the struct field, the SELECT list, a nil-means-true fallback.
   TOTAL=$(count "$S" 'chain_valid')
   WRITES=$(count "$(grep -E 'INSERT INTO' <<< "$S" || true)" 'chain_valid')
   if [ "$TOTAL" = "$WRITES" ]; then
@@ -423,18 +427,19 @@ fi
 
 echo "== §9  no backup/site query names a column the schema does not have (s311) =="
 #
-# `sites.rs` health_summary selected `last_response_ms` from `monitors`, whose
+# The sites route's health_summary selected `last_response_ms` from `monitors`, whose
 # column is `last_response_time` — a 42703 at parse-analyze, so an unconditional
 # 500 from the day it shipped (e65893c, 2026-03-22) until v2.68.0. The backend
-# has ZERO compile-checked queries (`sqlx::query!` count is 0 against 728
-# unchecked `query_as(`), so nothing but execution could ever have caught it.
+# has ZERO compile-checked queries (the Rust tree had no `sqlx::query!`; the Go
+# port's queryAll/queryOne are strings too), so nothing but execution could
+# ever have caught it.
 #
 # ⚠ This is a REGRESSION pin on the one literal, not the class sweep. The class
 # arm — every identifier in a SELECT list exists in the migrations for that table
 # — needs either a live database or a migration parser, and neither belongs in a
 # pure-source suite. Recorded here so the next person knows what is NOT covered.
-BAD_COL=$(grep -rn 'last_response_ms' --include=*.rs panel/backend/src panel/agent/src 2>/dev/null | wc -l)
-GOOD_COL=$(grep -rn 'last_response_time' --include=*.rs panel/backend/src panel/agent/src 2>/dev/null | wc -l)
+BAD_COL=$(grep -rn 'last_response_ms' --include='*.go' panel/go 2>/dev/null | wc -l)
+GOOD_COL=$(grep -rn 'last_response_time' --include='*.go' panel/go 2>/dev/null | wc -l)
 if [ "$GOOD_COL" -eq 0 ]; then
   bad "neither column name appears in the backend — this arm is measuring nothing"
 elif [ "$BAD_COL" -eq 0 ]; then
@@ -539,15 +544,15 @@ echo "== §12  backup_destinations.encryption_enabled is a documented dead colum
 # (v2.24.0's encryption_key fix, and a second pass on this table) walk past the sibling
 # column: it had zero readers, zero writers, and no comment anywhere.
 DEST_RAW=$(cat "$DEST")
-STRUCT_BODY=$(sed -n '/^pub struct BackupDestination {/,/^}/p' "$DEST")
+STRUCT_BODY=$(sed -n '/^type rtBackupDestinationsBackupDestination struct {/,/^}/p' "$DEST")
 
 if [ -z "$STRUCT_BODY" ]; then
-  bad "§12 could not locate 'pub struct BackupDestination' in $DEST — extraction failed, arm skipped"
-elif ! grep -qE '^\s*pub id: Uuid,' <<< "$STRUCT_BODY"; then
+  bad "§12 could not locate 'type rtBackupDestinationsBackupDestination struct' in $DEST — extraction failed, arm skipped"
+elif ! grep -qE '^\s*ID +uuid\.UUID ' <<< "$STRUCT_BODY"; then
   bad "§12 struct extraction landed on the wrong block (no 'id' field) — positive control failed"
 else
   ok "§12 struct extraction located BackupDestination correctly (positive control: 'id' field present)"
-  if grep -qE 'encryption_enabled|encryption_key' <<< "$STRUCT_BODY"; then
+  if grep -qiE 'encryption_?enabled|encryption_?key' <<< "$STRUCT_BODY"; then
     bad "§12 BackupDestination declares an encryption_enabled/encryption_key field — a dead column was reintroduced without removing or updating the tombstone comment above the struct"
   else
     ok "§12 BackupDestination still excludes encryption_enabled/encryption_key (by construction)"
@@ -556,7 +561,7 @@ fi
 
 # The tombstone must live directly above the struct, not merely somewhere in the file —
 # an unattached comment gives a future reader no reason to look at it before adding a field.
-PRE_STRUCT=$(grep -B12 '^pub struct BackupDestination {' "$DEST")
+PRE_STRUCT=$(grep -B12 '^type rtBackupDestinationsBackupDestination struct {' "$DEST")
 if grep -q 'encryption_enabled' <<< "$PRE_STRUCT" && grep -q 'encryption_key' <<< "$PRE_STRUCT"; then
   ok "§12 a tombstone comment directly above BackupDestination documents both dead columns"
 else
@@ -565,7 +570,7 @@ fi
 
 # Regression control: if this ever fires red, the "zero readers/writers" claim the
 # tombstone makes is now false and the comment (or the code) needs to change.
-ENC_ENABLED_HITS=$(grep -rniE 'encryption_enabled' --include=*.rs --include=*.tsx --include=*.ts panel/ | grep -vF "$DEST" | wc -l)
+ENC_ENABLED_HITS=$(grep -rniE 'encryption_enabled' --include='*.go' --include='*.tsx' --include='*.ts' panel/go panel/frontend | grep -vF "$DEST" | wc -l)
 if [ "$ENC_ENABLED_HITS" -gt 0 ]; then
   bad "§12 encryption_enabled is referenced outside $DEST ($ENC_ENABLED_HITS hit(s)) — the dead-column claim in the tombstone is stale"
 else
@@ -595,81 +600,45 @@ fi
 # reference elsewhere in the file, or renaming the parameter before using it.
 # A name/signature existing is necessary; it is never sufficient.
 
-V1_FN=$(sed -n '/^fn derive_backup_encryption_key_v1(jwt_secret: &str) -> String {/,/^}/p' <<< "$EXEC_SRC")
-if [ -z "$V1_FN" ]; then
-  bad "§13a could not extract derive_backup_encryption_key_v1's own body — signature changed or function is gone; a pre-s434 encrypted backup can no longer be restored"
-elif has "$V1_FN" 'format!\("backup-enc-\{\}", &jwt_secret\[\.\.32\.min\(jwt_secret\.len\(\)\)\]\)'; then
-  ok "§13a derive_backup_encryption_key_v1's own body still performs the exact legacy derivation (needed to decrypt pre-existing backups)"
-else
-  bad "§13a derive_backup_encryption_key_v1 exists but its BODY no longer performs the legacy derivation — a same-named stub would satisfy a name-only check while making every pre-s434 encrypted backup permanently unrestorable"
-fi
+# §13a retired: covered by TestBackupPolicyExecutorVersion1ReproducesTheExactLegacyFormat (panel/go/internal/api/svc_backup_policy_executor_test.go)
+# §13b retired: covered by TestPinBackupTruthV2BackupKeyIsTheSaltedHKDF (panel/go/internal/api/pin_backup_truth_test.go)
 
-V2_FN=$(sed -n '/^pub fn derive_backup_encryption_key_v2(jwt_secret: &str) -> String {/,/^}/p' <<< "$CRYPTO_SRC")
-if [ -z "$V2_FN" ]; then
-  bad "§13b could not extract derive_backup_encryption_key_v2's own body — signature changed or function is gone"
-elif has "$V2_FN" 'hex::encode\(derive_key_with_salt\(jwt_secret, BACKUP_ENCRYPTION_SALT\)\)'; then
-  ok "§13b derive_backup_encryption_key_v2's own body derives via HKDF (derive_key_with_salt), not a raw secret slice or the legacy SHA-256-only path"
-else
-  bad "§13b derive_backup_encryption_key_v2's body no longer calls derive_key_with_salt — it may have regressed to derive_key_legacy (plain SHA-256, the pre-HKDF weakness) or something else entirely, even if that call text still appears elsewhere in the file as a decoy"
-fi
-
-# §13c — the REGRESSION this whole section exists to catch: if a future edit
-# inlines v1's raw-slice pattern back into the CURRENT-version function
-# (derive_backup_encryption_key, not the deliberately-kept-legacy _v1), new
-# backups go back to leaking JWT_SECRET bytes.
-#
-# ⚠ Two prior drafts of this arm were each defeated in review before ship:
-# (1) a bare file-wide COUNT of the slice pattern can't tell "correctly
-# isolated in v1" from "still in the current function" (pre-fix code also
-# shows exactly 1 occurrence); (2) a body-scoped grep for the LITERAL
-# identifier `jwt_secret[..` is defeated by aliasing the parameter first
-# (`let s = jwt_secret; ...&s[..32]...`) — same leak, different spelling. The
-# fix for both: require the CURRENT function's body to be EXACTLY a
-# delegation call to derive_backup_encryption_key_for_version — a positive
-# match on the one correct shape, not a negative match on the many ways to
-# spell the wrong one. A delegation call has no `[` at all; any hand-rolled
-# derivation (v1's, or a renamed-variable variant of it) does.
-CURRENT_FN=$(sed -n '/^pub fn derive_backup_encryption_key(jwt_secret: &str) -> String {/,/^}/p' <<< "$EXEC_SRC")
-if [ -z "$CURRENT_FN" ]; then
-  bad "§13c could not extract derive_backup_encryption_key's own body — signature changed, re-read it"
-elif ! has "$CURRENT_FN" 'derive_backup_encryption_key_for_version\(CURRENT_BACKUP_KEY_VERSION, jwt_secret\)'; then
-  bad "§13c derive_backup_encryption_key's body is no longer a plain delegation to derive_backup_encryption_key_for_version(CURRENT_BACKUP_KEY_VERSION, jwt_secret) — it may be computing a key itself again, under any variable name"
-elif has "$CURRENT_FN" '\['; then
-  bad "§13c derive_backup_encryption_key's body contains '[' (indexing/slicing) alongside the delegation call — a hand-rolled derivation may have been added back in, even if the delegation call is also still present"
-else
-  ok "§13c derive_backup_encryption_key's body is exactly a delegation to derive_backup_encryption_key_for_version — no slicing under any spelling"
-fi
+# §13c retired: covered by TestBackupPolicyExecutorCurrentVersionConstantMatchesTheDefaultDerivation
+# and TestBackupPolicyExecutorVersion1AndVersion2DeriveDifferentKeys (panel/go/internal/api/svc_backup_policy_executor_test.go)
+# — together they fail if the current derivation stops delegating to the current
+# version, including an inlined v1 raw slice under any spelling.
 
 # §13d — not just that the COLUMN NAME appears in the INSERT text, but that
 # the value bound to it is the CURRENT_BACKUP_KEY_VERSION constant specifically
 # (not a hardcoded literal that happens to equal today's value, which would
-# silently stop tracking future version bumps). Extract the substring between
-# the two adjacent, invariant anchors around it in the actual bind() chain.
-BIND_GAP=$(sed -n 's/.*\.bind(encrypted)\(.*\)\.bind(policy\.id).*/\1/p' <<< "$EXEC_SRC")
+# silently stop tracking future version bumps). Extract the argument between
+# the two adjacent, invariant anchors around it in the execSQL argument list
+# (column order: ..., encrypted, encryption_key_version, policy_id, ...).
+BIND_GAP=$(sed -n 's/.*[ ,]encrypted, \(.*\), policy\.ID,.*/\1/p' <<< "$EXEC_SRC")
 if [ -z "$BIND_GAP" ]; then
-  bad "§13d could not isolate the bind() call between .bind(encrypted) and .bind(policy.id) — the INSERT's bind chain shape changed, re-read it"
-elif [ "$(tr -d ' ' <<< "$BIND_GAP")" = ".bind(CURRENT_BACKUP_KEY_VERSION)" ]; then
-  ok "§13d the INSERT binds encryption_key_version to CURRENT_BACKUP_KEY_VERSION specifically, not a hardcoded literal"
+  bad "§13d could not isolate the argument between encrypted and policy.ID — the INSERT's argument list shape changed, re-read it"
+elif [ "$(tr -d ' ' <<< "$BIND_GAP")" = "BackupPolicyExecutorCurrentBackupKeyVersion" ]; then
+  ok "§13d the INSERT binds encryption_key_version to BackupPolicyExecutorCurrentBackupKeyVersion specifically, not a hardcoded literal"
 else
-  bad "§13d the bind() between encrypted and policy.id is '$BIND_GAP', not .bind(CURRENT_BACKUP_KEY_VERSION) — every new encrypted backup could be recorded under the wrong (e.g. hardcoded, stale) version, making restore derive the wrong passphrase for it"
+  bad "§13d the argument between encrypted and policy.ID is '$BIND_GAP', not BackupPolicyExecutorCurrentBackupKeyVersion — every new encrypted backup could be recorded under the wrong (e.g. hardcoded, stale) version, making restore derive the wrong passphrase for it"
 fi
 
 # §13e — restore must pass the ROW'S OWN recorded version as the FIRST
 # ARGUMENT specifically, not merely have both the function name and
 # `backup.encryption_key_version` appear SOMEWHERE in the same function (a
 # decoy log line referencing the field elsewhere satisfies that weaker
-# check while the real call still hardcodes CURRENT_BACKUP_KEY_VERSION).
-RESTORE_FN=$(sed -n '/pub async fn restore_db_backup/,/^}/p' <<< "$ORCH_SRC" | tr '\n' ' ' | tr -s ' ')
+# check while the real call still hardcodes the current-version constant).
+RESTORE_FN=$(sed -n '/^func rtBackupOrchestratorRestoreDbBackup(/,/^}/p' <<< "$ORCH_SRC" | tr '\n' ' ' | tr -s ' ')
 if [ -z "$RESTORE_FN" ]; then
-  bad "§13e could not extract restore_db_backup from $ORCH"
-elif has "$RESTORE_FN" 'derive_backup_encryption_key_for_version\( *backup\.encryption_key_version *,'; then
-  ok "§13e restore_db_backup passes the row's own encryption_key_version as the version argument, adjacent to the call"
-elif has "$RESTORE_FN" 'derive_backup_encryption_key_for_version\('; then
-  bad "§13e restore_db_backup calls derive_backup_encryption_key_for_version, but NOT with backup.encryption_key_version as the first argument — it may be hardcoding CURRENT_BACKUP_KEY_VERSION instead, silently deriving the wrong passphrase for any backup written under an older version"
-elif has "$RESTORE_FN" 'derive_backup_encryption_key\(&state\.config\.jwt_secret\)'; then
-  bad "§13e restore_db_backup calls the version-LESS derive_backup_encryption_key (always current) — a backup written under an older derivation would silently get the wrong passphrase"
+  bad "§13e could not extract rtBackupOrchestratorRestoreDbBackup from $ORCH"
+elif has "$RESTORE_FN" 'BackupPolicyExecutorDeriveBackupEncryptionKeyForVersion\( *backup\.EncryptionKeyVersion *,'; then
+  ok "§13e rtBackupOrchestratorRestoreDbBackup passes the row's own EncryptionKeyVersion as the version argument, adjacent to the call"
+elif has "$RESTORE_FN" 'BackupPolicyExecutorDeriveBackupEncryptionKeyForVersion\('; then
+  bad "§13e rtBackupOrchestratorRestoreDbBackup calls ...KeyForVersion, but NOT with backup.EncryptionKeyVersion as the first argument — it may be hardcoding the current version instead, silently deriving the wrong passphrase for any backup written under an older version"
+elif has "$RESTORE_FN" 'BackupPolicyExecutorDeriveBackupEncryptionKey\('; then
+  bad "§13e rtBackupOrchestratorRestoreDbBackup calls the version-LESS BackupPolicyExecutorDeriveBackupEncryptionKey (always current) — a backup written under an older derivation would silently get the wrong passphrase"
 else
-  bad "§13e restore_db_backup's key derivation matches none of the known shapes — re-read it"
+  bad "§13e rtBackupOrchestratorRestoreDbBackup's key derivation matches none of the known shapes — re-read it"
 fi
 
 if grep -qE 'ADD COLUMN IF NOT EXISTS encryption_key_version SMALLINT NOT NULL DEFAULT 1' "$KEYVER_MIG"; then

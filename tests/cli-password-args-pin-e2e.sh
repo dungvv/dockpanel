@@ -19,6 +19,13 @@
 # flag is given. `--password` still works for scripts that already use it
 # — this closes the door on it being the ONLY way, not on it existing.
 #
+# Go port: the flags are cli.go's passwordFlags + spec.conflicts on `db
+# create` / `backup db-create`; the helper is db.go::resolvePassword, the
+# masked prompt is promptTTY (golang.org/x/term on /dev/tty, rpassword's
+# equivalent); the commands are cmdDBCreate (db.go) and cmdDBBackupCreate
+# (backup.go). §A-§C are now Go unit tests
+# (panel/go/internal/cli/pin_cli_password_args_test.go).
+#
 # §A `password` is optional (`Option<String>`) on both commands, not a bare
 #    required `String` — the shape that forced argv exposure.
 # §B `--password-stdin` exists on both and conflicts with `--password`
@@ -49,7 +56,6 @@ code() {
   perl -0777 -pe '
     s{^[ \t]*/\*.*?\*/[ \t]*$}{}gms;
     s{^\s*//.*$}{}gm;
-    s{^\s*///.*$}{}gm;
   ' "$1"
 }
 
@@ -57,36 +63,7 @@ has()  { grep -qE -- "$2" <<< "$1"; }
 
 fnbody() {
   awk -v fn="$2" '
-    index($0, "fn " fn "(") && !started { started=1 }
-    started {
-      n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
-      if (opened || n>0) opened=1
-      if (opened && depth<=0) exit
-    }
-  ' <<< "$1"
-}
-
-# An `enum NAME { ... }` body, bounded on its own braces — scopes the
-# variant search below so a same-named variant on a DIFFERENT enum earlier
-# in the file (SitesCmd::Create precedes DbCmd::Create) can't be matched by
-# accident.
-enumbody() {
-  awk -v en="$2" '
-    index($0, "enum " en " {") && !started { started=1 }
-    started {
-      n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
-      if (opened || n>0) opened=1
-      if (opened && depth<=0) exit
-    }
-  ' <<< "$1"
-}
-
-# clap struct-variant bodies are not `fn NAME(...)` — bound instead on the
-# variant's OWN name and its opening/closing braces. Call on an enumbody
-# result, never on a whole-file body — see enumbody's own comment.
-variantbody() {
-  awk -v v="$2" '
-    index($0, v " {") && !started { started=1 }
+    !started && (index($0, "func " fn "(") == 1 || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) { started=1 }
     started {
       n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
       if (opened || n>0) opened=1
@@ -113,132 +90,79 @@ before() {
   [ "$o1" != -1 ] && [ "$o2" != -1 ] && [ "$o1" -lt "$o2" ]
 }
 
-MAIN=panel/cli/src/main.rs
-MAIN_C=$(code "$MAIN")
-DB=panel/cli/src/commands/db.rs
+CLI=panel/go/internal/cli
+DB=$CLI/db.go
 DB_C=$(code "$DB")
-BACKUP=panel/cli/src/commands/backup.rs
+BACKUP=$CLI/backup.go
 BACKUP_C=$(code "$BACKUP")
-MOD=panel/cli/src/commands/mod.rs
-MOD_C=$(code "$MOD")
 
-DBCMD_ENUM=$(enumbody "$MAIN_C" "DbCmd")
-BACKUPCMD_ENUM=$(enumbody "$MAIN_C" "BackupCmd")
-DB_CREATE_VARIANT=$(variantbody "$DBCMD_ENUM" "Create")
-BACKUP_DBCREATE_VARIANT=$(variantbody "$BACKUPCMD_ENUM" "DbCreate")
-RESOLVE_BODY=$(fnbody "$MOD_C" "resolve_password")
-CMD_DB_CREATE_BODY=$(fnbody "$DB_C" "cmd_db_create")
-CMD_DB_BACKUP_CREATE_BODY=$(fnbody "$BACKUP_C" "cmd_db_backup_create")
+RESOLVE_BODY=$(fnbody "$DB_C" "resolvePassword")
+PROMPT_BODY=$(fnbody "$DB_C" "promptTTY")
+CMD_DB_CREATE_BODY=$(fnbody "$DB_C" "cmdDBCreate")
+CMD_DB_BACKUP_CREATE_BODY=$(fnbody "$BACKUP_C" "cmdDBBackupCreate")
 
-# ── §A password is Option<String>, not a bare required String ───────────
-echo "── §A --password is optional on both commands ──"
-
-if has "$DB_CREATE_VARIANT" 'password:\s*Option<String>'; then
-  ok "A1 DbCmd::Create's password field is Option<String>"
-else
-  bad "A1 DbCmd::Create's password is not Option<String> — still a forced argv value"
-fi
-
-if has "$BACKUP_DBCREATE_VARIANT" 'password:\s*Option<String>'; then
-  ok "A2 BackupCmd::DbCreate's password field is Option<String>"
-else
-  bad "A2 BackupCmd::DbCreate's password is not Option<String> — still a forced argv value"
-fi
+# ── §A password is optional, not a bare required value ──────────────────
+# A1 retired: covered by TestPinCliPasswordArgsFlags (panel/go/internal/cli/pin_cli_password_args_test.go)
+# A2 retired: covered by TestPinCliPasswordArgsFlags (panel/go/internal/cli/pin_cli_password_args_test.go)
 
 # ── §B --password-stdin exists and conflicts with --password ────────────
-echo "── §B --password-stdin exists and is mutually exclusive with --password ──"
+# B1 retired: covered by TestPinCliPasswordArgsFlags (panel/go/internal/cli/pin_cli_password_args_test.go)
+# B2 retired: covered by TestPinCliPasswordArgsFlags + TestPinCliPasswordArgsConflictRejected (panel/go/internal/cli/pin_cli_password_args_test.go)
+# B3 retired: covered by TestPinCliPasswordArgsFlags (panel/go/internal/cli/pin_cli_password_args_test.go)
+# B4 retired: covered by TestPinCliPasswordArgsFlags (panel/go/internal/cli/pin_cli_password_args_test.go)
 
-if has "$DB_CREATE_VARIANT" 'password_stdin:\s*bool'; then
-  ok "B1 DbCmd::Create has a password_stdin flag"
+# ── §C resolvePassword implements all three resolution tiers ───────────
+echo "── §C resolvePassword: explicit value, stdin, interactive prompt ──"
+
+# C1 retired: covered by TestPinCliPasswordArgsResolve (panel/go/internal/cli/pin_cli_password_args_test.go)
+# C2 retired: covered by TestPinCliPasswordArgsResolve (panel/go/internal/cli/pin_cli_password_args_test.go)
+# C3 retired: covered by TestPinCliPasswordArgsResolve (panel/go/internal/cli/pin_cli_password_args_test.go)
+
+if has "$RESOLVE_BODY" 'promptTTY\(prompt\)' \
+  && has "$PROMPT_BODY" 'os\.OpenFile\("/dev/tty"' && has "$PROMPT_BODY" 'term\.ReadPassword\('; then
+  ok "C4 the fallback tier is an interactive masked prompt on /dev/tty (promptTTY → term.ReadPassword)"
 else
-  bad "B1 DbCmd::Create has no password_stdin flag"
+  bad "C4 no interactive masked-prompt fallback — a caller with neither flag would get... what?"
 fi
 
-if has "$DB_CREATE_VARIANT" 'conflicts_with\s*=\s*"password_stdin"'; then
-  ok "B2 DbCmd::Create's --password conflicts_with --password-stdin"
+# C5 retired: covered by TestPinCliPasswordArgsResolve (panel/go/internal/cli/pin_cli_password_args_test.go)
+
+# ── §D both commands actually CALL resolvePassword ───────────────────────
+echo "── §D cmdDBCreate / cmdDBBackupCreate resolve before sending ──"
+
+if has "$CMD_DB_CREATE_BODY" 'resolvePassword\(password, fromStdin,'; then
+  ok "D1 cmdDBCreate calls resolvePassword"
 else
-  bad "B2 no conflicts_with guard — a caller could pass both flags with silently ambiguous precedence"
+  bad "D1 cmdDBCreate never calls resolvePassword — the optional-flag plumbing is decorative"
 fi
 
-if has "$BACKUP_DBCREATE_VARIANT" 'password_stdin:\s*bool'; then
-  ok "B3 BackupCmd::DbCreate has a password_stdin flag"
+if before "$CMD_DB_CREATE_BODY" "resolvePassword" 'map[string]any{' \
+  && has "$CMD_DB_CREATE_BODY" '"password": pw'; then
+  ok "D2 resolvePassword runs before the request body is built, and the body sends the resolved value"
 else
-  bad "B3 BackupCmd::DbCreate has no password_stdin flag"
+  bad "D2 resolvePassword runs after (or the request body doesn't use its result) — position wrong"
 fi
 
-if has "$BACKUP_DBCREATE_VARIANT" 'conflicts_with\s*=\s*"password_stdin"'; then
-  ok "B4 BackupCmd::DbCreate's --password conflicts_with --password-stdin"
+if has "$CMD_DB_BACKUP_CREATE_BODY" 'resolvePassword\(password, fromStdin,'; then
+  ok "D3 cmdDBBackupCreate calls resolvePassword"
 else
-  bad "B4 no conflicts_with guard on the backup db-create variant"
+  bad "D3 cmdDBBackupCreate never calls resolvePassword"
 fi
 
-# ── §C resolve_password implements all three resolution tiers ──────────
-echo "── §C resolve_password: explicit value, stdin, interactive prompt ──"
-
-if [ -n "$RESOLVE_BODY" ]; then
-  ok "C1 resolve_password exists"
+if before "$CMD_DB_BACKUP_CREATE_BODY" "resolvePassword" 'map[string]any{' \
+  && has "$CMD_DB_BACKUP_CREATE_BODY" '"password": +pw'; then
+  ok "D4 resolvePassword runs before the request body is built, and the body sends the resolved value"
 else
-  bad "C1 resolve_password is missing — every arm below is measuring nothing"
+  bad "D4 resolvePassword runs after (or the request body doesn't use its result) — position wrong"
 fi
 
-if has "$RESOLVE_BODY" 'if let Some\(p\) = password'; then
-  ok "C2 an explicit --password value is honored first (backward compatible)"
+# ── §E the module actually depends on the masked-prompt package ──────────
+echo "── §E go.mod declares the prompt dependency ──"
+
+if grep -qE '^[[:space:]]*golang\.org/x/term v' panel/go/go.mod; then
+  ok "E1 panel/go/go.mod depends on golang.org/x/term (rpassword's equivalent)"
 else
-  bad "C2 no explicit-value tier — existing scripts using --password would break"
-fi
-
-if has "$RESOLVE_BODY" 'password_stdin' && has "$RESOLVE_BODY" 'read_line'; then
-  ok "C3 the stdin tier reads a line when password_stdin is set"
-else
-  bad "C3 no stdin-reading tier found"
-fi
-
-if has "$RESOLVE_BODY" 'rpassword::prompt_password'; then
-  ok "C4 the fallback tier is an interactive masked prompt"
-else
-  bad "C4 no interactive prompt fallback — a caller with neither flag would get... what?"
-fi
-
-if before "$RESOLVE_BODY" "password_stdin" "rpassword::prompt_password"; then
-  ok "C5 stdin is tried before falling through to the interactive prompt"
-else
-  bad "C5 resolution order is wrong — the prompt could fire even with --password-stdin set"
-fi
-
-# ── §D both commands actually CALL resolve_password ──────────────────────
-echo "── §D cmd_db_create / cmd_db_backup_create resolve before sending ──"
-
-if has "$CMD_DB_CREATE_BODY" 'resolve_password'; then
-  ok "D1 cmd_db_create calls resolve_password"
-else
-  bad "D1 cmd_db_create never calls resolve_password — the Option<String> plumbing is decorative"
-fi
-
-if before "$CMD_DB_CREATE_BODY" "resolve_password" 'json!({'; then
-  ok "D2 resolve_password runs before the request body is built"
-else
-  bad "D2 resolve_password runs after (or the request body doesn't wait for it) — position wrong"
-fi
-
-if has "$CMD_DB_BACKUP_CREATE_BODY" 'resolve_password'; then
-  ok "D3 cmd_db_backup_create calls resolve_password"
-else
-  bad "D3 cmd_db_backup_create never calls resolve_password"
-fi
-
-if before "$CMD_DB_BACKUP_CREATE_BODY" "resolve_password" 'json!({'; then
-  ok "D4 resolve_password runs before the request body is built"
-else
-  bad "D4 resolve_password runs after (or the request body doesn't wait for it) — position wrong"
-fi
-
-# ── §E the CLI crate actually depends on rpassword ───────────────────────
-echo "── §E Cargo.toml declares the prompt dependency ──"
-
-if grep -qE '^rpassword\s*=' panel/cli/Cargo.toml; then
-  ok "E1 panel/cli/Cargo.toml depends on rpassword"
-else
-  bad "E1 no rpassword dependency in panel/cli/Cargo.toml — C4 above would not even compile"
+  bad "E1 no golang.org/x/term dependency in panel/go/go.mod — C4 above would not even compile"
 fi
 
 # ── §F docs reflect the new, safer default ────────────────────────────────

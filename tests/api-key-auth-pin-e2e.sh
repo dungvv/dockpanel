@@ -2,9 +2,10 @@
 # api-key-auth-pin-e2e.sh — s467
 #
 # Wires the panel's previously-unwired `dp_`-prefixed API key scaffold
-# (routes/api_keys.rs) into `AuthUser` (auth.rs), so it authenticates like a
-# session JWT on every AuthUser-gated handler — the missing half that let the
-# CLI (panel/cli/src/backend_client.rs) restore a site's DATABASE as well as
+# (now panel/go/internal/api/rt_api_keys.go) into the authUser extractor
+# (core_auth.go: (*AppState).authUser -> authenticateAPIKey), so it
+# authenticates like a session JWT on every authUser-gated handler — the
+# missing half that let the CLI (now panel/go/internal/cli/backend.go) restore a site's DATABASE as well as
 # its files, which the agent alone structurally cannot do (no DB
 # credentials). Full design: project_dockpanel_tech_debt_p198. Full account
 # of what shipped, including three fixes a 3-lens adversarial skeptic
@@ -40,6 +41,11 @@
 # failed" bug pre-fix, and an admin's key restoring a site owned by a
 # DIFFERENT user via the admin-sites fallback).
 #
+# GO PORT: §A reads panel/go/internal/api/core_auth.go, §B the shipped
+# migrations copy panel/go/internal/api/migrations, §C/§D the Go CLI
+# (internal/cli/backend.go followProgress/loadBackendToken, internal/cli/
+# backup.go cmdBackupRestoreViaBackend).
+#
 # No running panel needed.
 #   run: bash tests/api-key-auth-pin-e2e.sh
 set -uo pipefail
@@ -74,7 +80,7 @@ lacks() { ! grep -qE -- "$2" <<< "$1"; }
 # can't be satisfied by an unrelated occurrence elsewhere in the same file.
 fnbody() {
   awk -v fn="$2" '
-    index($0, "fn " fn "(") && !started { started=1 }
+    (index($0, "func " fn "(") == 1 || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) && !started { started=1 }
     started {
       n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
       if (opened || n>0) opened=1
@@ -83,54 +89,55 @@ fnbody() {
   ' <<< "$1"
 }
 
-AUTH=panel/backend/src/auth.rs
+AUTH=panel/go/internal/api/core_auth.go
 AUTH_C=$(code "$AUTH")
-MIGRATIONS_GLOB=$(ls panel/backend/migrations/*api_keys_hash*.sql 2>/dev/null | head -1)
+MIGRATIONS_GLOB=$(ls panel/go/internal/api/migrations/*api_keys_hash*.sql 2>/dev/null | head -1)
 MIGRATION_C=$([ -n "$MIGRATIONS_GLOB" ] && code "$MIGRATIONS_GLOB" || echo "")
-BACKEND_CLIENT=panel/cli/src/backend_client.rs
+BACKEND_CLIENT=panel/go/internal/cli/backend.go
 BACKEND_CLIENT_C=$(code "$BACKEND_CLIENT")
-BACKUP=panel/cli/src/commands/backup.rs
+BACKUP=panel/go/internal/cli/backup.go
 BACKUP_C=$(code "$BACKUP")
 
 # ── §A auth.rs: the dp_ branch and authenticate_api_key() ──────────────────
-echo "── §A auth.rs: dp_-prefixed bearer tokens authenticate as an API key, not a JWT ──"
+echo "── §A core_auth.go: dp_-prefixed bearer tokens authenticate as an API key, not a JWT ──"
 
-FRP_BODY=$(fnbody "$AUTH_C" "from_request_parts")
-if has "$FRP_BODY" 'bearer_token\.as_deref\(\)\.filter\(\|t\| t\.starts_with\("dp_"\)\)'; then
-  ok "A1 AuthUser::from_request_parts detects a dp_-prefixed bearer token"
+FRP_BODY=$(fnbody "$AUTH_C" "authUser")
+if has "$FRP_BODY" 'if hasBearer && strings\.HasPrefix\(bearer, "dp_"\) \{' \
+  && has "$FRP_BODY" 'return st\.authenticateAPIKey\(r\.Context\(\), bearer\)'; then
+  ok "A1 (*AppState).authUser detects a dp_-prefixed bearer token"
 else
-  bad "A1 the dp_-prefix detection branch is missing from AuthUser::from_request_parts"
+  bad "A1 the dp_-prefix detection branch is missing from (*AppState).authUser"
 fi
 
-DP_CHECK_LINE=$(grep -nE 'starts_with\("dp_"\)' "$AUTH" | head -1 | cut -d: -f1)
-COOKIE_FALLBACK_LINE=$(grep -nE '^\s*let token = bearer_token\.clone\(\)\.or_else' "$AUTH" | head -1 | cut -d: -f1)
+DP_CHECK_LINE=$(grep -nE 'strings\.HasPrefix\(bearer, "dp_"\)' <<< "$FRP_BODY" | head -1 | cut -d: -f1)
+COOKIE_FALLBACK_LINE=$(grep -nE '^\s*token := bearer$' <<< "$FRP_BODY" | head -1 | cut -d: -f1)
 if [ -n "$DP_CHECK_LINE" ] && [ -n "$COOKIE_FALLBACK_LINE" ] && [ "$DP_CHECK_LINE" -lt "$COOKIE_FALLBACK_LINE" ]; then
   ok "A2 the dp_ check runs BEFORE the JWT/cookie-fallback logic (an early return, not a fallback)"
 else
   bad "A2 the dp_ check is not positioned before the JWT/cookie path — it would never be reached, or would run after a wasted decode attempt"
 fi
 
-if has "$AUTH_C" 'async fn authenticate_api_key\(state: &AppState, key: &str\) -> Result<Claims, ApiError>'; then
-  ok "A3 authenticate_api_key() exists with the expected signature"
+if has "$AUTH_C" '^func \(st \*AppState\) authenticateAPIKey\(ctx context\.Context, key string\) \(\*Claims, error\)'; then
+  ok "A3 authenticateAPIKey() exists with the expected signature"
 else
-  bad "A3 authenticate_api_key() is missing or its signature changed"
+  bad "A3 authenticateAPIKey() is missing or its signature changed"
 fi
 
-AAK_BODY=$(fnbody "$AUTH_C" "authenticate_api_key")
+AAK_BODY=$(fnbody "$AUTH_C" "authenticateAPIKey")
 
-if lacks "$AAK_BODY" 'session_invalid\('; then
-  ok "A4 authenticate_api_key() never uses the session_invalid() marker (a key is not a browser session)"
+if [ -n "$AAK_BODY" ] && lacks "$AAK_BODY" 'sessionInvalid\('; then
+  ok "A4 authenticateAPIKey() never uses the sessionInvalid() marker (a key is not a browser session)"
 else
-  bad "A4 authenticate_api_key() calls session_invalid() — a bad/revoked key would wrongly redirect a browser to /login"
+  bad "A4 authenticateAPIKey() is missing or calls sessionInvalid() — a bad/revoked key would wrongly redirect a browser to /login"
 fi
 
 # Control: session_invalid() itself still exists and is still used by the JWT
 # path — proves A4 passes because the call was REMOVED from this function
 # specifically, not because the whole helper was deleted project-wide.
-if has "$AUTH_C" 'fn session_invalid\(msg: &str\) -> ApiError' && has "$AUTH_C" 'session_invalid\("Authentication required"\)'; then
-  ok "A4-control session_invalid() still exists and still gates the JWT/cookie path"
+if has "$AUTH_C" '^func sessionInvalid\(msg string\) error' && has "$FRP_BODY" 'sessionInvalid\("Authentication required"\)'; then
+  ok "A4-control sessionInvalid() still exists and still gates the JWT/cookie path"
 else
-  bad "A4-control session_invalid() itself was removed or the JWT path no longer uses it"
+  bad "A4-control sessionInvalid() itself was removed or the JWT path no longer uses it"
 fi
 
 if has "$AAK_BODY" 'SELECT id, user_id, created_at FROM api_keys WHERE key_hash = \$1'; then
@@ -139,14 +146,14 @@ else
   bad "A5 the key-lookup query is missing created_at — the revocation check below cannot compare against a mint time"
 fi
 
-if has "$AAK_BODY" 'state\.sessions_revoked_at\.read\(\)\.await' \
-  && has "$AAK_BODY" 'created_at\.timestamp\(\) < ts'; then
+if has "$AAK_BODY" 'st\.sessionsRevokedAt\(\)' \
+  && has "$AAK_BODY" 'row\.CreatedAt\.Unix\(\) < ts'; then
   ok "A6 a key minted BEFORE the last 'revoke all sessions'/Panic Button fire is refused"
 else
   bad "A6 the sessions_revoked_at check is missing — a stolen/leaked key would survive an incident-response logout that explicitly promises to kill it"
 fi
 
-if has "$AAK_BODY" 'role == "suspended"'; then
+if has "$AAK_BODY" 'u\.Role == "suspended"'; then
   ok "A7 a suspended account's key stops authenticating (parity with the JWT path)"
 else
   bad "A7 the suspended-account check is missing from the API-key path"
@@ -176,18 +183,19 @@ fi
 
 # ── §C backend_client.rs: pass/fail is decided by the TERMINAL step alone ──
 echo
-echo "── §C CLI backend_client.rs: follow_progress() and byte-safe SSE framing ──"
+echo "── §C CLI backend.go: followProgress() and byte-safe SSE framing ──"
 
-if has "$BACKEND_CLIENT_C" 'if token\.is_empty\(\)'; then
-  ok "C1 load_token() rejects an empty/whitespace-only token file instead of treating it as configured"
+LT_BODY=$(fnbody "$BACKEND_CLIENT_C" "loadBackendToken")
+if has "$LT_BODY" 'token := strings\.TrimSpace\(raw\)' && has "$LT_BODY" 'if token == "" \{'; then
+  ok "C1 loadBackendToken() rejects an empty/whitespace-only token file instead of treating it as configured"
 else
-  bad "C1 load_token() no longer guards against an empty token file"
+  bad "C1 loadBackendToken() no longer guards against an empty token file"
 fi
 
-FP_BODY=$(fnbody "$BACKEND_CLIENT_C" "follow_progress")
+FP_BODY=$(fnbody "$BACKEND_CLIENT_C" "followProgress")
 
-if lacks "$FP_BODY" 'saw_error'; then
-  ok "C2 follow_progress() has no cross-step 'saw_error' latch left over from the fixed defect"
+if [ -n "$FP_BODY" ] && lacks "$FP_BODY" 'saw_?[Ee]rror|anyError|hadError'; then
+  ok "C2 followProgress() has no cross-step 'saw_error' latch left over from the fixed defect"
 else
   bad "C2 a saw_error-shaped latch is back — an earlier advisory-only error step would again fail a successful restore"
 fi
@@ -196,16 +204,17 @@ fi
 # `step_name == "complete"` branch — not a variable accumulated from earlier
 # events. Scoped to the tail of the function so an unrelated status==\"error\"
 # comparison elsewhere in the file can't satisfy this.
-COMPLETE_BRANCH=$(awk '/step_name == "complete"/{f=1} f' <<< "$FP_BODY")
+COMPLETE_BRANCH=$(awk '/"step"\), ""\) == "complete"/{f=1} f' <<< "$FP_BODY")
 if has "$COMPLETE_BRANCH" 'if status == "error"'; then
   ok "C3 the complete-event branch decides pass/fail from THIS event's own status"
 else
   bad "C3 the complete-event branch does not check its own status field"
 fi
 
-if has "$BACKEND_CLIENT_C" 'let mut buf: Vec<u8> = Vec::new\(\);' \
-  && has "$BACKEND_CLIENT_C" 'String::from_utf8_lossy\(&frame\)' \
-  && lacks "$BACKEND_CLIENT_C" 'String::from_utf8_lossy\(&chunk\)'; then
+if has "$FP_BODY" 'var buf \[\]byte' \
+  && has "$FP_BODY" 'buf = append\(buf, chunk\[:n\]\.\.\.\)' \
+  && has "$FP_BODY" 'frame := strings\.ToValidUTF8\(string\(buf\[:pos\+2\]\)' \
+  && lacks "$FP_BODY" 'string\(chunk'; then
   ok "C4 raw bytes are buffered across chunks and decoded only once a complete frame has arrived (chunk boundaries can split a multi-byte char)"
 else
   bad "C4 a raw chunk is decoded independently before a full frame has been assembled — a split multi-byte character would corrupt a printed message"
@@ -213,17 +222,22 @@ fi
 
 # ── §D backup.rs: domain resolution matches the restore endpoint's own scope ─
 echo
-echo "── §D CLI backup.rs: domain→site-id resolution falls back to the admin-sites listing ──"
+echo "── §D CLI backup.go: domain→site-id resolution falls back to the admin-sites listing ──"
 
-RESTORE_VIA_BACKEND_BODY=$(fnbody "$BACKUP_C" "cmd_backup_restore_via_backend")
+RESTORE_VIA_BACKEND_BODY=$(fnbody "$BACKUP_C" "cmdBackupRestoreViaBackend")
 
-if has "$RESTORE_VIA_BACKEND_BODY" '"/api/admin/sites"'; then
-  ok "D1 cmd_backup_restore_via_backend falls back to GET /api/admin/sites"
+if has "$RESTORE_VIA_BACKEND_BODY" 'backendGet\("/api/admin/sites", token\)'; then
+  ok "D1 cmdBackupRestoreViaBackend falls back to GET /api/admin/sites"
 else
   bad "D1 no /api/admin/sites fallback — an admin's key can restore a site it doesn't own via the API, but the CLI's own domain lookup would 404 first"
 fi
 
-if has "$RESTORE_VIA_BACKEND_BODY" 'owned_site_id'; then
+# Order: the owner-scoped lookup, then the `if !ok {` it failed, then the
+# admin listing inside it.
+L_OWN=$(grep -nE 'siteID, ok := findID\(sites, "domain", domain\)' <<< "$RESTORE_VIA_BACKEND_BODY" | head -1 | cut -d: -f1)
+L_IFNOT=$(awk -v from="${L_OWN:-999999}" 'NR > from && /^[[:space:]]*if !ok \{/ {print NR; exit}' <<< "$RESTORE_VIA_BACKEND_BODY")
+L_ADMIN=$(grep -nE '/api/admin/sites' <<< "$RESTORE_VIA_BACKEND_BODY" | head -1 | cut -d: -f1)
+if [ -n "$L_OWN" ] && [ -n "$L_IFNOT" ] && [ -n "$L_ADMIN" ] && [ "$L_OWN" -lt "$L_IFNOT" ] && [ "$L_IFNOT" -lt "$L_ADMIN" ]; then
   ok "D2 the fallback is conditioned on the owner-scoped lookup coming up empty, not run unconditionally"
 else
   bad "D2 no owned/not-owned branch found — cannot confirm the fallback is actually gated"

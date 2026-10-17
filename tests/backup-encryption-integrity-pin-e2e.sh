@@ -5,26 +5,27 @@
 # tampered with is REJECTED before it is ever decrypted, instead of
 # decrypting silently into wrong bytes.
 #
-# `panel/agent/src/services/encryption.rs` used plain AES-256-CBC with no
+# The agent's backup encryption (Rust era: services/encryption.rs; now
+# `panel/go/internal/agent/services/encryption.go`) used plain AES-256-CBC with no
 # integrity check (CWE-353). PKCS7 padding bounds only the final ciphertext
 # block, so a bit-flip anywhere earlier decrypts without error into
 # corrupted plaintext — a database dump that silently fails to import, or
-# worse, imports partially. Fix: encrypt-then-MAC. `encrypt_file` appends a
+# worse, imports partially. Fix: encrypt-then-MAC. `EncryptionEncryptFile` appends a
 # 32-byte HMAC-SHA256 tag (over the ciphertext, keyed by a passphrase-
 # derived subkey independent of the AES key openssl derives internally) plus
-# an 8-byte magic marker. `decrypt_file` verifies that tag BEFORE handing
+# an 8-byte magic marker. `EncryptionDecryptFile` verifies that tag BEFORE handing
 # anything to openssl. A backup encrypted before this fix has no trailer;
-# `decrypt_file` detects the absence and falls back to the old,
+# `EncryptionDecryptFile` detects the absence and falls back to the old,
 # unauthenticated path so existing backups keep working.
 #
 # §A the crypto helpers + format constants exist.
-# §B encrypt_file: waits for openssl success, THEN computes+appends the tag
+# §B EncryptionEncryptFile: waits for openssl success, THEN computes+appends the tag
 #    (position — tagging a failed/partial encrypt would tag garbage).
-# §C decrypt_file: verifies the tag BEFORE the openssl child is spawned
+# §C EncryptionDecryptFile: verifies the tag BEFORE the openssl child is spawned
 #    (position — the core property; decrypting-then-checking would already
 #    have written attacker-controlled plaintext to disk by the time a check
 #    ran).
-# §D decrypt_file: a backup with no trailer (legacy, pre-fix) still
+# §D EncryptionDecryptFile: a backup with no trailer (legacy, pre-fix) still
 #    decrypts — the compatibility half of the fix.
 # §E docs no longer claim a mode ("GCM") this file has never implemented.
 # §F a live round trip against the REAL openssl binary + a Python replica of
@@ -63,11 +64,12 @@ code() {
 
 has()  { grep -qE -- "$2" <<< "$1"; }
 
-# A function body, bounded on ITS OWN braces. Anchored on `fn NAME(`, not the
-# bare name, so a rename to a prefixed/suffixed sibling cannot satisfy it.
+# A function body, bounded on ITS OWN braces. Anchored on `func NAME(` (or a
+# method `func (r *T) NAME(`), not the bare name, so a rename to a
+# prefixed/suffixed sibling cannot satisfy it.
 fnbody() {
   awk -v fn="$2" '
-    index($0, "fn " fn "(") && !started { started=1 }
+    (index($0, "func " fn "(") || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) && !started { started=1 }
     started {
       n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
       if (opened || n>0) opened=1
@@ -94,79 +96,71 @@ before() {
   [ "$o1" != -1 ] && [ "$o2" != -1 ] && [ "$o1" -lt "$o2" ]
 }
 
-ENC=panel/agent/src/services/encryption.rs
+ENC=panel/go/internal/agent/services/encryption.go
+[ -f "$ENC" ] || { echo "missing file: $ENC"; exit 1; }
 ENC_C=$(code "$ENC")
 
-ENCRYPT_BODY=$(fnbody "$ENC_C" "encrypt_file")
-DECRYPT_BODY=$(fnbody "$ENC_C" "decrypt_file")
+ENCRYPT_BODY=$(fnbody "$ENC_C" "EncryptionEncryptFile")
+DECRYPT_BODY=$(fnbody "$ENC_C" "EncryptionDecryptFile")
+OPENSSL_BODY=$(fnbody "$ENC_C" "encryptionOpenssl")
 
 # ── §A crypto helpers + format constants exist ───────────────────────────
 echo "── §A HMAC helpers and format constants exist ──"
 
-if has "$ENC_C" 'fn derive_mac_key'; then
-  ok "A1 derive_mac_key exists"
-else
-  bad "A1 derive_mac_key is missing — nothing below can be measuring the real fix"
-fi
+# A1 retired: covered by TestEncryptionMacKeyIsIndependentPerPassphrase (panel/go/internal/agent/services/encryption_test.go)
+# A2 retired: covered by TestEncryptionTagRoundTrips (panel/go/internal/agent/services/encryption_test.go)
+# A3 retired: covered by TestEncryptionTagRejectsTamperedCiphertext (panel/go/internal/agent/services/encryption_test.go)
 
-if has "$ENC_C" 'fn compute_tag'; then
-  ok "A2 compute_tag exists"
-else
-  bad "A2 compute_tag is missing"
-fi
-
-if has "$ENC_C" 'fn verify_tag'; then
-  ok "A3 verify_tag exists"
-else
-  bad "A3 verify_tag is missing"
-fi
-
-if has "$ENC_C" 'MAC_MAGIC'; then
+if has "$ENC_C" 'encryptionMacMagic[[:space:]]*= "DPHMAC01"'; then
   ok "A4 a magic trailer marker distinguishes tagged from legacy files"
 else
   bad "A4 no magic marker constant — legacy detection has nothing to key off"
 fi
 
-if has "$ENC_C" '"dockpanel-backup-hmac-v1"'; then
-  ok "A5 the MAC key is domain-separated from the AES key by a fixed label"
+# A5 retired: covered by TestEncryptionTagFormatIsNestedHmac (panel/go/internal/agent/services/encryption_test.go)
+
+# ── §B EncryptionEncryptFile: tag AFTER confirmed success, not before ────────────
+echo "── §B EncryptionEncryptFile tags only a confirmed-good ciphertext ──"
+
+if has "$ENCRYPT_BODY" 'encryptionComputeTag\('; then
+  ok "B1 EncryptionEncryptFile calls encryptionComputeTag"
 else
-  bad "A5 no domain-separation label — the MAC subkey derivation changed shape"
+  bad "B1 EncryptionEncryptFile does not call encryptionComputeTag — no tag is ever written"
 fi
 
-# ── §B encrypt_file: tag AFTER confirmed success, not before ────────────
-echo "── §B encrypt_file tags only a confirmed-good ciphertext ──"
-
-if has "$ENCRYPT_BODY" 'compute_tag'; then
-  ok "B1 encrypt_file calls compute_tag"
+if before "$ENCRYPT_BODY" "if !out.Success()" "encryptionComputeTag("; then
+  ok "B2 the openssl success check precedes encryptionComputeTag — a failed/partial encrypt is never tagged"
 else
-  bad "B1 encrypt_file does not call compute_tag — no tag is ever written"
+  bad "B2 encryptionComputeTag runs before (or without) confirming openssl succeeded — could tag garbage"
 fi
 
-if before "$ENCRYPT_BODY" "output.status.success" "compute_tag("; then
-  ok "B2 the openssl success check precedes compute_tag — a failed/partial encrypt is never tagged"
-else
-  bad "B2 compute_tag runs before (or without) confirming openssl succeeded — could tag garbage"
-fi
-
-if has "$ENCRYPT_BODY" '\.append\(true\)'; then
+if has "$ENCRYPT_BODY" 'os\.O_APPEND'; then
   ok "B3 the tag is appended to the ciphertext file, not written to a side channel"
 else
   bad "B3 no append-mode write found — where does the tag actually go?"
 fi
 
-# ── §C decrypt_file: verify BEFORE decrypting ────────────────────────────
-echo "── §C decrypt_file verifies the tag before openssl ever runs ──"
+# ── §C EncryptionDecryptFile: verify BEFORE decrypting ────────────────────────────
+echo "── §C EncryptionDecryptFile verifies the tag before openssl ever runs ──"
 
-if has "$DECRYPT_BODY" 'verify_tag'; then
-  ok "C1 decrypt_file calls verify_tag"
+if has "$DECRYPT_BODY" 'encryptionVerifyTag\('; then
+  ok "C1 EncryptionDecryptFile calls encryptionVerifyTag"
 else
-  bad "C1 decrypt_file does not call verify_tag — a tampered backup would decrypt unchecked"
+  bad "C1 EncryptionDecryptFile does not call encryptionVerifyTag — a tampered backup would decrypt unchecked"
 fi
 
-if before "$DECRYPT_BODY" "verify_tag(" "safe_command(\"openssl\")"; then
-  ok "C2 verify_tag precedes the openssl child spawn — verify-then-decrypt, not the reverse"
+# In Go the openssl child is spawned inside encryptionOpenssl, so the position
+# is measured against that call — and C2a proves the helper really is the spawn.
+if has "$OPENSSL_BODY" 'safecmd\.Command\(ctx, "openssl"'; then
+  ok "C2a encryptionOpenssl is where the openssl child is spawned"
 else
-  bad "C2 verify_tag runs at or after the openssl spawn — present-but-too-late is the same as absent"
+  bad "C2a encryptionOpenssl no longer spawns openssl — C2's position check would be measuring the wrong call"
+fi
+if before "$DECRYPT_BODY" "encryptionVerifyTag(" "encryptionOpenssl(" \
+   && [ "$(grep -c 'safecmd\.' <<< "$DECRYPT_BODY")" -eq 0 ]; then
+  ok "C2 encryptionVerifyTag precedes the openssl child spawn — verify-then-decrypt, not the reverse"
+else
+  bad "C2 encryptionVerifyTag runs at or after the openssl spawn — present-but-too-late is the same as absent"
 fi
 
 if has "$DECRYPT_BODY" "integrity check failed"; then
@@ -178,10 +172,10 @@ fi
 # ── §D legacy (pre-fix, untagged) backups still decrypt ─────────────────
 echo "── §D a backup with no trailer falls back to the old path ──"
 
-if has "$DECRYPT_BODY" 'has_tag'; then
-  ok "D1 decrypt_file branches on whether a trailer is present"
+if has "$DECRYPT_BODY" 'if hasTag \{'; then
+  ok "D1 EncryptionDecryptFile branches on whether a trailer is present"
 else
-  bad "D1 no has_tag-style branch — every old backup would now fail to decrypt"
+  bad "D1 no hasTag-style branch — every old backup would now fail to decrypt"
 fi
 
 if has "$DECRYPT_BODY" 'predates the integrity'; then
@@ -227,7 +221,7 @@ enc_path = os.path.join(workdir, "plain.bin.enc")
 with open(plain_path, "wb") as f:
     f.write(os.urandom(4096))
 
-# Same openssl invocation shape as encrypt_file (key via stdin, not argv).
+# Same openssl invocation shape as EncryptionEncryptFile (key via stdin, not argv).
 r = subprocess.run(
     ["openssl", "enc", "-aes-256-cbc", "-salt", "-pbkdf2", "-iter", "100000",
      "-in", plain_path, "-out", enc_path, "-pass", "stdin"],
