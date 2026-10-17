@@ -6,47 +6,28 @@ on:
   pull_request:
     branches: [main]
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  lint-rust:
-    name: Lint (Rust)
+  # Every shipped binary (API, agent, CLI, MCP server) is Go, in panel/go.
+  # Unlike the clippy steps this replaced (`|| true`), lint is enforcing.
+  lint-go:
+    name: Lint (Go)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Go
+        uses: actions/setup-go@v6
         with:
-          components: clippy
+          go-version-file: panel/go/go.mod
+          cache-dependency-path: panel/go/go.sum
 
-      - name: Cache Rust dependencies
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            panel/agent/target/
-            panel/backend/target/
-            panel/cli/target/
-            panel/mcp/target/
-          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-lint-
+      - name: gofmt
+        run: |
+          unformatted=$(cd panel/go && gofmt -l .)
+          [ -z "$unformatted" ] || { echo "::error::not gofmt-clean:"; echo "$unformatted"; exit 1; }
 
-      - name: Clippy — Agent
-        run: cargo clippy --manifest-path panel/agent/Cargo.toml --release 2>&1 || true
-
-      - name: Clippy — Backend
-        run: cargo clippy --manifest-path panel/backend/Cargo.toml --release 2>&1 || true
-
-      - name: Clippy — CLI
-        run: cargo clippy --manifest-path panel/cli/Cargo.toml --release 2>&1 || true
-
-      - name: Clippy — MCP
-        run: cargo clippy --manifest-path panel/mcp/Cargo.toml --release 2>&1 || true
+      - name: go vet
+        run: cd panel/go && go vet ./...
 
   lint-frontend:
     name: Lint (Frontend)
@@ -67,50 +48,30 @@ jobs:
       - name: Type check
         run: cd panel/frontend && npx tsc --noEmit
 
-  build-rust:
-    name: Build (Rust)
+  build-go:
+    name: Build (Go)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: actions/cache@v5
+      - name: Setup Go
+        uses: actions/setup-go@v6
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            panel/agent/target/
-            panel/backend/target/
-            panel/cli/target/
-            panel/mcp/target/
-          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-build-
+          go-version-file: panel/go/go.mod
+          cache-dependency-path: panel/go/go.sum
 
-      - name: Build Agent
-        run: cargo build --release --manifest-path panel/agent/Cargo.toml
-
-      - name: Build Backend
-        run: cargo build --release --manifest-path panel/backend/Cargo.toml
-
-      - name: Build CLI
-        run: cargo build --release --manifest-path panel/cli/Cargo.toml
-
-      - name: Build MCP
-        run: cargo build --release --manifest-path panel/mcp/Cargo.toml
+      - name: Build all binaries, both arches (static)
+        run: |
+          bash scripts/build-go.sh go-out/amd64 amd64
+          bash scripts/build-go.sh go-out/arm64 arm64
 
       - name: Report binary sizes
         run: |
-          echo "| Binary | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "| Binary | Size (amd64) |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Agent | $(du -h panel/agent/target/release/dockpanel-agent | cut -f1) |" >> $GITHUB_STEP_SUMMARY
-          echo "| API | $(du -h panel/backend/target/release/dockpanel-api | cut -f1) |" >> $GITHUB_STEP_SUMMARY
-          echo "| CLI | $(du -h panel/cli/target/release/dockpanel | cut -f1) |" >> $GITHUB_STEP_SUMMARY
-          echo "| MCP | $(du -h panel/mcp/target/release/dockpanel-mcp | cut -f1) |" >> $GITHUB_STEP_SUMMARY
+          for b in dockpanel-api dockpanel-agent dockpanel dockpanel-mcp; do
+            echo "| $b | $(du -h go-out/amd64/$b | cut -f1) |" >> $GITHUB_STEP_SUMMARY
+          done
 
   build-frontend:
     name: Build (Frontend)
@@ -136,34 +97,39 @@ jobs:
           echo "### Frontend Bundle" >> $GITHUB_STEP_SUMMARY
           du -sh panel/frontend/dist/ >> $GITHUB_STEP_SUMMARY
 
+  # The api package's DB-backed tests (migrator, query helpers, every route
+  # group's SQL) are gated on DATABASE_URL — without the service they skip, so
+  # the service is what makes them run here.
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: dockpanel
+          POSTGRES_PASSWORD: dockpanel
+          POSTGRES_DB: dockpanel
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: actions/cache@v5
+      - name: Setup Go
+        uses: actions/setup-go@v6
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            panel/agent/target/
-            panel/backend/target/
-            panel/cli/target/
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-
+          go-version-file: panel/go/go.mod
+          cache-dependency-path: panel/go/go.sum
 
-      - name: Test Agent
-        run: cargo test --manifest-path panel/agent/Cargo.toml
-
-      - name: Test Backend
-        run: cargo test --manifest-path panel/backend/Cargo.toml
+      - name: go test (race, Postgres-backed)
+        env:
+          DATABASE_URL: postgres://dockpanel:dockpanel@localhost:5432/dockpanel?sslmode=disable
+        run: cd panel/go && go test -race -count=1 ./...
 
   security:
     name: Security Audit
@@ -171,36 +137,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+      - name: Setup Go
+        uses: actions/setup-go@v6
         with:
-          tool: cargo-audit
+          go-version-file: panel/go/go.mod
+          cache-dependency-path: panel/go/go.sum
 
-      # Audits are ENFORCING (no `|| true`): a real advisory now FAILS the build.
-      # Accepted, upstream-blocked items are ignored narrowly and on purpose —
-      # panel/backend/.cargo/audit.toml pins RUSTSEC-2023-0071 (the rsa phantom
-      # lockfile entry from sqlx-mysql; DockPanel is Postgres-only). Unmaintained
-      # and yanked advisories are cargo-audit *warnings* and do not fail the run.
-      - name: Audit Agent
-        run: cd panel/agent && cargo audit
-
-      - name: Audit Backend
-        run: cd panel/backend && cargo audit
-
-      - name: Audit CLI
-        run: cd panel/cli && cargo audit
-
-      # rmcp is the newest, fastest-moving dependency in this codebase (63
-      # releases since March 2025, one disclosed CVSS 7.5 DoS already patched
-      # — see the >=3.2.0 pin comment in panel/mcp/Cargo.toml). Dependabot
-      # alone has repeatedly missed Rust advisories on this project
-      # (RUSTSEC entries aren't GitHub Security Advisories) — this is the
-      # audit that actually catches them.
-      - name: Audit MCP
-        run: cd panel/mcp && cargo audit
+      # Enforcing, like the cargo audits it replaced: a known vulnerability in
+      # code the binaries actually reach fails the build. govulncheck reports
+      # only reachable call paths, so it needs no ignore list.
+      - name: govulncheck
+        run: cd panel/go && go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -689,30 +636,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      # The same cache key as `build-rust` on purpose: this job wants that job's
-      # artifacts, not a second copy of them.
-      - name: Cache Rust dependencies
-        uses: actions/cache@v5
+      - name: Setup Go
+        uses: actions/setup-go@v6
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            panel/backend/target/
-          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-build-
+          go-version-file: panel/go/go.mod
+          cache-dependency-path: panel/go/go.sum
 
       - name: Build the API
-        run: cargo build --release --manifest-path panel/backend/Cargo.toml
+        run: cd panel/go && CGO_ENABLED=0 go build -o /tmp/dockpanel-api ./cmd/dockpanel-api
 
       # No agent socket and no /etc/dockpanel here. The API needs exactly three
-      # variables, all hard `.expect()`s with no default (config.rs:96,119,124),
-      # and applies its own migrations on boot (main.rs:192) — so a bare runner
-      # with an empty postgres is enough.
+      # variables with no default (core_config.go) and applies its own
+      # migrations on boot — so a bare runner with an empty postgres is enough.
       - name: Start the API
         env:
           DATABASE_URL: postgresql://dockpanel:dockpanel@localhost:5432/dockpanel
@@ -720,12 +655,12 @@ jobs:
           AGENT_TOKEN: ci-only-agent-token-not-a-secret
           AGENT_SOCKET: /tmp/dockpanel-agent-absent.sock
         run: |
-          ./panel/backend/target/release/dockpanel-api > /tmp/api.log 2>&1 &
+          /tmp/dockpanel-api > /tmp/api.log 2>&1 &
           API_PID=$!
           for i in $(seq 1 60); do
             # The liveness check is not belt-and-braces. If postgres is
             # unreachable the API retries five times and then RETURNS FROM MAIN
-            # (main.rs:166) — it exits ZERO, having never bound a port. Polling
+            # — it exits ZERO, having never bound a port. Polling
             # only the port would burn the whole timeout and then blame the
             # health endpoint for a database that was never reachable, which is
             # the wrong sentence to hand whoever has to fix it.
