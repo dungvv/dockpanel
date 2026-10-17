@@ -21,7 +21,7 @@
 # stubbed systemctl/docker/curl — the guard decides whether to leave a panel
 # down, and a guard that has never been executed is a comment. Part 2 is source
 # analysis over CODE ONLY: it strips comments from both subjects and reads the
-# Rust one as production code, because a claim about behaviour that a paragraph
+# Go one as production code, because a claim about behaviour that a paragraph
 # of prose can satisfy is not a claim (s338). Its own arms are mutation-tested
 # on every run — commented out for the positive ones, and the real defect
 # planted for each negative one, which is the direction that fails quietly.
@@ -39,7 +39,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # replaced (lesson #109c).
 RESTORE_SH="${RESTORE_SH:-$REPO_ROOT/scripts/restore-snapshot.sh}"
 UPDATE_SH="${UPDATE_SH:-$REPO_ROOT/scripts/update.sh}"
-ORCHESTRATOR="${ORCHESTRATOR:-$REPO_ROOT/panel/backend/src/services/panel_update.rs}"
+ORCHESTRATOR="${ORCHESTRATOR:-$REPO_ROOT/panel/go/internal/api/svc_panel_update.go}"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
@@ -61,7 +61,7 @@ assert_lacks() { if contains "$2" "$3"; then bad "$1 — must NOT contain: $2"; 
 # NEGATIVE arm (match ⇒ bad) silently green, which is the direction that ships.
 comment_marker_for() {
   case "$1" in
-    *.rs|*.mjs|*.js|*.ts|*.tsx)                echo '//' ;;
+    *.go|*.rs|*.mjs|*.js|*.ts|*.tsx)           echo '//' ;;
     *.json)                                    echo ''   ;;  # JSON has no comments
     *)                                         echo '#'  ;;  # .sh, .service, .gitignore, .toml
   esac
@@ -82,7 +82,7 @@ code_lines() {
     # over it passed on code the stripper had merely removed.
     #
     # A trailing `//` is stripped, but only when the text before it has BALANCED
-    # double quotes — otherwise `let u = "https://host"` would lose its tail.
+    # double quotes — otherwise `u := "https://host"` would lose its tail.
     # Backslash escapes are skipped so `\"` does not flip the parity.
     awk '
       /^[[:space:]]*\/\*/ &&  /\*\/[[:space:]]*$/ { print ""; next }
@@ -127,19 +127,15 @@ has_code()   { local f="$1"; shift; [ "$(code_count "$f" "$@")" -gt 0 ]; }
 code_lineno() { local f="$1"; shift; code_lines "$f" | grep -n "$@" 2>/dev/null | head -1 | cut -d: -f1 || true; }
 
 # ── one addition to the set, for a second kind of blindness ──────────────────
-# The orchestrator's unit-test module quotes, in its own assertions, the very
-# filename the arms below look for. An arm that reads the whole file is
-# therefore satisfied BY THE TESTS even when the production constant has been
-# retargeted at something else entirely — measured against this suite at s338,
-# with nothing commented out at all. So the Rust subject is read as production
-# code: comments stripped as above, then everything from the test attribute to
-# EOF blanked. Height is preserved here too, for the same reason.
-prod_lines() {
-  code_lines "$1" | awk '
-    /^[[:space:]]*#\[cfg\(test\)\]/ { intest = 1 }
-    intest                          { print ""; next }
-                                    { print }'
-}
+# The orchestrator's unit tests quote, in their own assertions, the very
+# filename the arms below look for. An arm that read the tests too would be
+# satisfied BY THE TESTS even when the production constant had been retargeted
+# at something else entirely — measured against this suite at s338 (Rust, whose
+# test module shared the file), with nothing commented out at all. In Go the
+# tests live in svc_panel_update_test.go, which no arm reads, so production code
+# is the subject file's code lines. The name is kept so every arm still says
+# which stream it reads.
+prod_lines() { code_lines "$1"; }
 prod_count() { local f="$1"; shift; prod_lines "$f" | grep -c "$@" 2>/dev/null || true; }
 has_prod()   { local f="$1"; shift; [ "$(prod_count "$f" "$@")" -gt 0 ]; }
 
@@ -389,10 +385,10 @@ echo
 PAT_VERDICT_PATH='^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*="[^"]*last-panel-update[.]json"'
 PAT_EXIT_TRAP='^[[:space:]]*trap[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+EXIT'
 PAT_DETACHED='^[[:space:]]*exec[[:space:]]+systemd-run'
-PAT_RESULT_CONST='^[[:space:]]*(pub[[:space:]]+)?(const|static)[[:space:]]+[A-Z][A-Z0-9_]*[^=]*=[[:space:]]*"[^"]*last-panel-update[.]json"'
-PAT_RESULT_READ='read_to_string[(][A-Z][A-Z0-9_]*[)]'
-PAT_PROMOTED='verdict[[:space:]]*=[[:space:]]*Some[(][(][[:space:]]*true'
-PAT_VERDICT_DECL='^[[:space:]]*let[[:space:]]+mut[[:space:]]+[a-z_]+[[:space:]]*=[[:space:]]*None;'
+PAT_RESULT_CONST='^[[:space:]]*(const|var)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[^=]*=[[:space:]]*"[^"]*last-panel-update[.]json"'
+PAT_RESULT_READ='os[.]ReadFile[(][A-Za-z_][A-Za-z0-9_]*[)]'
+PAT_PROMOTED='verdict[[:space:]]*=[[:space:]]*&[A-Za-z_]+[{][^}]*OK:[[:space:]]*true'
+PAT_VERDICT_DECL='^[[:space:]]*var[[:space:]]+verdict[[:space:]]+[*][A-Za-z_]+[[:space:]]*$'
 
 O="$(cat "$ORCHESTRATOR")"   # raw, and used by exactly one arm — see §2b
 
@@ -439,9 +435,9 @@ fi
 
 echo
 echo "§2b · the orchestrator, read as production code"
-# Read as PRODUCTION code: the file's own test module spells this filename twice
-# in its assertions, and those two lines alone kept this arm green while the
-# constant pointed somewhere else entirely.
+# Read as PRODUCTION code: the orchestrator's tests spell this filename in
+# their assertions, and (in Rust, same file) those lines alone kept this arm
+# green while the constant pointed somewhere else entirely.
 pin_prod "the orchestrator reads that file" "$ORCHESTRATOR" -E "$PAT_RESULT_CONST"
 
 # A constant that nothing reads is a comment with a type. The name is taken from
@@ -450,7 +446,7 @@ pin_prod "the orchestrator reads that file" "$ORCHESTRATOR" -E "$PAT_RESULT_CONS
 const_use_count() {
     local f="$1" name
     name="$(prod_lines "$f" | grep -E "$PAT_RESULT_CONST" \
-            | sed -E 's/^[[:space:]]*(pub[[:space:]]+)?(const|static)[[:space:]]+([A-Z][A-Z0-9_]*).*/\3/' \
+            | sed -E 's/^[[:space:]]*(const|var)[[:space:]]+([A-Za-z_][A-Za-z0-9_]*).*/\2/' \
             | awk 'NR==1{print}')"
     if [ -z "$name" ]; then echo 0; return; fi
     prod_count "$f" -F -e "$name"
@@ -491,12 +487,12 @@ tag="colour #ffcc00"
 suffix="${tag#colour }"
 argc=$#
 PROBE
-cat > "$PROBES/probe.rs" <<'PROBE'
+cat > "$PROBES/probe.go" <<'PROBE'
 // this whole line is explanation and must be blanked
 /* and so is this one,
    which runs on */
-let endpoint = "https://example.invalid/api";
-let kept = 1; // this tail is explanation and must be blanked
+endpoint := "https://example.invalid/api"
+kept := 1 // this tail is explanation and must be blanked
 PROBE
 
 if [ "$(code_lines "$PROBES/probe.sh" | wc -l)" = "$(wc -l < "$PROBES/probe.sh")" ] \
@@ -512,20 +508,20 @@ if [ "$(code_count "$PROBES/probe.sh" -F -e '#ffcc00')" = "1" ] \
 else
     bad "shell: a # inside a string, a parameter expansion and \$# all survive"
 fi
-if [ "$(code_lines "$PROBES/probe.rs" | wc -l)" = "$(wc -l < "$PROBES/probe.rs")" ] \
-   && [ "$(code_count "$PROBES/probe.rs" -F -e 'must be blanked')" = "0" ] \
-   && [ "$(code_count "$PROBES/probe.rs" -F -e 'which runs on')" = "0" ]; then
-    ok "rust: line comments, a block comment and a trailing tail are all blanked"
+if [ "$(code_lines "$PROBES/probe.go" | wc -l)" = "$(wc -l < "$PROBES/probe.go")" ] \
+   && [ "$(code_count "$PROBES/probe.go" -F -e 'must be blanked')" = "0" ] \
+   && [ "$(code_count "$PROBES/probe.go" -F -e 'which runs on')" = "0" ]; then
+    ok "go: line comments, a block comment and a trailing tail are all blanked"
 else
-    bad "rust: line comments, a block comment and a trailing tail are all blanked"
+    bad "go: line comments, a block comment and a trailing tail are all blanked"
 fi
-if [ "$(code_count "$PROBES/probe.rs" -F -e 'https://example.invalid/api')" = "1" ] \
-   && [ "$(code_count "$PROBES/probe.rs" -F -e 'let kept = 1;')" = "1" ]; then
-    ok "rust: a // inside a string literal is code, and the line before a tail survives"
+if [ "$(code_count "$PROBES/probe.go" -F -e 'https://example.invalid/api')" = "1" ] \
+   && [ "$(code_count "$PROBES/probe.go" -F -e 'kept := 1 ')" = "1" ]; then
+    ok "go: a // inside a string literal is code, and the line before a tail survives"
 else
-    bad "rust: a // inside a string literal is code, and the line before a tail survives"
+    bad "go: a // inside a string literal is code, and the line before a tail survives"
 fi
-if [ "$(comment_marker_for x.rs)" = '//' ] && [ "$(comment_marker_for x.sh)" = '#' ] \
+if [ "$(comment_marker_for x.go)" = '//' ] && [ "$(comment_marker_for x.sh)" = '#' ] \
    && [ -z "$(comment_marker_for x.json)" ]; then
     ok "the marker comes from the extension, so a copy must keep the subject's"
 else
@@ -538,7 +534,7 @@ echo "§2d · every pinned pattern, commented out on a copy"
 # commented out in a COPY of its subject and its own predicate is run again: it
 # has to come back blind. The copy KEEPS THE SUBJECT'S EXTENSION, because the
 # stripper picks its language from the filename — a copy called `mutated` is read
-# as shell whatever it holds, and a Rust subject would keep every `//` line.
+# as shell whatever it holds, and a Go subject would keep every `//` line.
 MUTANTS="$SCRATCH/mutants"; mkdir -p "$MUTANTS"
 
 mutate_out() {   # subject, ERE, tag  →  path of a copy with matching lines commented
@@ -640,7 +636,7 @@ fi
 # The census's own inversion, minus the branch surgery: a success verdict
 # recorded from the handoff itself, written one line under the declaration it
 # overwrites so it is in scope and unconditional.
-PROMOTE_DEFECT='        verdict = Some((true, String::from("complete"), String::new()));'
+PROMOTE_DEFECT='		verdict = &panelUpdateVerdict{OK: true, Stage: "complete"}'
 CTL="$(plant_line_after "$ORCHESTRATOR" "$PAT_VERDICT_DECL" "$PROMOTE_DEFECT" ctlpromote)"
 if landed_insert "$ORCHESTRATOR" "$CTL" "$PROMOTE_DEFECT" && has_prod "$CTL" -E "$PAT_PROMOTED"; then
     ok "planting a recorded success at the handoff makes that arm fire"

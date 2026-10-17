@@ -4,13 +4,14 @@
 # An unattended service must name the host it acts on.
 #
 # DockPanel's multi-server migration reached every HTTP route and NOT ONE
-# background service. `AppState` carries both handles — `agents: AgentRegistry`
-# ("dispatches to local or remote agents by server_id") and `agent: AgentClient`
-# ("Legacy single-agent accessor") — and all twelve background services were
+# background service. `AppState` carries both handles — `Agents *AgentRegistry`
+# ("dispatches to local or remote agents by server id") and `Agent *AgentClient`
+# ("the legacy single-agent accessor") — and all twelve background services were
 # spawned with the legacy one. Each queries rows across the whole fleet and acts
 # on whichever machine the panel happens to run on.
 #
-# For the disk healer that is destruction, not routing. `auto_clean_disk` read
+# For the disk healer that is destruction, not routing. `auto_clean_disk` (Go:
+# autoHealerAutoCleanDisk in panel/go/internal/api/svc_auto_healer.go) read
 # ONE firing `disk` row with no `server_id` predicate and sent the fixes to the
 # local agent. `alert_state` is keyed per server, so ANY member crossing its
 # threshold made the panel host clean and prune ITSELF while the full machine was
@@ -32,13 +33,19 @@
 #       command reclaimed, and `-a` took the locally built image with no registry
 #       to restore from.
 #   §D  DESTRUCTION IS CONSENTED TO SEPARATELY, AND THE COOLDOWN CAN EXIST. The
-#       hourly gate counted `activity_logs` rows written with `Uuid::nil()`,
+#       hourly gate counted `activity_logs` rows written with the nil uuid,
 #       which violates fk_activity_logs_user — every insert failed, the count was
 #       always 0, and the prune ran every 120 SECONDS (measured 19:16:13,
 #       19:18:13, 19:20:13, 19:22:13).
 #   §E  RETENTION KEEPS THE ONLY RECORD OF WHAT IT DID NOT DELETE.
 #
-# Pure source analysis: no box, no network, no build.
+# Pure source analysis: no box, no network, no build. The subjects are the Go
+# port (panel/go — the only tree that is built and shipped); arm ids and intent
+# are unchanged from the Rust originals, and each Rust idiom is mapped to the
+# Go shape it became (`Uuid::nil()` → `uuid.Nil`, `for_server(` →
+# `.ForServer(`, `log_activity_on_server(` → `ActivityLogActivityOnServer(`,
+# a main.rs spawn → a `spawnSupervised` line in core_state.go). Arms that are
+# better as unit tests were retired to Go tests and say so where they stood.
 #
 # Arms key on the CAPABILITY a regression must use, not today's spelling
 # (lesson #122). Where an arm could be satisfied by the prose NARRATING a check,
@@ -56,12 +63,13 @@ ok()   { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 skip() { SKIP=$((SKIP+1)); printf '  \033[33m-\033[0m SKIP %s\n' "$1"; }
 
-AH=panel/backend/src/services/auto_healer.rs
-MAIN=panel/backend/src/main.rs
-DIAG=panel/agent/src/services/diagnostics.rs
-SET=panel/backend/src/routes/settings.rs
+API=panel/go/internal/api
+AH=$API/svc_auto_healer.go
+MAIN=$API/core_state.go
+DIAG=panel/go/internal/agent/services/diagnostics.go
+SET=$API/rt_settings.go
 SETTSX=panel/frontend/src/pages/Settings.tsx
-AGENT=panel/backend/src/services/agent.rs
+AGENT=$API/svc_agent.go
 
 for f in "$AH" "$MAIN" "$DIAG" "$SET" "$SETTSX" "$AGENT"; do
   [ -f "$f" ] || bad "MISSING SUBJECT FILE: $f"
@@ -77,49 +85,54 @@ code() {
 }
 
 # The stripper is code, and code can be wrong. Measure it before trusting it.
+FUNC_RE='^func ([(][^)]*[)] )?[A-Za-z_][A-Za-z0-9_]*[[(]'
 stripper_self_check() {
   local bad_files=0 f raw stripped
   for f in "$@"; do
     [ -f "$f" ] || continue
-    raw=$(grep -cE '^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn ' "$f" || true)
-    stripped=$(grep -cE '^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn ' <<< "$(code "$f")" || true)
+    raw=$(grep -cE "$FUNC_RE" "$f" || true)
+    stripped=$(grep -cE "$FUNC_RE" <<< "$(code "$f")" || true)
     if [ "$raw" != "$stripped" ]; then
-      bad "STRIPPER ATE CODE in $f: $raw fn declarations before, $stripped after"
+      bad "STRIPPER ATE CODE in $f: $raw func declarations before, $stripped after"
       bad_files=$((bad_files+1))
     fi
   done
-  [ "$bad_files" -eq 0 ] && ok "comment stripper preserves every fn declaration in all $# subjects"
+  [ "$bad_files" -eq 0 ] && ok "comment stripper preserves every func declaration in all $# subjects"
 }
 
 subj() { local t; t=$(code "$1"); [ -n "$t" ] || return 1; printf '%s' "$t"; }
 has()   { grep -qE -- "$2" <<< "$1"; }
 count() { grep -cE -- "$2" <<< "$1" || true; }
 
-# `has` is LINE-oriented, but Rust signatures and multi-line SQL string literals
-# wrap. An arm keyed on a construct that spans lines matches nothing — and it
+# `has` is LINE-oriented, but signatures and multi-line SQL string literals
+# wrap (Go spells a long statement as `"…"+` fragments, one per line). An arm
+# keyed on a construct that spans lines matches nothing — and it
 # fails in whichever direction the arm is written, so a PRESENCE arm goes red on
 # correct code (noisy, survivable) while an ABSENCE arm goes GREEN on the defect
 # (silent, not survivable). Caught at s301: three §G arms measured nothing and
 # only the red told me. Flatten a WINDOW, never a whole subject — flattening the
 # subject is window bleed by construction (p31).
-flat() { tr '\n' ' ' <<< "$1" | tr -s ' '; }
+flat() { tr '\n\t' '  ' <<< "$1" | tr -s ' '; }
 
 # The flattened signature of one function: enough lines to cover a wrapped
-# parameter list, anchored on the paren so `fn run` cannot latch onto `fn run_scan`.
-sig() { flat "$(grep -A 8 -E "fn $2\(" <<< "$1" || true)"; }
+# parameter list, anchored on the paren so `func Run` cannot latch onto `func RunScan`.
+# Bounded on the line that opens the body (`{` at end of line), never a fixed
+# window that runs into the body.
+sig() { flat "$(awk -v re="^func ([(][^)]*[)] )?$2[[(]" '!f && $0 ~ re {f=1} f {print; if (/\{[[:space:]]*$/) exit}' <<< "$1")"; }
 
 # Every statement matching a pattern, each flattened onto its own line, so a
 # line-oriented `has`/`count` can measure multi-line SQL without bleeding across
 # statements. `--` separates grep's windows; it becomes the line break.
-stmt() { grep -A "${3:-3}" -E -- "$2" <<< "$1" | tr '\n' ' ' | sed 's/ -- /\n/g' | tr -s ' '; }
+stmt() { grep -A "${3:-3}" -E -- "$2" <<< "$1" | tr '\n\t' '  ' | sed 's/ -- /\n/g' | tr -s ' '; }
 
 # Extract one function body by brace balance. A fixed `-A n` window is NOT a
 # function (lesson: p31) — a regression that moves a line past the window makes
 # the arm silently measure nothing.
+# Go: `func Name(` or a method `func (x *T) Name(`, matched on the WHOLE name.
 fnbody() {
   local src="$1" name="$2"
   awk -v fn="$name" '
-    index($0, "fn " fn) && !started { started=1 }
+    !started && ($0 ~ ("^func " fn "[[(]") || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) { started=1 }
     started {
       n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
       if (opened || n>0) opened=1
@@ -142,8 +155,8 @@ SET_S=$(subj "$SET")   || { bad "cannot read $SET"; SET_S=""; }
 TSX_S=$(subj "$SETTSX")|| { bad "cannot read $SETTSX"; TSX_S=""; }
 AGENT_S=$(subj "$AGENT") || { bad "cannot read $AGENT"; AGENT_S=""; }
 
-CLEAN=$(fnbody "$AH_S" "auto_clean_disk")
-[ -n "$CLEAN" ] || bad "could not extract auto_clean_disk — every §A/§B arm below is meaningless"
+CLEAN=$(fnbody "$AH_S" "autoHealerAutoCleanDisk")
+[ -n "$CLEAN" ] || bad "could not extract autoHealerAutoCleanDisk — every §A/§B arm below is meaningless"
 
 echo
 echo "§A the host is named"
@@ -151,37 +164,38 @@ echo "§A the host is named"
 # A1 — the firing query must carry server_id. The defect was its ABSENCE, so the
 # arm requires the predicate, not merely the word.
 if has "$CLEAN" "server_id[^\n]*IS NOT NULL|a\.server_id|WHERE a\.alert_type"; then
-  ok "A1 auto_clean_disk's firing query is server-aware"
+  ok "A1 autoHealerAutoCleanDisk's firing query is server-aware"
 else
-  bad "A1 auto_clean_disk selects firing disk alerts with NO server_id — the s298 defect"
+  bad "A1 autoHealerAutoCleanDisk selects firing disk alerts with NO server_id — the s298 defect"
 fi
 
 # A2 — it must resolve the agent for THAT server, not use a handed-in local one.
-if has "$CLEAN" "for_server\("; then
-  ok "A2 auto_clean_disk resolves the agent via for_server(server_id)"
+if has "$CLEAN" "agents\.ForServer\(ctx, serverID\)"; then
+  ok "A2 autoHealerAutoCleanDisk resolves the agent via agents.ForServer(ctx, serverID)"
 else
-  bad "A2 auto_clean_disk does not call for_server — it acts on whatever agent it was handed"
+  bad "A2 autoHealerAutoCleanDisk does not call ForServer — it acts on whatever agent it was handed"
 fi
 
 # A3 — the signature must not accept a bare local client (the old shape).
-if has "$AH_S" "async fn auto_clean_disk\([^)]*AgentRegistry"; then
-  ok "A3 auto_clean_disk takes the AgentRegistry, not a single AgentClient"
+if has "$AH_S" "^func autoHealerAutoCleanDisk\([^)]*\*AgentRegistry"; then
+  ok "A3 autoHealerAutoCleanDisk takes the *AgentRegistry, not a single AgentClient"
 else
-  bad "A3 auto_clean_disk still takes a single AgentClient — it cannot reach another host"
+  bad "A3 autoHealerAutoCleanDisk still takes a single AgentClient — it cannot reach another host"
 fi
 
-# A4 — main.rs must actually hand the healer the registry. A4 is the arm that
+# A4 — the spawn site (core_state.go, Rust: main.rs) must actually hand the
+# healer the registry. A4 is the arm that
 # fails if the fix exists but is never wired (the s297 shape).
-if has "$MAIN_S" "auto_healer::run\(.*agents"; then
-  ok "A4 main.rs spawns auto_healer WITH the registry"
+if has "$MAIN_S" "spawnSupervised\(.*AutoHealerRun\(ctx, db, agents\)"; then
+  ok "A4 core_state.go spawns AutoHealerRun WITH the registry"
 else
   bad "A4 auto_healer is spawned without the registry — the fix is unreachable"
 fi
 
 # A5 — the alert_state reset must be scoped. Unscoped, healing one host cleared
 # every other server's disk state and its cooldown clock.
-RESET=$(grep -A 4 "UPDATE alert_state SET current_state = 'ok'" <<< "$CLEAN" || true)
-if [ -n "$RESET" ] && has "$RESET" "server_id = \\\$1"; then
+RESET=$(flat "$(grep -A 3 "UPDATE alert_state SET current_state = 'ok'" <<< "$CLEAN" || true)")
+if [ -n "$RESET" ] && has "$RESET" "WHERE server_id = \\\$1"; then
   ok "A5 the alert_state reset is scoped to the server that was healed"
 else
   bad "A5 the alert_state reset is fleet-wide — it clears servers nobody healed"
@@ -198,19 +212,20 @@ fi
 echo
 echo "§B recovery completes rather than being consumed"
 
-# B1 — resolve_alert is the ONLY writer of alerts.status='resolved'.
-if has "$CLEAN" "resolve_alert\("; then
-  ok "B1 auto_clean_disk completes recovery through resolve_alert"
+# B1 — resolve_alert (Go: NotificationsResolveAlert) is the ONLY writer of
+# alerts.status='resolved'.
+if has "$CLEAN" "NotificationsResolveAlert\("; then
+  ok "B1 autoHealerAutoCleanDisk completes recovery through NotificationsResolveAlert"
 else
-  bad "B1 auto_clean_disk resets alert_state without resolve_alert — alerts rows stay firing for ever"
+  bad "B1 autoHealerAutoCleanDisk resets alert_state without NotificationsResolveAlert — alerts rows stay firing for ever"
 fi
 
 # B2 — the activity row must not be written with the nil uuid: that insert
 # violates fk_activity_logs_user, which is what killed the cooldown.
-if has "$CLEAN" "Uuid::nil\(\)|uuid::Uuid::nil\(\)"; then
-  bad "B2 auto_clean_disk logs activity as Uuid::nil() — the insert fails and the cooldown never engages"
+if has "$CLEAN" "uuid\.Nil"; then
+  bad "B2 autoHealerAutoCleanDisk logs activity as uuid.Nil — the insert fails and the cooldown never engages"
 else
-  ok "B2 auto_clean_disk does not log activity as the nil uuid"
+  ok "B2 autoHealerAutoCleanDisk does not log activity as the nil uuid"
 fi
 
 # B3 — and it must write SOMETHING, or the gate it reads can never be satisfied.
@@ -220,8 +235,8 @@ fi
 # could travel in `server_id` instead of squatting in `target_name` — correct
 # code, red arm, which is the failure the suite header warns about. §J8 pins the
 # stronger property: that this writer and its cooldown agree on the SAME key.
-if has "$CLEAN" "log_activity(_on_server)?\("; then
-  ok "B3 auto_clean_disk still records the action it gates itself on"
+if has "$CLEAN" "ActivityLogActivity(OnServer)?\("; then
+  ok "B3 autoHealerAutoCleanDisk still records the action it gates itself on"
 else
   bad "B3 no activity record written — the cooldown query can never find a row"
 fi
@@ -230,8 +245,13 @@ echo
 echo "§C the reclaim cannot reach what the panel manages"
 
 # C1 — the unscoped prune must be gone from the WHOLE tree, not just this file.
-PRUNE_HITS=$(grep -rn -- '"system", *"prune"' --include=*.rs panel/agent/src panel/backend/src panel/cli/src 2>/dev/null | grep -c -- '--volumes' || true)
-if [ "$PRUNE_HITS" = "0" ]; then
+# Positive control first: the same grep must still see the scoped reclaim's own
+# `"image", "prune"` call, or a zero below proves only that the walk read nothing.
+PRUNE_CTL=$(grep -rn --include='*.go' -- '"image", *"prune"' panel/go 2>/dev/null | wc -l | tr -d ' ')
+PRUNE_HITS=$(grep -rn --include='*.go' -- '"system", *"prune"' panel/go 2>/dev/null | grep -c -- '--volumes' || true)
+if [ "$PRUNE_CTL" -lt 1 ]; then
+  bad "C1 CONTROL FAILED — the tree walk found no '\"image\", \"prune\"' call at all, so its zero below proves nothing"
+elif [ "$PRUNE_HITS" = "0" ]; then
   ok "C1 no 'docker system prune ... --volumes' anywhere in the tree"
 else
   bad "C1 $PRUNE_HITS site(s) still run 'docker system prune --volumes' — it deletes sleeping apps"
@@ -244,7 +264,8 @@ else
   bad "C2 no docker-reclaim fix — the disk heal has nothing safe to call"
 fi
 
-RECLAIM=$(awk '/"docker-reclaim"/{f=1} f{print} f&&/^        \}/{exit}' <<< "$DIAG_S")
+# The reclaim arm: from its `case` label to the next `case` of the same switch.
+RECLAIM=$(awk '/^\tcase "docker-reclaim"/{f=1; print; next} f&&/^\tcase /{exit} f{print}' <<< "$DIAG_S")
 
 # ⚠ C3 and C4 are ABSENCE arms. An absence arm over an EMPTY subject is
 # vacuously true, so both printed a confident GREEN against v2.55.0 — where
@@ -277,7 +298,7 @@ else
 fi
 
 # C5 — the OLD id must not resurrect the old behaviour for an older panel.
-if has "$DIAG_S" '"docker-reclaim" \| "docker-prune"|"docker-prune" \| "docker-reclaim"'; then
+if has "$DIAG_S" 'case "docker-reclaim", *"docker-prune":|case "docker-prune", *"docker-reclaim":'; then
   ok "C5 the legacy docker-prune id routes to the scoped reclaim"
 else
   bad "C5 docker-prune is not routed to the scoped reclaim — an older panel gets the destructive path back by name"
@@ -290,22 +311,23 @@ echo "§D consent is explicit and the cooldown can exist"
 if has "$SET_S" '"auto_heal_docker_reclaim"'; then
   ok "D1 auto_heal_docker_reclaim is an allowed settings key"
 else
-  bad "D1 auto_heal_docker_reclaim is not in ALLOWED_KEYS — the UI control cannot save"
+  bad "D1 auto_heal_docker_reclaim is not in the allowed settings keys — the UI control cannot save"
 fi
 
 # D2 — default OFF. Requires the VALUE, not just the key (lesson #155).
-GATE=$(fnbody "$AH_S" "reclaim_enabled")
-if [ -n "$GATE" ] && has "$GATE" "unwrap_or\(false\)"; then
+# Go shape: true ONLY for a stored literal "true" — a missing row (nil) is false.
+GATE=$(fnbody "$AH_S" "autoHealerReclaimEnabled")
+if [ -n "$GATE" ] && has "$GATE" 'return v != nil && \*v == "true"$'; then
   ok "D2 docker reclamation defaults to OFF"
 else
-  bad "D2 reclaim_enabled does not default to false — destruction is opt-OUT"
+  bad "D2 autoHealerReclaimEnabled does not default to false — destruction is opt-OUT"
 fi
 
 # D3 — the reclaim must actually be gated on it, or the setting is decoration.
-if has "$CLEAN" "reclaim_enabled\("; then
+if has "$CLEAN" "autoHealerReclaimEnabled\("; then
   ok "D3 the reclaim step is gated on the operator's consent"
 else
-  bad "D3 the reclaim runs without consulting reclaim_enabled"
+  bad "D3 the reclaim runs without consulting autoHealerReclaimEnabled"
 fi
 
 # D4 — an operator control must exist. Requires the api.put VALUE, not the word.
@@ -326,55 +348,27 @@ echo
 echo "§E retention keeps the only record of what it did not delete"
 
 # E1/E2 — the unlink path must match the writer, which nests per resource.
-if has "$AH_S" 'databases/\{db_name\}/\{filename\}'; then
+if has "$AH_S" '"/var/backups/dockpanel/databases/%s/%s", e\.C, e\.B\)' && has "$AH_S" 'SELECT id, filename, db_name, server_id FROM'; then
   ok "E1 the database retention path nests per database, as the writer does"
 else
-  bad "E1 the database retention path omits {db_name} — it unlinks a path that never exists"
+  bad "E1 the database retention path omits db_name — it unlinks a path that never exists"
 fi
 
-if has "$AH_S" 'volumes/\{container_name\}/\{filename\}'; then
+if has "$AH_S" '"/var/backups/dockpanel/volumes/%s/%s", e\.C, e\.B\)' && has "$AH_S" 'SELECT id, filename, container_name, server_id FROM'; then
   ok "E2 the volume retention path nests per container, as the writer does"
 else
-  bad "E2 the volume retention path omits {container_name} — it unlinks a path that never exists"
+  bad "E2 the volume retention path omits container_name — it unlinks a path that never exists"
 fi
 
 # E3 — the row must not be deleted unconditionally after a discarded unlink.
-if has "$AH_S" "fn prune_policy_backup"; then
+if has "$AH_S" "^func autoHealerPrunePolicyBackup\("; then
   ok "E3 policy retention goes through a single guarded retire step"
 else
-  bad "E3 no prune_policy_backup — the DELETE is not guarded by the unlink result"
+  bad "E3 no autoHealerPrunePolicyBackup — the DELETE is not guarded by the unlink result"
 fi
 
-PPB=$(fnbody "$AH_S" "prune_policy_backup")
-if [ -n "$PPB" ]; then
-  # E4 — a failed unlink must KEEP the row: it is the only record of the archive.
-  #
-  # ⛔ SCOPED TO THE UNLINK ARM AND COUNTED. Until s389 this was a whole-body
-  # `has "return false"`, and the body holds TWO of them — the remote-server
-  # guard that E5 pins separately, and the failed-unlink guard that E4 NAMES. So
-  # the guard this arm exists to protect could be deleted outright and E4 stayed
-  # green off its sibling. It had never been able to fail. Found by counting the
-  # literal inside its own subject, not by reading the arm.
-  PPB_UNLINK=$(awk '/match std::fs::remove_file\(filepath\)/,/^    \}$/' <<< "$PPB")
-  PPB_RF=$(/usr/bin/grep -oF -- "return false" <<< "$PPB" | wc -l | tr -d ' ')
-  if [ "$(wc -c <<< "$PPB_UNLINK")" -lt 200 ]; then
-    bad "E4 the unlink arm could not be isolated from prune_policy_backup — the arm measured nothing"
-  elif [ "$PPB_RF" != "2" ]; then
-    bad "E4 expected exactly two guards that keep the row (another server, failed unlink); found $PPB_RF"
-  elif has "$PPB_UNLINK" "return false"; then
-    ok "E4 a failed unlink keeps the row that names the archive"
-  else
-    bad "E4 the row is deleted regardless of whether the archive was removed"
-  fi
-  # E5 — a backup on ANOTHER server cannot be retired by a local unlink.
-  if has "$PPB" "row_server|local_server"; then
-    ok "E5 a backup belonging to another server is refused, not silently forgotten"
-  else
-    bad "E5 policy retention unlinks locally for backups that live on other servers"
-  fi
-else
-  skip "E4/E5 — prune_policy_backup body not extractable"
-fi
+# E4 retired: covered by TestPinUnattendedHostScopePrunePolicyBackupKeepsRowOnFailedUnlink (panel/go/internal/api/pin_unattended_host_scope_test.go)
+# E5 retired: covered by TestPinUnattendedHostScopePrunePolicyBackupRefusesOtherServer (panel/go/internal/api/pin_unattended_host_scope_test.go)
 
 # E6 — retention must be per resource. OFFSET over a policy's whole history kept
 # n backups in TOTAL across every database it covered.
@@ -391,10 +385,10 @@ fi
 # caller. On a fleet install every site backup living on a member host had its
 # only record destroyed while the archive stayed on that host — and `total_pruned`
 # counted it, so the log reported archives it had never touched.
-RC_S=$(fnbody "$AH_S" "run_retention_cleanup")
+RC_S=$(fnbody "$AH_S" "autoHealerRunRetentionCleanup")
 if [ -n "$RC_S" ]; then
   # E7 — all THREE sweeps must retire through the one guarded step.
-  PPB_CALLS=$(count "$RC_S" 'prune_policy_backup\(')
+  PPB_CALLS=$(count "$RC_S" 'autoHealerPrunePolicyBackup\(')
   if [ "$PPB_CALLS" -ge 3 ]; then
     ok "E7 all three retention sweeps retire through the guarded step ($PPB_CALLS call sites)"
   else
@@ -424,17 +418,17 @@ if [ -n "$RC_S" ]; then
     ok "E9 no direct DELETE of a backups row ($DEL_ANY other purges still matched — control non-vacuous)"
   fi
 else
-  skip "E7/E8/E9 — run_retention_cleanup body not extractable"
+  skip "E7/E8/E9 — autoHealerRunRetentionCleanup body not extractable"
 fi
 
 echo
 echo "§F the scheduled and webhook paths name the host too (s299)"
 
-DEPS=panel/backend/src/services/deploy_scheduler.rs
-PREV=panel/backend/src/services/preview_cleanup.rs
-GITD=panel/backend/src/routes/git_deploys.rs
-DEPR=panel/backend/src/routes/deploy.rs
-MET=panel/backend/src/services/metrics_collector.rs
+DEPS=$API/svc_deploy_scheduler.go
+PREV=$API/svc_preview_cleanup.go
+GITD=$API/rt_git_deploys.go
+DEPR=$API/rt_deploy.go
+MET=$API/svc_metrics_collector.go
 
 for f in "$DEPS" "$PREV" "$GITD" "$DEPR" "$MET"; do
   [ -f "$f" ] || bad "MISSING SUBJECT FILE: $f"
@@ -450,9 +444,9 @@ MET_S=$(subj "$MET" || true)
 # `SELECT id, name, ... FROM git_deploys` with no server_id at all, so the row
 # could not say which machine it meant even in principle.
 if [ -n "$DEPS_S" ]; then
-  SCHED=$(fnbody "$DEPS_S" "check_schedules")
+  SCHED=$(fnbody "$DEPS_S" "deploySchedulerCheckSchedules")
   if [ -z "$SCHED" ]; then
-    skip "F1/F2/F14/F15 — check_schedules body not extractable"
+    skip "F1/F2/F14/F15 — deploySchedulerCheckSchedules body not extractable"
   else
     if [ "$(count "$SCHED" "SELECT[^;]*server_id[^;]*FROM git_deploys")" -ge 2 ]; then
       ok "F1/F2 both scheduler queries (cron + one-time) select server_id"
@@ -463,8 +457,8 @@ if [ -n "$DEPS_S" ]; then
     # F14 — the one-time clear is the ONLY thing between a scheduled deploy and
     # an unbounded redeploy loop: a successful run leaves the row 'running',
     # which the one-time SELECT does not exclude. It used to be swallowed
-    # with `.ok()`.
-    if has "$SCHED" "rows_affected\(\)"; then
+    # with `.ok()` (Rust); the Go port checks both the error and rows affected.
+    if has "$SCHED" 'n, err := execSQL\(ctx, db, "UPDATE git_deploys SET scheduled_deploy_at = NULL' && has "$SCHED" 'if n != 1 \{'; then
       ok "F14 the one-time schedule clear is checked before deploying"
     else
       bad "F14 the one-time schedule clear is unchecked — an uncleared row redeploys every tick"
@@ -473,7 +467,7 @@ if [ -n "$DEPS_S" ]; then
     # F15 — reachability BEFORE the clear. Clearing first discards the
     # operator's only copy of a one-time instruction for a server we then
     # decline to deploy to. Order matters, so measure the order.
-    F15_RESOLVE=$(grep -n "for_server" <<< "$SCHED" | head -1 | cut -d: -f1)
+    F15_RESOLVE=$(grep -n "agents\.ForServer(" <<< "$SCHED" | head -1 | cut -d: -f1)
     F15_CLEAR=$(grep -n "scheduled_deploy_at = NULL" <<< "$SCHED" | head -1 | cut -d: -f1)
     if [ -n "$F15_RESOLVE" ] && [ -n "$F15_CLEAR" ] && [ "$F15_RESOLVE" -lt "$F15_CLEAR" ]; then
       ok "F15 the one-time path checks the server is reachable BEFORE clearing the schedule"
@@ -482,55 +476,56 @@ if [ -n "$DEPS_S" ]; then
     fi
   fi
 else
-  skip "F1/F2/F14/F15 — deploy_scheduler.rs not extractable"
+  skip "F1/F2/F14/F15 — svc_deploy_scheduler.go not extractable"
 fi
 
-# F3/F4/F5 — trigger_deploy_task is where the host was decided. It took an
-# AgentClient and wrapped it `AgentHandle::Local(agent)` three lines before
-# fetching the row that carries server_id.
+# F3/F4/F5 — trigger_deploy_task (Go: rtGitDeploysTriggerDeployTask) is where
+# the host was decided. It took an AgentClient and wrapped it
+# `AgentHandle::Local(agent)` three lines before fetching the row that carries
+# server_id. The Go shape of forcing the local agent is `.Local()` / `st.Agent`.
 if [ -n "$GITD_S" ]; then
-  TDT=$(fnbody "$GITD_S" "trigger_deploy_task")
+  TDT=$(fnbody "$GITD_S" "rtGitDeploysTriggerDeployTask")
   if [ -z "$TDT" ]; then
-    skip "F3/F4/F5 — trigger_deploy_task body not extractable"
+    skip "F3/F4/F5 — rtGitDeploysTriggerDeployTask body not extractable"
   else
-    if has "$TDT" "AgentHandle::Local"; then
-      bad "F3 trigger_deploy_task still forces the LOCAL agent — every scheduled deploy runs on the panel host"
+    if has "$TDT" '\.Local\(\)|st\.Agent[^s]'; then
+      bad "F3 rtGitDeploysTriggerDeployTask still forces the LOCAL agent — every scheduled deploy runs on the panel host"
     else
-      ok "F3 trigger_deploy_task no longer forces AgentHandle::Local"
+      ok "F3 rtGitDeploysTriggerDeployTask no longer forces the local agent"
     fi
 
-    if has "$TDT" "for_server\(config\.server_id\)"; then
-      ok "F4 trigger_deploy_task resolves the agent from the ROW's own server_id"
+    if has "$TDT" "agents\.ForServer\(ctx, config\.ServerID\)"; then
+      ok "F4 rtGitDeploysTriggerDeployTask resolves the agent from the ROW's own server_id"
     else
-      bad "F4 trigger_deploy_task does not resolve for_server(config.server_id)"
+      bad "F4 rtGitDeploysTriggerDeployTask does not resolve agents.ForServer(ctx, config.ServerID)"
     fi
 
     # The refusal must be a refusal: an early return, not a fallback.
     if has "$TDT" "Refusing to act on a different host"; then
       ok "F5 an unreachable deploy server is refused, never swapped for the local one"
     else
-      bad "F5 trigger_deploy_task has no explicit refusal when the server is unreachable"
+      bad "F5 rtGitDeploysTriggerDeployTask has no explicit refusal when the server is unreachable"
     fi
   fi
 else
-  skip "F3/F4/F5 — git_deploys.rs not extractable"
+  skip "F3/F4/F5 — rt_git_deploys.go not extractable"
 fi
 
 # F6/F7 — the spawn sites. A migration is not done when the callee is done
 # (lesson #156): grep the SPAWN, not just the call.
 if [ -n "$MAIN_S" ]; then
-  if has "$MAIN_S" "deploy_scheduler::run\(s_db\.clone\(\), s_agents"; then
-    ok "F6 main.rs spawns deploy_scheduler with the REGISTRY"
+  if has "$MAIN_S" "spawnSupervised\(.*DeploySchedulerRun\(ctx, db, agents\)"; then
+    ok "F6 core_state.go spawns DeploySchedulerRun with the REGISTRY"
   else
     bad "F6 deploy_scheduler is still spawned with the legacy single-agent handle"
   fi
-  if has "$MAIN_S" "preview_cleanup::run\(s_db\.clone\(\), s_agents"; then
-    ok "F7 main.rs spawns preview_cleanup with the REGISTRY"
+  if has "$MAIN_S" "spawnSupervised\(.*PreviewCleanupRun\(ctx, db, agents\)"; then
+    ok "F7 core_state.go spawns PreviewCleanupRun with the REGISTRY"
   else
     bad "F7 preview_cleanup is still spawned with the legacy single-agent handle"
   fi
 else
-  skip "F6/F7 — main.rs not extractable"
+  skip "F6/F7 — core_state.go not extractable"
 fi
 
 # F8/F9 — preview teardown. git_previews carries its own server_id since
@@ -542,58 +537,58 @@ if [ -n "$PREV_S" ]; then
   else
     bad "F8 a preview sweep still selects rows that cannot name their host"
   fi
-  if has "$PREV_S" "for_server\(" && has "$PREV_S" "Refusing to act on a different host"; then
+  if has "$PREV_S" "agents\.ForServer\(" && has "$PREV_S" "Refusing to act on a different host"; then
     ok "F9 preview teardown resolves that server and refuses when unreachable"
   else
     bad "F9 preview teardown still tears down containers on whichever host the panel runs on"
   fi
 else
-  skip "F8/F9 — preview_cleanup.rs not extractable"
+  skip "F8/F9 — svc_preview_cleanup.go not extractable"
 fi
 
 # F10 — the git-deploy webhook. Unauthenticated by design (it carries a secret,
 # not a session), so it has no ServerScope and reached for the local agent.
 if [ -n "$GITD_S" ]; then
-  WH=$(fnbody "$GITD_S" "webhook")
+  WH=$(fnbody "$GITD_S" "rtGitDeploysWebhook")
   if [ -z "$WH" ]; then
-    skip "F10 — webhook body not extractable"
-  elif has "$WH" "for_server\(config\.server_id\)" && ! has "$WH" "AgentHandle::Local"; then
+    skip "F10 — rtGitDeploysWebhook body not extractable"
+  elif has "$WH" "Agents\.ForServer\(ctx, config\.ServerID\)" && ! has "$WH" '\.Local\(\)|st\.Agent[^s]'; then
     ok "F10 the git-deploy webhook deploys on the server the deployment lives on"
   else
     bad "F10 a webhook push still builds and replaces containers on the panel host"
   fi
 else
-  skip "F10 — git_deploys.rs not extractable"
+  skip "F10 — rt_git_deploys.go not extractable"
 fi
 
 # F11 — the SITE deploy webhook, same shape, different file. sites.server_id is
 # NOT NULL, and the handler used to select only `domain`.
 if [ -n "$DEPR_S" ]; then
-  if has "$DEPR_S" "SELECT domain, server_id FROM sites" && has "$DEPR_S" "for_server\(site_server_id\)"; then
+  if has "$DEPR_S" "SELECT domain, server_id FROM sites" && has "$DEPR_S" "Agents\.ForServer\(ctx, siteServerID\)"; then
     ok "F11 the site webhook resolves the site's own server"
   else
     bad "F11 the site webhook still deploys a remote tenant's site onto the panel host"
   fi
 else
-  skip "F11 — deploy.rs not extractable"
+  skip "F11 — rt_deploy.go not extractable"
 fi
 
 # F12 — the guard that makes all of the above safe on a SINGLE-server install.
-# `ensure_local_server` returns Uuid::nil() until an admin exists, so the cached
-# local id can be None; the local row has no agent_url, so the DB fallthrough
+# `AgentEnsureLocalServer` returns uuid.Nil until an admin exists, so the cached
+# local id can be nil; the local row has no agent_url, so the DB fallthrough
 # would return NotFound and every threaded service would refuse to act on its
 # own box. This arm is the difference between a fix and an outage.
 if [ -n "$AGENT_S" ]; then
-  FS=$(fnbody "$AGENT_S" "for_server")
+  FS=$(fnbody "$AGENT_S" "ForServer")
   if [ -z "$FS" ]; then
-    skip "F12 — for_server body not extractable"
-  elif has "$FS" "is_local" && has "$FS" "AgentHandle::Local"; then
-    ok "F12 for_server returns the LOCAL handle for the local row even when the cached id is unset"
+    skip "F12 — ForServer body not extractable"
+  elif has "$(flat "$FS")" 'case rw\.IsLocal: return r\.local, nil' && has "$FS" 'SELECT agent_url, agent_token, cert_fingerprint, is_local FROM servers'; then
+    ok "F12 ForServer returns the LOCAL handle for the local row even when the cached id is unset"
   else
-    bad "F12 for_server cannot recognise the local server from the DB — a single-server install would refuse every threaded action"
+    bad "F12 ForServer cannot recognise the local server from the DB — a single-server install would refuse every threaded action"
   fi
 else
-  skip "F12 — agent.rs not extractable"
+  skip "F12 — svc_agent.go not extractable"
 fi
 
 # F13 — the laundering step. The server_id a reading is stored under decides
@@ -602,14 +597,15 @@ fi
 # ⚠ RE-POINTED at s302, and the reason is the point. This arm used to require the
 # literal `FROM servers WHERE is_local = true` INSIDE the collector, because s299
 # fixed the laundering by making that one lookup ask for the right row. s302
-# removed the lookup altogether: the collector now iterates `online_fleet` and
+# removed the lookup altogether: the collector now iterates `online_fleet` (Go:
+# agents.OnlineFleet) and
 # takes each id from the member it just read, so there is no single "local" id to
 # derive and the whole class of derivation is gone. The property is unchanged and
 # is now stronger; only its home moved. Per lesson #150 a re-pointed arm owes a
 # companion proving the caller still REACHES the new home — F13c below — or a
 # resolver nothing calls would satisfy it.
 if [ -n "$MET_S" ]; then
-  if has "$MET_S" '\.bind\(member\.id\)'; then
+  if has "$(stmt "$MET_S" 'INSERT INTO metrics_history' 1)" 'server_id\) VALUES .*disk, m\.ID\)'; then
     ok "F13 metrics_collector labels each reading with the server it was read from"
   else
     bad "F13 metrics_collector does not stamp readings per member — readings can be stored against the wrong machine"
@@ -619,29 +615,31 @@ if [ -n "$MET_S" ]; then
   else
     ok "F13b the oldest-row derivation is gone"
   fi
-  if has "$MET_S" 'online_fleet\(\)'; then
+  if has "$MET_S" 'agents\.OnlineFleet\(ctx\)'; then
     ok "F13c the collector actually reaches the fleet primitive it takes its ids from"
   else
-    bad "F13c the collector never calls online_fleet — F13's ids come from somewhere unproven"
+    bad "F13c the collector never calls OnlineFleet — F13's ids come from somewhere unproven"
   fi
 else
-  skip "F13 — metrics_collector.rs not extractable"
+  skip "F13 — svc_metrics_collector.go not extractable"
 fi
 
 # F13d — and the primitive those ids come from must not itself launder. This is
 # the assertion that moved out of the collector: whoever resolves "which server"
 # must not do it by row age.
 if [ -n "$AGENT_S" ]; then
-  OF=$(flat "$(grep -A 10 -E 'pub async fn online_fleet' <<< "$AGENT_S" || true)")
-  if has "$OF" 'ORDER BY created_at'; then
-    bad "F13d online_fleet orders the fleet by row age — the laundering moved rather than left"
+  OF=$(flat "$(fnbody "$AGENT_S" "OnlineFleet")")
+  if [ -z "$OF" ]; then
+    bad "F13d could not extract OnlineFleet — the arm measured nothing"
+  elif has "$OF" 'ORDER BY created_at'; then
+    bad "F13d OnlineFleet orders the fleet by row age — the laundering moved rather than left"
   elif has "$OF" 'is_local'; then
-    ok "F13d online_fleet resolves each server by identity, never by row age"
+    ok "F13d OnlineFleet resolves each server by identity, never by row age"
   else
-    bad "F13d online_fleet does not name is_local — nothing distinguishes the panel row while iterating"
+    bad "F13d OnlineFleet does not name is_local — nothing distinguishes the panel row while iterating"
   fi
 else
-  skip "F13d — agent.rs not extractable"
+  skip "F13d — svc_agent.go not extractable"
 fi
 
 
@@ -652,18 +650,18 @@ echo "§G the last background services name their host (s300 backups + s301 scan
 # the scanners. Both are pinned here, because the two halves share one hazard:
 # a fix that POPULATES a column is the first thing that ever runs the mechanisms
 # written against it, and those mechanisms have never been exercised.
-BS=panel/backend/src/services/backup_scheduler.rs
-BPE=panel/backend/src/services/backup_policy_executor.rs
-BV=panel/backend/src/services/backup_verifier.rs
-DS=panel/backend/src/services/drill_scheduler.rs
-TC=panel/backend/src/services/telemetry_collector.rs
-BO=panel/backend/src/routes/backup_orchestrator.rs
-SS=panel/backend/src/services/security_scanner.rs
-SSR=panel/backend/src/routes/security_scans.rs
-IS=panel/backend/src/services/image_scanner.rs
-ISR=panel/backend/src/routes/image_scans.rs
-SB=panel/backend/src/routes/sboms.rs
-AE=panel/backend/src/services/alert_engine.rs
+BS=$API/svc_backup_scheduler.go
+BPE=$API/svc_backup_policy_executor.go
+BV=$API/svc_backup_verifier.go
+DS=$API/svc_drill_scheduler.go
+TC=$API/svc_telemetry_collector.go
+BO=$API/rt_backup_orchestrator.go
+SS=$API/svc_security_scanner.go
+SSR=$API/rt_security_scans.go
+IS=$API/svc_image_scanner.go
+ISR=$API/rt_image_scans.go
+SB=$API/rt_sboms.go
+AE=$API/svc_alert_engine.go
 
 for f in "$BS" "$BPE" "$BV" "$DS" "$TC" "$BO" "$SS" "$SSR" "$IS" "$ISR" "$SB" "$AE"; do
   [ -f "$f" ] || bad "MISSING SUBJECT FILE: $f"
@@ -676,33 +674,33 @@ ISR_S=$(subj "$ISR" || true); SB_S=$(subj "$SB" || true);   AE_S=$(subj "$AE" ||
 
 # ── the backup family (s300) ───────────────────────────────────────────────
 if [ -n "$BS_S" ]; then
-  if has "$(sig "$BS_S" run)" "AgentRegistry" && has "$BS_S" "for_server\("; then
+  if has "$(sig "$BS_S" BackupSchedulerRun)" "\*AgentRegistry" && has "$BS_S" "agents\.ForServer\("; then
     ok "G1 backup_scheduler resolves each site's own server"
   else
     bad "G1 backup_scheduler still backs up every site through one agent"
   fi
 else
-  skip "G1 — backup_scheduler.rs not extractable"
+  skip "G1 — svc_backup_scheduler.go not extractable"
 fi
 
 if [ -n "$BPE_S" ]; then
-  if has "$BPE_S" "for_server\(" && has "$(sig "$BPE_S" run)" "AgentRegistry"; then
+  if has "$BPE_S" "agents\.ForServer\(" && has "$(sig "$BPE_S" BackupPolicyExecutorRun)" "\*AgentRegistry"; then
     ok "G2 backup_policy_executor resolves the host per row"
   else
     bad "G2 backup_policy_executor still writes every policy backup to the panel"
   fi
 else
-  skip "G2 — backup_policy_executor.rs not extractable"
+  skip "G2 — svc_backup_policy_executor.go not extractable"
 fi
 
 if [ -n "$BV_S" ]; then
-  if has "$BV_S" "for_server\(" && has "$(sig "$BV_S" run)" "AgentRegistry"; then
+  if has "$BV_S" "agents\.ForServer\(" && has "$(sig "$BV_S" BackupVerifierRun)" "\*AgentRegistry"; then
     ok "G3 backup_verifier reads each archive on the host that wrote it"
   else
     bad "G3 backup_verifier still verifies every archive on the panel"
   fi
 else
-  skip "G3 — backup_verifier.rs not extractable"
+  skip "G3 — svc_backup_verifier.go not extractable"
 fi
 
 # G4 — the #164 arm for the backup half. Populating drill_scheduler's server_id
@@ -710,77 +708,81 @@ fi
 # drill INSERTs a 'running' row immediately before the volume drill counts them.
 # Without an age bound one stranded row disables DR for that machine for ever.
 if [ -n "$DS_S" ]; then
-  GUARD=$(fnbody "$DS_S" "has_running_drill_for_server")
+  GUARD=$(fnbody "$DS_S" "drillSchedulerHasRunningDrillForServer")
   if [ -z "$GUARD" ]; then
-    skip "G4 — has_running_drill_for_server not extractable"
-  elif has "$GUARD" "INTERVAL|started_at"; then
+    skip "G4 — drillSchedulerHasRunningDrillForServer not extractable"
+  elif has "$GUARD" "started_at > NOW\(\) - INTERVAL"; then
     ok "G4 the drill concurrency guard is age-bounded, so one stranded drill cannot disable DR for ever"
   else
     bad "G4 the drill guard has no age bound — arming it makes a crashed drill permanent"
   fi
 else
-  skip "G4 — drill_scheduler.rs not extractable"
+  skip "G4 — svc_drill_scheduler.go not extractable"
 fi
 
 # G5 — telemetry_collector is local BY INTENT. The arm requires that intent to be
 # STATED (it takes the registry and asks it for the local agent), not merely to
 # coincide with a legacy handle nobody revisited.
 if [ -n "$TC_S" ]; then
-  if has "$(sig "$TC_S" run)" "AgentRegistry" && has "$TC_S" "\.local\(\)"; then
+  if has "$(sig "$TC_S" TelemetryCollectorRun)" "\*AgentRegistry" && has "$TC_S" "agents\.Local\(\)"; then
     ok "G5 telemetry_collector states local-by-intent through the registry"
   else
     bad "G5 telemetry_collector's locality is an accident of the legacy handle again"
   fi
 else
-  skip "G5 — telemetry_collector.rs not extractable"
+  skip "G5 — svc_telemetry_collector.go not extractable"
 fi
 
 # G6 — the laundering shape (s299's metrics_collector defect, verbatim): resolve
 # the real server, discard it, then stamp the row from an arbitrary online row.
-if [ -n "$BO_S" ]; then
+# Positive anchor: the file must still resolve hosts at all, or the absence
+# below is a fact about an empty subject.
+if [ -n "$BO_S" ] && ! has "$BO_S" "agentForSiteServer\("; then
+  bad "G6 backup_orchestrator no longer resolves a server at all — the absence arm below proves nothing"
+elif [ -n "$BO_S" ]; then
   if has "$BO_S" "FROM servers WHERE status = 'online' LIMIT 1"; then
     bad "G6 backup_orchestrator still stamps server_id from an arbitrary online server"
   else
     ok "G6 the arbitrary-online-server stamp is gone from backup_orchestrator"
   fi
 else
-  skip "G6 — backup_orchestrator.rs not extractable"
+  skip "G6 — rt_backup_orchestrator.go not extractable"
 fi
 
 # ── the scanners (s301) ────────────────────────────────────────────────────
 # G7/G8 — both scanners take a MACHINE as their subject, so the arm requires the
 # fleet LOOP, not merely a registry in the signature.
 if [ -n "$SS_S" ]; then
-  if has "$(sig "$SS_S" run)" "AgentRegistry" && has "$SS_S" "online_fleet\(\)"; then
+  if has "$(sig "$SS_S" SecurityScannerRun)" "\*AgentRegistry" && has "$SS_S" "agents\.OnlineFleet\(ctx\)"; then
     ok "G7 security_scanner sweeps the fleet instead of the panel alone"
   else
     bad "G7 security_scanner still scans only the panel host — members are never scanned at all"
   fi
 else
-  skip "G7 — security_scanner.rs not extractable"
+  skip "G7 — svc_security_scanner.go not extractable"
 fi
 
 if [ -n "$IS_S" ]; then
-  if has "$(sig "$IS_S" run)" "AgentRegistry" && has "$IS_S" "online_fleet\(\)"; then
+  if has "$(sig "$IS_S" ImageScannerRun)" "\*AgentRegistry" && has "$IS_S" "agents\.OnlineFleet\(ctx\)"; then
     ok "G8 image_scanner sweeps the fleet instead of the panel alone"
   else
     bad "G8 image_scanner still sweeps only the panel's images"
   fi
 else
-  skip "G8 — image_scanner.rs not extractable"
+  skip "G8 — svc_image_scanner.go not extractable"
 fi
 
 if [ -n "$MAIN_S" ]; then
-  for pair in "security_scanner:G9" "image_scanner:G10" "alert_engine:G11"; do
+  for pair in "SecurityScannerRun:G9" "ImageScannerRun:G10" "AlertEngineRun:G11"; do
     svc=${pair%%:*}; id=${pair##*:}
-    if has "$MAIN_S" "${svc}::run\(s_db\.clone\(\), s_agents"; then
-      ok "$id main.rs spawns $svc with the REGISTRY"
+    if has "$MAIN_S" "spawnSupervised\(.*${svc}\(ctx, db, agents\)"; then
+      ok "$id core_state.go spawns $svc with the REGISTRY"
     else
       bad "$id $svc is still spawned with the legacy single-agent handle — the fix exists but is never wired"
     fi
   done
 else
-  skip "G9/G10/G11 — main.rs not extractable"
+  skip "G9/G10/G11 — core_state.go not extractable"
 fi
 
 # G12 — THE arming arm. The upsert's arbiter named a column the INSERT never
@@ -830,7 +832,7 @@ if [ -n "$SS_S" ]; then
     bad "G14 the weekly cadence gate is still fleet-wide or still counts failed scans"
   fi
 else
-  skip "G14 — security_scanner.rs not extractable"
+  skip "G14 — svc_security_scanner.go not extractable"
 fi
 
 # G15 — the scan record itself. This route resolved the correct agent and threw
@@ -842,20 +844,23 @@ if [ -n "$SSR_S" ]; then
     bad "G15 the manual scan route still files every member's scan under no server"
   fi
 else
-  skip "G15 — security_scans.rs not extractable"
+  skip "G15 — rt_security_scans.go not extractable"
 fi
 
 # G16 — the readers. If these keep reading the NULL bucket while the writers
 # start binding, the Security page empties out and the posture card disappears.
 if [ -n "$SSR_S" ]; then
-  NULLREADS=$(count "$(stmt "$SSR_S" 'FROM security_scans' 2)" 'server_id IS NULL')
-  if [ "$NULLREADS" -eq 0 ]; then
+  READS=$(stmt "$SSR_S" 'FROM security_scans' 2)
+  NULLREADS=$(count "$READS" 'server_id IS NULL')
+  if [ -z "$READS" ]; then
+    bad "G16 no security_scans reader found — the absence arm below proves nothing"
+  elif [ "$NULLREADS" -eq 0 ]; then
     ok "G16 no security_scans reader is still pinned to the NULL bucket"
   else
     bad "G16 $NULLREADS security_scans reader(s) still filter server_id IS NULL — the scan history will read empty"
   fi
 else
-  skip "G16 — security_scans.rs not extractable"
+  skip "G16 — rt_security_scans.go not extractable"
 fi
 
 # G17 — the image write + its retention. An unscoped 30-row trim makes a busy
@@ -875,7 +880,7 @@ if [ -n "$ISR_S" ]; then
     bad "G17b the history trim is still per image — one host evicts another's only result"
   fi
 else
-  skip "G17 — image_scans.rs not extractable"
+  skip "G17 — rt_image_scans.go not extractable"
 fi
 
 # G18 — the deploy gate. The scan that decides has to be a scan of the machine
@@ -883,44 +888,45 @@ fi
 # wave a vulnerable image onto another.
 if [ -n "$ISR_S" ]; then
   # s369: the gate was split so every door that runs an image can call it, and
-  # the scan lookup moved into `preflight_gate_image`. The arm follows the code
+  # the scan lookup moved into `preflight_gate_image` (Go:
+  # rtImageScansPreflightGateImage). The arm follows the code
   # to where the query now lives — and G18b below pairs with it, asserting the
   # original entry point still REACHES it, which is the half that stops a
   # follow-the-code repoint from quietly measuring nothing (lesson #150).
-  GATE=$(fnbody "$ISR_S" "preflight_gate_image")
+  GATE=$(fnbody "$ISR_S" "rtImageScansPreflightGateImage")
   if [ -z "$GATE" ]; then
-    skip "G18 — preflight_gate_image not extractable"
-  elif has "$GATE" 'server_id: uuid::Uuid' && has "$GATE" 'server_id = \$1'; then
+    skip "G18 — rtImageScansPreflightGateImage not extractable"
+  elif has "$GATE" 'serverID uuid\.UUID' && has "$GATE" 'server_id = \$1'; then
     ok "G18 the deploy gate reads a scan of the deploy TARGET"
   else
     bad "G18 the deploy gate still reads whichever host scanned that image last"
   fi
-  ENTRY=$(fnbody "$ISR_S" "preflight_gate")
+  ENTRY=$(fnbody "$ISR_S" "rtImageScansPreflightGate")
   if [ -z "$ENTRY" ]; then
-    skip "G18b — preflight_gate not extractable"
-  elif has "$ENTRY" 'preflight_gate_image\(pool, server_id'; then
+    skip "G18b — rtImageScansPreflightGate not extractable"
+  elif has "$ENTRY" 'rtImageScansPreflightGateImage\(ctx, db, serverID'; then
     ok "G18b the template entry point still reaches the scoped gate"
   else
-    bad "G18b preflight_gate no longer calls preflight_gate_image — G18 is measuring a function nothing calls"
+    bad "G18b rtImageScansPreflightGate no longer calls rtImageScansPreflightGateImage — G18 is measuring a function nothing calls"
   fi
 else
-  skip "G18 — image_scans.rs not extractable"
+  skip "G18 — rt_image_scans.go not extractable"
 fi
 
 # G19 — the badge feed. This was the one handler in its module with no scope at
 # all, and the client keys its response by image, so a fleet-wide DISTINCT ON
 # collapsed every host's result into one with no duplicate and no error.
 if [ -n "$ISR_S" ]; then
-  LR=$(fnbody "$ISR_S" "list_recent")
+  LR=$(fnbody "$ISR_S" "rtImageScansListRecent")
   if [ -z "$LR" ]; then
-    skip "G19 — list_recent not extractable"
-  elif has "$LR" "ServerScope" && has "$LR" 'server_id = \$1'; then
+    skip "G19 — rtImageScansListRecent not extractable"
+  elif has "$LR" "serverID, _, err := st\.serverScope\(r\)" && has "$LR" 'server_id = \$1'; then
     ok "G19 the Apps badge feed is server-scoped"
   else
-    bad "G19 list_recent is still fleet-wide — badges collapse across hosts, last writer wins"
+    bad "G19 rtImageScansListRecent is still fleet-wide — badges collapse across hosts, last writer wins"
   fi
 else
-  skip "G19 — image_scans.rs not extractable"
+  skip "G19 — rt_image_scans.go not extractable"
 fi
 
 # G20 — THE 42P10 ARM, and the reason this migration and this writer are one
@@ -938,25 +944,27 @@ if [ -n "$SB_S" ]; then
     bad "G20 the SBOM upsert names an arbiter with no matching unique index — every generate 500s (42P10)"
   fi
 else
-  skip "G20 — sboms.rs not extractable"
+  skip "G20 — rt_sboms.go not extractable"
 fi
 
 # G21 — alert_engine's three AGENT-driven checks. Its DB-driven checks were
 # already per-server; only the ones that ask a machine what it has were blind.
 if [ -n "$AE_S" ]; then
   OLDEST=$(count "$AE_S" 'FROM servers ORDER BY created_at ASC LIMIT 1')
-  if [ "$OLDEST" -eq 0 ]; then
+  if ! has "$AE_S" 'FROM servers'; then
+    bad "G21 alert_engine reads no servers rows at all — the absence below proves nothing"
+  elif [ "$OLDEST" -eq 0 ]; then
     ok "G21 the oldest-row 'local server' derivation is gone from alert_engine"
   else
     bad "G21 alert_engine still derives 'the local server' by row age in $OLDEST place(s)"
   fi
-  if has "$AE_S" "online_fleet\(\)" && has "$AE_S" "check_container_health\(&pool, member\)"; then
+  if has "$AE_S" "agents\.OnlineFleet\(ctx\)" && has "$AE_S" "alertEngineCheckContainerHealth\(ctx, db, member\)"; then
     ok "G22 alert_engine runs its agent-driven checks once per online server"
   else
     bad "G22 alert_engine still asks the panel's agent and labels the answer with another server"
   fi
 else
-  skip "G21/G22 — alert_engine.rs not extractable"
+  skip "G21/G22 — svc_alert_engine.go not extractable"
 fi
 
 # G23 — the corollary arm (#164): two bugs that cancel are two bugs. alert_engine
@@ -964,28 +972,28 @@ fi
 # the right host BY ACCIDENT. Correct ids end the accident, which is why this
 # must be true in the same commit as G22 and not one release later.
 if [ -n "$AH_S" ]; then
-  RESTART=$(fnbody "$AH_S" "auto_restart_services")
+  RESTART=$(fnbody "$AH_S" "autoHealerAutoRestartServices")
   if [ -z "$RESTART" ]; then
-    skip "G23 — auto_restart_services not extractable"
+    skip "G23 — autoHealerAutoRestartServices not extractable"
   else
-    if has "$RESTART" "for_server\(" && has "$(sig "$AH_S" auto_restart_services)" "AgentRegistry"; then
-      ok "G23 auto_restart_services restarts a service on the host it died on"
+    if has "$RESTART" "agents\.ForServer\(" && has "$(sig "$AH_S" autoHealerAutoRestartServices)" "\*AgentRegistry"; then
+      ok "G23 autoHealerAutoRestartServices restarts a service on the host it died on"
     else
-      bad "G23 auto_restart_services still posts every restart to the local agent"
+      bad "G23 autoHealerAutoRestartServices still posts every restart to the local agent"
     fi
     UNSCOPED=$(count "$RESTART" "alert_type = 'service_down'")
     SCOPED=$(count "$RESTART" 'server_id = \$1')
     if [ "$UNSCOPED" -gt 0 ] && [ "$SCOPED" -ge 3 ]; then
       ok "G24 its alert_state reads and writes are scoped to the server ($SCOPED predicates)"
     else
-      bad "G24 alert_state statements in auto_restart_services are still fleet-wide (scoped=$SCOPED)"
+      bad "G24 alert_state statements in autoHealerAutoRestartServices are still fleet-wide (scoped=$SCOPED)"
     fi
     if has "$RESTART" 'target_name = \$1 AND server_id = \$2'; then
       ok "G25 the restart cooldown counts attempts on THIS server"
     else
       bad "G25 the cooldown is still keyed on the bare service name — two hosts share one budget"
     fi
-    if has "$RESTART" "log_activity_on_server\(" && ! has "$RESTART" "Uuid::nil\(\)"; then
+    if has "$RESTART" "ActivityLogActivityOnServer\(" && ! has "$RESTART" "uuid\.Nil"; then
       ok "G26 the heal is recorded against the server's owner, so the cooldown row can exist at all"
     else
       bad "G26 the heal record still uses the nil uuid — it violates the user FK, so the cooldown stays dead"
@@ -994,15 +1002,15 @@ if [ -n "$AH_S" ]; then
     # asking for the wrong one fails silently and for ever. The agent's payload
     # carries `status` and `container_id`; the alert engine reads the correct
     # name for the same payload 900 lines away in the same subsystem.
-    APPS=$(grep -A 4 -E 'get\("/apps"\)' <<< "$RESTART" || true)
-    if has "$RESTART" 'get\("container_id"\)' && ! has "$RESTART" 'c\.get\("state"\)'; then
+    if has "$RESTART" 'Agent\.Get\(ctx, "/apps"\)' && has "$RESTART" 'jsonGet\(c, "container_id"\)' \
+       && has "$RESTART" 'jsonGet\(c, "status"\)' && ! has "$RESTART" 'jsonGet\(c, "state"\)'; then
       ok "G27 the container leg reads the field names the agent actually sends"
     else
       bad "G27 the container leg still reads fields the /apps payload has never had — it can never fire"
     fi
   fi
 else
-  skip "G23–G27 — auto_healer.rs not extractable"
+  skip "G23–G27 — svc_auto_healer.go not extractable"
 fi
 
 # G28 — the NEGATIVE arm, and the reason it runs over STRIPPED source. The
@@ -1011,16 +1019,19 @@ fi
 # comments that spell the name precisely to say they are NOT using it, so an arm
 # over raw source would fire on the prose narrating the decision — the #149 trap,
 # and the reason `subj` is used here rather than the file.
-BG_FILES=$(find panel/backend/src/services -name '*.rs' -type f 2>/dev/null | sort)
-BG_COUNT=$(grep -c '\.rs$' <<< "$BG_FILES" || true)
+# Background services are the svc_*.go files (non-test) of the flat api package.
+BG_FILES=$(find "$API" -maxdepth 1 -name 'svc_*.go' ! -name '*_test.go' -type f 2>/dev/null | sort)
+BG_COUNT=$(grep -c '\.go$' <<< "$BG_FILES" || true)
 if [ "${BG_COUNT:-0}" -lt 10 ]; then
   bad "G28 only $BG_COUNT service files enumerated — the absence arm below cannot mean anything"
+elif ! has "$AGENT_S" '^func \(r \*AgentRegistry\) ForServerOrLocal\('; then
+  bad "G28 ForServerOrLocal is no longer defined in svc_agent.go — the pattern below matches nothing by construction; re-point it"
 else
   OFFENDERS=0
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    [ "$f" = "panel/backend/src/services/agent.rs" ] && continue
-    if grep -qE -- '\.for_server_or_local\(' <<< "$(code "$f")"; then
+    [ "$f" = "$API/svc_agent.go" ] && continue
+    if grep -qE -- '\.ForServerOrLocal\(' <<< "$(code "$f")"; then
       bad "G28 $f calls the resolver that silently substitutes the local agent"
       OFFENDERS=$((OFFENDERS+1))
     fi
@@ -1046,10 +1057,10 @@ echo "§H the panel host is watched too, and the legacy handle has an allow-list
 # the SPAWN SITES, not a per-service arm. Four releases in a row shipped a
 # per-defect arm and left a sibling on the legacy handle; an allow-list of one
 # goes red the moment a new service joins it, or an old one is missed.
-MC=panel/backend/src/services/metrics_collector.rs
-SM=panel/backend/src/services/server_monitor.rs
-MN=panel/backend/src/main.rs
-AG=panel/backend/src/services/agent.rs
+MC=$API/svc_metrics_collector.go
+SM=$API/svc_server_monitor.go
+MN=$API/core_state.go
+AG=$API/svc_agent.go
 
 for f in "$MC" "$SM" "$MN" "$AG"; do
   [ -f "$f" ] || bad "MISSING SUBJECT FILE: $f"
@@ -1058,29 +1069,29 @@ done
 MC_S=$(subj "$MC" || true); SM_S=$(subj "$SM" || true)
 MN_S=$(subj "$MN" || true); AG_S=$(subj "$AG" || true)
 
-# H1 — the collector takes the REGISTRY. Keyed on the flattened signature: a Rust
-# parameter list wraps, and a line-oriented `has` over raw source measures nothing
+# H1 — the collector takes the REGISTRY. Keyed on the flattened signature: a
+# parameter list can wrap, and a line-oriented `has` over raw source measures nothing
 # (lesson #168 — and as a PRESENCE arm this fails loudly rather than green).
 if [ -n "$MC_S" ]; then
-  MC_RUN=$(sig "$MC_S" "run")
-  if has "$MC_RUN" 'AgentRegistry'; then
-    ok "H1 metrics_collector::run takes the AgentRegistry"
+  MC_RUN=$(sig "$MC_S" "MetricsCollectorRun")
+  if has "$MC_RUN" '\*AgentRegistry'; then
+    ok "H1 MetricsCollectorRun takes the *AgentRegistry"
   else
-    bad "H1 metrics_collector::run does not take the AgentRegistry — it cannot reach any host but its own"
+    bad "H1 MetricsCollectorRun does not take the AgentRegistry — it cannot reach any host but its own"
   fi
 else
-  skip "H1 — metrics_collector.rs not extractable"
+  skip "H1 — svc_metrics_collector.go not extractable"
 fi
 
 # H2 — and actually iterates it.
 if [ -n "$MC_S" ]; then
-  if has "$MC_S" 'online_fleet\(\)'; then
+  if has "$MC_S" 'agents\.OnlineFleet\(ctx\)'; then
     ok "H2 metrics_collector iterates the online fleet"
   else
     bad "H2 metrics_collector never iterates the fleet — members get no history rows"
   fi
 else
-  skip "H2 — metrics_collector.rs not extractable"
+  skip "H2 — svc_metrics_collector.go not extractable"
 fi
 
 # H3 — every history row is stamped with the server it was READ FROM. The defect
@@ -1089,13 +1100,13 @@ fi
 if [ -n "$MC_S" ]; then
   if has "$MC_S" 'is_local = true'; then
     bad "H3 metrics_collector still resolves one 'local' id — every reading lands on that one server"
-  elif has "$MC_S" '\.bind\(member\.id\)'; then
+  elif has "$(stmt "$MC_S" 'INSERT INTO metrics_history' 1)" 'server_id\) VALUES .*disk, m\.ID\)'; then
     ok "H3 metrics_collector stamps each reading with the server it was read from"
   else
     bad "H3 metrics_collector binds no per-member id to its history writes"
   fi
 else
-  skip "H3 — metrics_collector.rs not extractable"
+  skip "H3 — svc_metrics_collector.go not extractable"
 fi
 
 # H4 — the panel row's scalar columns get a writer at last. Flattened: the UPDATE
@@ -1103,13 +1114,13 @@ fi
 # first fragment.
 if [ -n "$MC_S" ]; then
   MC_UPD=$(flat "$MC_S")
-  if has "$MC_UPD" 'UPDATE servers SET.*cpu_usage' && has "$MC_S" 'is_local'; then
+  if has "$MC_UPD" 'UPDATE servers SET .*cpu_usage = \$2' && has "$MC_S" 'if m\.IsLocal \{'; then
     ok "H4 the local server's scalar columns are written by the collector"
   else
     bad "H4 nothing writes the panel row's cpu/memory/disk — its thresholds can never evaluate"
   fi
 else
-  skip "H4 — metrics_collector.rs not extractable"
+  skip "H4 — svc_metrics_collector.go not extractable"
 fi
 
 # H5 — THE CLASS ARM. NO spawn may hold the legacy single-agent handle.
@@ -1123,15 +1134,22 @@ fi
 # the registry and resolve per row, so the allow-list is retired rather than
 # decremented: an allow-list that outlives its reason is how the next service
 # quietly joins it.
+# Go: every background service is a `spawnSupervised(...)` line in
+# core_state.go; the legacy handle is `st.Agent` / `Agents.Local()` /
+# `agents.Local()`. The spawn list is asserted first (#143).
 if [ -n "$MN_S" ]; then
-  LEGACY=$(count "$MN_S" 'state\.agent\.clone\(\)')
-  if [ "$LEGACY" -eq 0 ]; then
-    ok "H5 no background service holds the legacy local agent handle — every spawn resolves per row"
+  SPAWNS=$(grep -E 'spawnSupervised\(shutdown, "' <<< "$MN_S" || true)
+  SPAWN_N=$(grep -c . <<< "$SPAWNS" || true)
+  LEGACY=$(count "$SPAWNS" 'st\.Agent([^s]|$)|[Aa]gents\.Local\(\)|, agent\)')
+  if [ "$SPAWN_N" -lt 15 ]; then
+    bad "H5 only $SPAWN_N background spawns enumerated — the class arm below cannot mean anything"
+  elif [ "$LEGACY" -eq 0 ]; then
+    ok "H5 none of the $SPAWN_N background spawns holds the legacy local agent handle — every spawn resolves per row"
   else
     bad "H5 $LEGACY spawn(s) hold the legacy local agent handle — that service acts on THIS box no matter which host its rows name"
   fi
 else
-  skip "H5 — main.rs not extractable"
+  skip "H5 — core_state.go not extractable"
 fi
 
 # H6 — the offline sweep states its exemption instead of inheriting it from a
@@ -1145,7 +1163,7 @@ if [ -n "$SM_S" ]; then
     bad "H6 the offline sweep does not name is_local — the exemption rests on a NULL comparison nobody stated"
   fi
 else
-  skip "H6 — server_monitor.rs not extractable"
+  skip "H6 — svc_server_monitor.go not extractable"
 fi
 
 # H7 — the shared fleet primitive carries the flag the collector branches on.
@@ -1153,41 +1171,44 @@ fi
 # ⚠ The window is bounded by the struct's own closing brace, NOT by `-A n`. The
 # first draft used `grep -A 12` and printed a confident GREEN against v2.58.0,
 # where the field does not exist: twelve lines after a six-line struct run into
-# `ensure_local_server`, whose body contains `WHERE is_local = true`. A fixed
+# `ensure_local_server`, whose body contains `WHERE is_local = true`. (Go:
+# AgentFleetMember, bounded the same way.) A fixed
 # window is not a declaration (p31), and the only reason this was caught is that
 # the arm was run against the previous tag and required to be red (#158).
 if [ -n "$AG_S" ]; then
-  AG_FLEET=$(flat "$(awk '/pub struct FleetMember/{f=1} f{print; if(/^\}/) exit}' <<< "$AG_S")")
+  AG_FLEET=$(flat "$(awk '/^type AgentFleetMember struct/{f=1} f{print; if(/^\}/) exit}' <<< "$AG_S")")
   if [ -z "$AG_FLEET" ]; then
-    bad "H7 could not extract the FleetMember declaration — the arm cannot mean anything"
-  elif has "$AG_FLEET" 'is_local'; then
-    ok "H7 FleetMember carries is_local"
+    bad "H7 could not extract the AgentFleetMember declaration — the arm cannot mean anything"
+  elif has "$AG_FLEET" 'IsLocal[[:space:]]+bool'; then
+    ok "H7 AgentFleetMember carries IsLocal"
   else
-    bad "H7 FleetMember has no is_local — nothing can tell the panel row from a member while iterating"
+    bad "H7 AgentFleetMember has no IsLocal — nothing can tell the panel row from a member while iterating"
   fi
 else
-  skip "H7 — agent.rs not extractable"
+  skip "H7 — svc_agent.go not extractable"
 fi
 
 # H8 — the fleet reads are concurrent. Serial round trips over N hosts inside a
-# 30-second interval fall behind, and tokio's default MissedTickBehavior then
-# fires the backlog back to back.
+# 30-second interval fall behind. (Rust: join_all; Go: one goroutine per member
+# under a sync.WaitGroup, inside the fleet loop.)
 if [ -n "$MC_S" ]; then
-  if has "$MC_S" 'join_all'; then
+  MC_RUNB=$(flat "$(fnbody "$MC_S" MetricsCollectorRun)")
+  if has "$MC_RUNB" 'var wg sync\.WaitGroup for i := range fleet \{ wg\.Add\(1\) go func\(\)' && has "$MC_RUNB" 'wg\.Wait\(\)'; then
     ok "H8 the fleet is read concurrently, so a large fleet cannot outrun the tick"
   else
     bad "H8 the collector reads the fleet serially — N round trips inside a 30s interval"
   fi
 else
-  skip "H8 — metrics_collector.rs not extractable"
+  skip "H8 — svc_metrics_collector.go not extractable"
 fi
 
 echo
 echo "§I the nil uuid is not a user (s303 / v2.60.0) — THE CLASS, not four instances"
 
-# Four writers reached for `Uuid::nil()` as "no user". `activity_logs.user_id` is
+# Four writers reached for `Uuid::nil()` (Go: `uuid.Nil`) as "no user". `activity_logs.user_id` is
 # nullable with an FK to `users`, so a nil is a non-NULL value naming a row that
-# does not exist: the insert is rejected with 23503 and `log_activity` swallows it
+# does not exist: the insert is rejected with 23503 and `log_activity` (Go:
+# ActivityLogActivity) swallows it
 # into a warn. None of the four ever recorded anything, and TWO of them read their
 # own rows back as a rate limit — a COUNT(*) that could only return 0 standing in
 # for a cooldown.
@@ -1200,7 +1221,8 @@ echo "§I the nil uuid is not a user (s303 / v2.60.0) — THE CLASS, not four in
 
 # The subject list must be asserted before it is trusted: an arm that enumerates
 # its own subjects and finds none prints green having examined nothing (#143).
-NIL_FILES=$(find panel/backend/src -name '*.rs' | wc -l)
+api_sources() { find "$API" -maxdepth 1 -name '*.go' ! -name '*_test.go' -type f | sort; }
+NIL_FILES=$(api_sources | wc -l | tr -d ' ')
 if [ "$NIL_FILES" -lt 40 ]; then
   bad "I0 only $NIL_FILES backend sources found — I1 would examine almost nothing; refusing to trust it"
 else
@@ -1212,21 +1234,21 @@ else
   NIL_BAD=""
   while IFS= read -r f; do
     FS=$(code "$f")
-    has "$FS" 'log_activity' || continue
-    CALLW=$(stmt "$FS" 'log_activity(_on_server|_system)?\(' 12)
-    NIL_CALLS=$((NIL_CALLS + $(count "$CALLW" 'log_activity(_on_server|_system)?\(')))
-    if has "$CALLW" 'log_activity(_on_server|_system)?\([^)]*[Uu]uid::nil'; then
+    has "$FS" 'ActivityLogActivity' || continue
+    CALLW=$(stmt "$FS" 'ActivityLogActivity(OnServer|System)?\(' 12)
+    NIL_CALLS=$((NIL_CALLS + $(count "$CALLW" 'ActivityLogActivity(OnServer|System)?\(')))
+    if has "$CALLW" 'ActivityLogActivity(OnServer|System)?\([^)]*uuid\.Nil'; then
       NIL_BAD="$NIL_BAD $f"
     fi
-  done < <(find panel/backend/src -name '*.rs')
+  done < <(api_sources)
 
   # …and the calls themselves must be plausible, or the loop above matched nothing.
   if [ "$NIL_CALLS" -lt 100 ]; then
-    bad "I1 only $NIL_CALLS log_activity call sites matched — the extraction is broken, not the code clean"
+    bad "I1 only $NIL_CALLS ActivityLogActivity call sites matched — the extraction is broken, not the code clean"
   elif [ -n "$NIL_BAD" ]; then
     bad "I1 activity written as the nil uuid in:$NIL_BAD — those rows violate fk_activity_logs_user and are never stored"
   else
-    ok "I1 none of the $NIL_CALLS log_activity call sites names the nil uuid as a user"
+    ok "I1 none of the $NIL_CALLS ActivityLogActivity call sites names the nil uuid as a user"
   fi
 
   # I1b — and the call site is not the only way in. `auth.rs` passed the class
@@ -1234,18 +1256,19 @@ else
   # one-line helper (`fn zero_uuid() -> Uuid { Uuid::nil() }`), so the grep saw
   # `zero_uuid()` and found nothing to complain about. A pattern that launders
   # itself through a name is still the pattern. This forbids the FACTORY: a
-  # function whose entire body hands back a nil uuid.
+  # function whose entire body hands back a nil uuid (Go:
+  # `func zeroUUID() uuid.UUID { return uuid.Nil }`).
   #
-  # The one legitimate nil in the tree is a cached-admin sentinel inside a
-  # larger function in agent.rs, which this cannot match by construction.
+  # The legitimate nils in the tree are error-path returns and comparisons
+  # inside larger functions, which this cannot match by construction.
   NIL_FACTORY=""
   while IFS= read -r f; do
     FS=$(code "$f")
-    has "$FS" 'Uuid::nil' || continue
-    if has "$(flat "$FS")" 'fn [a-z_]+\(\) *-> *(uuid::)?Uuid *\{ *(uuid::)?Uuid::nil\(\) *\}'; then
+    has "$FS" 'uuid\.Nil' || continue
+    if has "$(flat "$FS")" 'func [A-Za-z_][A-Za-z0-9_]*\(\) *uuid\.UUID *\{ *return uuid\.Nil *\}'; then
       NIL_FACTORY="$NIL_FACTORY $f"
     fi
-  done < <(find panel/backend/src -name '*.rs')
+  done < <(api_sources)
 
   if [ -n "$NIL_FACTORY" ]; then
     bad "I1b a nil-uuid factory is defined in:$NIL_FACTORY — it launders the sentinel past the class arm above"
@@ -1256,11 +1279,11 @@ fi
 
 # I2 — the writer that IS a cooldown. It must name a real owner and stamp the
 # host, exactly as auto_restart_services has since v2.58.0 (G26 is its twin).
-SSL=$(fnbody "$AH_S" "auto_renew_ssl")
+SSL=$(fnbody "$AH_S" "autoHealerAutoRenewSsl")
 if [ -z "$SSL" ]; then
-  bad "I2 could not extract auto_renew_ssl — every §I SSL arm below is meaningless"
+  bad "I2 could not extract autoHealerAutoRenewSsl — every §I SSL arm below is meaningless"
 else
-  if has "$(flat "$SSL")" 'log_activity_on_server\(' && ! has "$SSL" '[Uu]uid::nil'; then
+  if has "$(flat "$SSL")" 'ActivityLogActivityOnServer\(' && ! has "$SSL" 'uuid\.Nil'; then
     ok "I2 the SSL renewal attempt is recorded against the site's owner and server"
   else
     bad "I2 the SSL renewal record still uses the nil uuid — the anti-CA-hammering cooldown stays dead"
@@ -1269,7 +1292,7 @@ else
   # I3 — a gate must read something its own subject writes. This is the severed
   # pair stated directly: the action counted and the action logged are one string.
   if has "$SSL" "action = 'auto_heal.renew_ssl'" && has "$SSL" '"auto_heal.renew_ssl"'; then
-    ok "I3 auto_renew_ssl records the very action its cooldown counts"
+    ok "I3 autoHealerAutoRenewSsl records the very action its cooldown counts"
   else
     bad "I3 the SSL cooldown counts an action this function never writes — it can never engage"
   fi
@@ -1279,18 +1302,18 @@ else
   # it resolves to the panel's own row, so a member's cert failure was filed
   # against the panel and hidden from the picker that would show it.
   if has "$(flat "$SSL")" 'ORDER BY created_at ASC LIMIT 1'; then
-    bad "I4 auto_renew_ssl still stamps its alert with the oldest servers row instead of the site's server"
+    bad "I4 autoHealerAutoRenewSsl still stamps its alert with the oldest servers row instead of the site's server"
   else
-    ok "I4 auto_renew_ssl does not resolve a server by taking the oldest row"
+    ok "I4 autoHealerAutoRenewSsl does not resolve a server by taking the oldest row"
   fi
 fi
 
 # I5 — auto-sleep genuinely has no user to name, so it must say so in the way the
 # schema sanctions (NULL) rather than by inventing a uuid.
-SLEEP=$(fnbody "$AH_S" "auto_sleep_idle_containers")
+SLEEP=$(fnbody "$AH_S" "autoHealerAutoSleepIdleContainers")
 if [ -z "$SLEEP" ]; then
-  bad "I5 could not extract auto_sleep_idle_containers"
-elif has "$(flat "$SLEEP")" 'log_activity_system\('; then
+  bad "I5 could not extract autoHealerAutoSleepIdleContainers"
+elif has "$(flat "$SLEEP")" 'ActivityLogActivitySystem\('; then
   ok "I5 stopping a customer's container leaves an audit row with no invented user"
 else
   bad "I5 auto-sleep still writes its audit row with a user that does not exist — stopping a container leaves no record"
@@ -1300,12 +1323,17 @@ fi
 # account is what credential stuffing and user enumeration look like; it was the
 # ONLY failure branch that named a nil uuid, so the panel recorded the one case
 # that is not enumeration and dropped the one that is.
-AUTH=panel/backend/src/routes/auth.rs
+AUTH=$API/rt_auth.go
 AUTH_S=$(subj "$AUTH" || true)
 if [ -z "$AUTH_S" ]; then
   bad "I6 could not read $AUTH"
 else
-  if has "$AUTH_S" 'log_activity_system\(' && ! has "$AUTH_S" 'zero_uuid|[Uu]uid::nil'; then
+  # Go: `uuid.Nil` also appears in this file as a plain comparison
+  # (`localID != uuid.Nil`), which is not a user; what is forbidden is the
+  # sentinel reaching an activity writer, or a helper that launders it.
+  if has "$AUTH_S" 'ActivityLogActivitySystem\(ctx, st\.DB, body\.Email, "auth\.login_failed"' \
+     && ! has "$AUTH_S" 'zero_?[Uu][Uu][Ii][Dd]\(' \
+     && ! has "$(stmt "$AUTH_S" 'ActivityLogActivity(OnServer)?\(' 6)" 'ActivityLogActivity(OnServer)?\([^)]*uuid\.Nil'; then
     ok "I6 a login against a non-existent account is recorded"
   else
     bad "I6 login failures against unknown accounts still write a nil uuid — the enumeration signature is invisible"
@@ -1316,7 +1344,7 @@ fi
 # surface cannot name the account or the origin: the login writers pass no
 # target_name, so the column this reader used to select as "user" was NULL on
 # every row it has ever returned.
-SECR=panel/backend/src/routes/security.rs
+SECR=$API/rt_security.go
 SECR_S=$(subj "$SECR" || true)
 if [ -z "$SECR_S" ]; then
   bad "I7 could not read $SECR"
@@ -1325,11 +1353,11 @@ else
   # on the SELECT line and the recognisable token on the WHERE line below it, so
   # a `grep -A n` anchored on either one misses the other (p31, and this arm
   # printed a false RED against a correct fix before it was written this way).
-  AUDQ=$(flat "$(fnbody "$SECR_S" "login_audit")")
+  AUDQ=$(flat "$(fnbody "$SECR_S" "rtSecurityLoginAudit")")
   if [ -z "$AUDQ" ]; then
     bad "I7 could not locate the login-audit query — the arm would measure nothing"
   elif ! has "$AUDQ" 'auth.login_failed'; then
-    bad "I7 login_audit no longer reads auth.login_failed — the arm is measuring the wrong function"
+    bad "I7 rtSecurityLoginAudit no longer reads auth.login_failed — the arm is measuring the wrong function"
   elif has "$AUDQ" 'user_email' && has "$AUDQ" 'ip_address'; then
     ok "I7 the login-audit feed carries the account and the origin of each attempt"
   else
@@ -1343,24 +1371,28 @@ fi
 if [ -n "$AE_S" ]; then
   HEALQ=$(stmt "$AE_S" "action = 'auto_heal.restart_service'" 5)
   if [ -z "$HEALQ" ]; then
-    bad "I8 could not locate the heal-suppression query in alert_engine.rs"
+    bad "I8 could not locate the heal-suppression query in svc_alert_engine.go"
   elif has "$HEALQ" 'server_id = \$2'; then
     ok "I8 a heal on one host does not suppress the same service's alert on another"
   else
     bad "I8 the heal-suppression count is still fleet-wide — healing nginx on one server mutes nginx on all of them"
   fi
 else
-  skip "I8 — alert_engine.rs not extractable"
+  skip "I8 — svc_alert_engine.go not extractable"
 fi
 
 # I9 — the fourth writer, and the one the obvious audit misses: written
 # `.unwrap_or_else(uuid::Uuid::nil)`, with no parentheses, so a `Uuid::nil()`
 # grep does not find it. It fed a NOT NULL column with a foreign key.
-WH=panel/backend/src/routes/whmcs.rs
+# Go shape of the defect: the local-server lookup's nil result defaulted to
+# uuid.Nil instead of being refused. The anchor proves the lookup is still here.
+WH=$API/rt_whmcs.go
 WH_S=$(subj "$WH" || true)
 if [ -z "$WH_S" ]; then
   bad "I9 could not read $WH"
-elif has "$WH_S" 'unwrap_or(_else)?\( *(uuid::)?Uuid::nil'; then
+elif ! has "$WH_S" "SELECT id FROM servers WHERE is_local = true LIMIT 1"; then
+  bad "I9 the local-server lookup is gone from rt_whmcs.go — this arm is measuring nothing"
+elif has "$WH_S" 'uuid\.Nil' || ! has "$WH_S" 'if sourceID == nil \{'; then
   bad "I9 whmcs still defaults a missing local server to the nil uuid — an FK violation surfaced as a 500"
 else
   ok "I9 a missing local server is reported, not laundered into a sentinel uuid"
@@ -1382,7 +1414,8 @@ fi
 # guard is what caught it. `role` used to be the stash as well as the status, and
 # the deny-list below was the whole compensation; the stash now has its own
 # column (`users.prior_role`) and both suspenders share one statement in
-# `helpers::suspend_account`. An arm still grepping whmcs.rs for the UPDATE would
+# `helpers::suspend_account` (Go: suspendAccount in core_helpers.go). An arm
+# still grepping whmcs.rs for the UPDATE would
 # have been measuring an absent subject — lesson #150, extracting a helper moves
 # the subject of every pin that measured it. So the arm follows the code, and is
 # paired with the check that the caller still REACHES it.
@@ -1391,7 +1424,7 @@ fi
 # different hazard, a lapsed invoice suspending the operator out of their own panel.
 if [ -z "$WH_S" ]; then
   : # already reported by I9
-elif ! has "$WH_S" 'helpers::suspend_account'; then
+elif ! has "$WH_S" 'suspendAccount\(ctx, st, '; then
   bad "I9b whmcs no longer reaches the shared suspend statement — this arm is measuring nothing"
 elif has "$WH_S" "role NOT IN \\('admin', 'reseller'\\)"; then
   ok "I9b the billing webhook cannot overwrite a privileged role"
@@ -1407,26 +1440,26 @@ if [ -z "$WH_S" ]; then
   : # already reported by I9
 elif has "$WH_S" "UPDATE users SET role = 'user'"; then
   bad "I9c the billing webhook still restores every unsuspended account to 'user'"
-elif ! has "$WH_S" 'helpers::unsuspend_account'; then
+elif ! has "$WH_S" 'unsuspendAccount\(ctx, st, '; then
   bad "I9c whmcs does not reach the shared unsuspend statement — this arm is measuring nothing"
 else
   ok "I9c the billing webhook gives back the role it recorded, not a hardcoded one"
 fi
 
 # I10 — the structural guarantee behind all of the above. `user_id` is an Option
-# in exactly one place, the private writer, so a caller must choose between
+# (Go: *uuid.UUID) in exactly one place, the private writer (activityWriteRow), so a caller must choose between
 # naming a user and declaring there is none. Re-introducing a nil-defaulting
 # public helper is what this arm exists to catch.
-ACT=panel/backend/src/services/activity.rs
+ACT=$API/svc_activity.go
 ACT_S=$(subj "$ACT" || true)
 if [ -z "$ACT_S" ]; then
   bad "I10 could not read $ACT"
 else
-  if has "$(sig "$ACT_S" "log_activity_system")" 'user_email' \
-     && ! has "$(sig "$ACT_S" "log_activity_system")" 'user_id'; then
+  if has "$(sig "$ACT_S" "ActivityLogActivitySystem")" 'userEmail' \
+     && ! has "$(sig "$ACT_S" "ActivityLogActivitySystem")" '[uU]serID'; then
     ok "I10 the no-user writer takes no user id at all, so there is nothing to pass a sentinel into"
   else
-    bad "I10 log_activity_system still accepts a user id — the sentinel can come straight back"
+    bad "I10 ActivityLogActivitySystem still accepts a user id — the sentinel can come straight back"
   fi
 fi
 
@@ -1439,18 +1472,18 @@ fi
 echo
 echo "§J the panel stops lying (s304)"
 
-TERM_R=panel/backend/src/routes/terminal.rs
-LOGS_R=panel/backend/src/routes/logs.rs
-ACTR=panel/backend/src/routes/activity.rs
+TERM_R=$API/rt_terminal.go
+LOGS_R=$API/rt_logs.go
+ACTR=$API/rt_activity.go
 ACTTSX=panel/frontend/src/pages/Activity.tsx
-HELP=panel/backend/src/helpers.rs
+HELP=$API/core_helpers.go
 
 for f in "$TERM_R" "$LOGS_R" "$ACTR" "$ACTTSX" "$HELP"; do
   [ -f "$f" ] || bad "MISSING SUBJECT FILE: $f"
 done
 
 TERM_S=$(subj "$TERM_R" || true)
-# No LOGS_S: J5 stopped naming logs.rs when it adopted J4's source-derived
+# No LOGS_S: J5 stopped naming logs.rs (Go: rt_logs.go) when it adopted J4's source-derived
 # enumeration, and each arm now reads its own subject inside the loop. `$LOGS_R`
 # stays in the missing-subject-file check above — logs.rs is still a subject, it
 # is simply no longer one this file names by hand.
@@ -1459,9 +1492,9 @@ ACTTSX_S=$(subj "$ACTTSX" || true)
 HELP_S=$(subj "$HELP" || true)
 
 # Call sites of a function, definition excluded — the definition line is the one
-# that carries `fn`. Counting raw occurrences would let a pin pass on a helper
+# that carries `func`. Counting raw occurrences would let a pin pass on a helper
 # nobody calls.
-callsites() { grep -E -- "$2" <<< "$1" | grep -vcE '(^|[^[:alnum:]_])fn[[:space:]]' || true; }
+callsites() { grep -E -- "$2" <<< "$1" | grep -vcE '^func[[:space:]]' || true; }
 
 # J1 — the public share viewer decides expiry itself. It used to compute the
 # remaining seconds, clamp a negative to zero and render the content anyway, so
@@ -1471,13 +1504,13 @@ callsites() { grep -E -- "$2" <<< "$1" | grep -vcE '(^|[^[:alnum:]_])fn[[:space:
 if [ -z "$TERM_S" ]; then
   bad "J1 could not read $TERM_R"
 else
-  VS=$(fnbody "$TERM_S" "view_shared")
+  VS=$(fnbody "$TERM_S" "rtTerminalViewShared")
   if [ -z "$VS" ]; then
-    bad "J1 could not extract view_shared — the arm measured nothing"
-  elif has "$(flat "$VS")" 'share_lifetime\(' && has "$(flat "$VS")" 'ok_or_else'; then
+    bad "J1 could not extract rtTerminalViewShared — the arm measured nothing"
+  elif has "$(flat "$VS")" ':= rtTerminalShareLifetime\(\*raw, time\.Now\(\)\.Unix\(\)\) if !ok \{ return apiErr\(http\.StatusNotFound'; then
     ok "J1 the public share viewer refuses an expired share instead of rendering it"
   else
-    bad "J1 view_shared no longer rejects on the shared lifetime decision — an expired share renders"
+    bad "J1 rtTerminalViewShared no longer rejects on the shared lifetime decision — an expired share renders"
   fi
 fi
 
@@ -1487,7 +1520,7 @@ fi
 # the URL still served it.
 if [ -z "$TERM_S" ]; then
   skip "J2 — terminal routes not extractable"
-elif [ "$(callsites "$TERM_S" 'share_lifetime\(')" -ge 2 ]; then
+elif [ "$(callsites "$TERM_S" 'rtTerminalShareLifetime\(')" -ge 2 ]; then
   ok "J2 the operator's list and the public viewer share one expiry rule, so they cannot drift"
 else
   bad "J2 fewer than two callers of the shared expiry rule — a reader has its own copy again"
@@ -1497,10 +1530,10 @@ fi
 # credential and gets the shape check the revoke path always had.
 if [ -z "$TERM_S" ]; then
   skip "J3 — terminal routes not extractable"
-elif has "$(flat "$(fnbody "$TERM_S" "view_shared")")" 'valid_share_id\('; then
+elif has "$(flat "$(fnbody "$TERM_S" "rtTerminalViewShared")")" 'if !rtTerminalValidShareID\(id\) \{'; then
   ok "J3 the unauthenticated viewer validates the share id before querying"
 else
-  bad "J3 view_shared no longer validates the share id"
+  bad "J3 rtTerminalViewShared no longer validates the share id"
 fi
 
 # J4 — both streaming tickets refuse at the MINT when a fleet member is selected.
@@ -1514,8 +1547,9 @@ fi
 # subjects can never see a subject that was never added to it, so a THIRD mint
 # of this class would have been invisible to it for ever. The subjects are now
 # derived FROM SOURCE: a streaming ticket mint is a route handler whose name
-# ends `_token` and whose signature takes a per-server scope. `iac`'s API-token
-# pair and `rotate_token` are correctly excluded because they take no scope.
+# ends `Token` and whose body resolves a per-server scope (Go: the
+# `st.serverScope(r)` call is the ServerScope extractor). `iac`'s API-token
+# pair and `rotateToken` are correctly excluded because they take no scope.
 # Per lesson #143 an arm that enumerates its own subjects must ASSERT the
 # enumeration first, or an empty list prints green having measured nothing.
 #
@@ -1526,9 +1560,10 @@ fi
 # run both versions. The old hardcoded arm prints TWO GREENS and never mentions
 # it; this one enumerates THREE and goes red on the new one. Do not "simplify"
 # it back to a literal list.
-MINTS=$(for f in panel/backend/src/routes/*.rs; do
-  perl -0777 -ne 'while (/pub async fn ([a-z_0-9]*_token)\s*\((.*?)\)\s*->/gs) {
-    my ($n,$a)=($1,$2); next unless $a =~ /ServerScope\(/; print "$ARGV:$n\n"; }' "$f"
+MINTS=$(for f in "$API"/rt_*.go; do
+  [[ "$f" == *_test.go ]] && continue
+  perl -0777 -ne 'while (/^func (rt[A-Za-z0-9]*Token)\(st \*AppState, w http\.ResponseWriter, r \*http\.Request\) error \{\n(.*?)^\}/gms) {
+    my ($n,$b)=($1,$2); next unless $b =~ /st\.serverScope\(r\)/; print "$ARGV:$n\n"; }' "$f"
 done | sort)
 MINT_N=$(printf '%s\n' "$MINTS" | grep -c . || true)
 if [ "$MINT_N" -lt 2 ]; then
@@ -1545,7 +1580,7 @@ else
     BODY=$(flat "$(fnbody "$src" "$fn")")
     if [ -z "$BODY" ]; then
       bad "J4 could not extract $fn — the arm measured nothing"
-    elif has "$BODY" 'require_local_agent_scope\('; then
+    elif has "$BODY" 'requireLocalAgentScope\('; then
       ok "J4 $fn refuses a fleet member at the mint, before any socket is dialled"
     else
       bad "J4 $fn mints a ticket for any selected server again — that stream fails as a network error"
@@ -1554,7 +1589,8 @@ else
 fi
 
 # J5 — and it can only do that because it keeps the id. `ServerScope` resolved it
-# and both handlers bound it to `_server_id` and threw it away; the knowledge to
+# and both handlers bound it to `_server_id` (Go: `_, agent, err :=
+# st.serverScope(r)`) and threw it away; the knowledge to
 # answer honestly was already in the handler.
 #
 # ⚠ s321: THIS ARM USED TO ITERATE A HARDCODED TWO-ELEMENT LIST — three lines
@@ -1584,10 +1620,12 @@ else
       bad "J5 could not read $file"
       continue
     fi
-    SIG=$(sig "$src" "$fn")
+    SIG=$(fnbody "$src" "$fn")
     if [ -z "$SIG" ]; then
       bad "J5 could not extract $fn — the arm measured nothing"
-    elif has "$SIG" 'ServerScope\( *_server_id'; then
+    elif ! has "$SIG" ':?= st\.serverScope\(r\)'; then
+      bad "J5 $fn no longer resolves the scope at all — the arm measured nothing"
+    elif has "$SIG" '^[[:space:]]*_, [A-Za-z_]+, err :?= st\.serverScope\(r\)'; then
       bad "J5 $fn discards the resolved server id again — it cannot tell which host was selected"
     else
       ok "J5 $fn keeps the resolved server id rather than discarding it"
@@ -1604,7 +1642,7 @@ if [ -z "$ACTR_S" ] || [ -z "$ACTTSX_S" ]; then
   bad "J6 could not read both trees"
 else
   B_OK=0; F_OK=0
-  has "$(flat "$(grep -A 16 -E 'struct ActivityLog' <<< "$ACTR_S" || true)")" 'server_id' && B_OK=1
+  has "$(flat "$(awk '/^type rtActivityActivityLog struct/{f=1} f{print; if(/^\}/) exit}' <<< "$ACTR_S")")" 'json:"server_id"' && B_OK=1
   has "$(flat "$(grep -A 16 -E 'interface ActivityEntry' <<< "$ACTTSX_S" || true)")" 'server_id' && F_OK=1
   if [ "$B_OK" = 1 ] && [ "$F_OK" = 1 ]; then
     ok "J6 the host travels from the audit row to the audit page in both trees"
@@ -1617,7 +1655,7 @@ fi
 # no more legible than a feed that prints nothing.
 if [ -z "$ACTR_S" ]; then
   skip "J7 — activity route not extractable"
-elif has "$(flat "$ACTR_S")" 'LEFT JOIN servers' && has "$(flat "$ACTTSX_S")" 'server_name'; then
+elif has "$(flat "$ACTR_S")" 'LEFT JOIN servers' && has "$ACTR_S" 'json:"server_name"' && has "$(flat "$ACTTSX_S")" 'server_name'; then
   ok "J7 the audit feed resolves the host to its name in both trees"
 else
   bad "J7 the audit feed no longer resolves the host name — the operator reads a uuid"
@@ -1631,10 +1669,10 @@ fi
 if [ -z "$AH_S" ]; then
   skip "J8 — auto_healer not extractable"
 else
-  ACD=$(flat "$(fnbody "$AH_S" "auto_clean_disk")")
+  ACD=$(flat "$(fnbody "$AH_S" "autoHealerAutoCleanDisk")")
   READER_OK=0; WRITER_OK=0
   has "$ACD" "auto_heal\.clean_logs' AND server_id" && READER_OK=1
-  has "$ACD" 'log_activity_on_server\(' && WRITER_OK=1
+  has "$ACD" 'ActivityLogActivityOnServer\(ctx, db, userID, "auto-healer", "auto_heal\.clean_logs",.*new\(serverID\)' && WRITER_OK=1
   if [ "$READER_OK" = 1 ] && [ "$WRITER_OK" = 1 ]; then
     ok "J8 the clean_logs cooldown and its writer agree on server_id, so the gate survives the rename"
   else
@@ -1649,9 +1687,10 @@ fi
 # things confine that to the panel today: nginx points both stream paths at the
 # local socket, and the local agent rejects a ticket signed elsewhere. A proxy
 # removes both at once. Bind the domain into the signed ticket FIRST.
-UPGRADES=$(grep -rlE 'WebSocketUpgrade' panel/backend/src --include=*.rs | sort | tr '\n' ' ')
+# Go: a WebSocket handler is a `websocket.Accept(` call (coder/websocket).
+UPGRADES=$(grep -rlE --include='*.go' 'websocket\.Accept\(' panel/go/internal/api | grep -v '_test\.go$' | sort | tr '\n' ' ')
 if [ "$(printf '%s' "$UPGRADES" | wc -w)" -eq 1 ] && [[ "$UPGRADES" == *ws_metrics* ]]; then
-  ok "J9 still exactly one WebSocket handler (ws_metrics) — no stream proxy has been added"
+  ok "J9 still exactly one WebSocket handler (rt_ws_metrics.go) — no stream proxy has been added"
 else
   bad "J9 a new WebSocket handler exists ($UPGRADES) — bind the domain into the terminal ticket BEFORE proxying, or an empty domain is a root shell on every host"
 fi
@@ -1696,22 +1735,26 @@ fi
 # stream too, so an SSE handler that resolves a per-server agent has exactly the
 # dashboard socket's defect. Today all six read user-owned rows by id and touch
 # no agent, which is why none of them was affected; this arm makes that a
-# property rather than a coincidence.
+# property rather than a coincidence. Go: an SSE handler is a route handler
+# that sets `text/event-stream` or hands off to a `…ServeSSE(` helper; it is
+# per-server scoped when it calls `st.serverScope(r)`.
 #
 # GREEN AT BOTH TAGS BY DESIGN — a tripwire for a regression that does not exist
 # yet cannot be red at the previous tag (#180). MUTATION-TESTED instead: append
 # an SSE handler taking a per-server scope and this arm names it and fails.
 # A future session re-deriving this as a false green should read that sentence
 # before deleting a tripwire.
-SSE_SCOPED=$(for f in panel/backend/src/routes/*.rs; do
-  perl -0777 -ne 'while (/pub async fn ([a-z_0-9]+)\s*\((.*?)\)\s*->\s*([^{]*)\{/gs) {
-    my ($n,$a,$r)=($1,$2,$3); next unless $r =~ /Sse</; next unless $a =~ /ServerScope\(/;
-    print "$ARGV:$n "; }' "$f"
-done)
-SSE_ALL=$(for f in panel/backend/src/routes/*.rs; do
-  perl -0777 -ne 'while (/pub async fn ([a-z_0-9]+)\s*\((.*?)\)\s*->\s*([^{]*)\{/gs) {
-    my ($n,$a,$r)=($1,$2,$3); next unless $r =~ /Sse</; print "$ARGV:$n\n"; }' "$f"
-done | grep -c . || true)
+sse_handlers() {
+  for f in "$API"/rt_*.go; do
+    [[ "$f" == *_test.go ]] && continue
+    perl -0777 -ne 'while (/^func (rt[A-Za-z0-9]+)\(st \*AppState, w http\.ResponseWriter, r \*http\.Request\) error \{\n(.*?)^\}/gms) {
+      my ($n,$b)=($1,$2); next unless $b =~ /text\/event-stream|ServeSSE\(/;
+      print "$ARGV:$n", ($b =~ /st\.serverScope\(/ ? " SCOPED" : ""), "\n"; }' "$f"
+  done
+}
+SSE_LIST=$(sse_handlers)
+SSE_SCOPED=$(grep ' SCOPED$' <<< "$SSE_LIST" | sed 's/ SCOPED$//' | tr '\n' ' ' || true)
+SSE_ALL=$(grep -c . <<< "$SSE_LIST" || true)
 if [ "$SSE_ALL" -lt 3 ]; then
   bad "J11 enumerated only $SSE_ALL SSE handlers — the enumeration is broken, not the code"
 elif [ -z "$SSE_SCOPED" ]; then

@@ -25,20 +25,20 @@
 #       when `DOCKPANEL_SFTP_LAB` was unset — so a run that executed NOTHING
 #       printed the same `ok` as a run that proved the transport, and the summary
 #       counted it as a pass. A test that cannot run must not be able to report
-#       success. Now `#[ignore]`d (a counted, visible state in the summary's
-#       `N ignored` column) and `expect`ing the variable, so running it without a
-#       lab PANICS instead of passing vacuously.
+#       success. The Rust fix `#[ignore]`d it and `expect`ed the variable; the Go
+#       port (TestLabUploadAndTestSurviveForceCommand in
+#       panel/go/internal/agent/services/remote_backup_test.go) calls `t.Skip`
+#       when DOCKPANEL_SFTP_LAB is unset — reported as SKIP, a counted, visible
+#       state, never as PASS.
 #
 # POLARITY, WRITTEN DOWN BEFORE THE RUN (#335 — a false green hides inside a
 # batch of reds): every arm here is RED at v2.95.2 and green at HEAD. There are
 # no controls that pass at both tags; this suite pins changes made this session,
 # so `git stash` is its mutation test.
 #
-# ⚠ THIS SUITE PRACTISES WHAT IT PINS (#383). Its Rust subject is rustfmt-managed,
-# so every arm over it UN-WRAPS the body before matching and uses a BOUNDED gap
-# (` *`), never a bare `.*`. Flattening alone is NOT enough: rustfmt writes
-# `run_sftp(\n    "ssh",`, which flattens to `run_sftp( "ssh"` WITH A SPACE, so a
-# pattern spelled `run_sftp\("` still misses it. Both halves or neither.
+# ⚠ THIS SUITE PRACTISES WHAT IT PINS (#383). Its Go subject is read as ONE
+# flattened, comment-stripped body, so a statement gofmt splits across lines is
+# still matched, and prose narrating a call cannot satisfy the arm about it.
 #
 # Pure source analysis: no box, no network, no build.
 
@@ -57,7 +57,7 @@ hasE() { grep -cE -- "$2" <<< "$1" >/dev/null; }
 CI=.github/workflows/ci.yml
 REL=.github/workflows/release.yml
 PINS=.github/workflows/regression-pins.yml
-RB=panel/agent/src/services/remote_backup.rs
+RB=panel/go/internal/agent/services/remote_backup_test.go
 
 for f in "$CI" "$REL" "$RB"; do
   [ -f "$f" ] || { echo "missing subject $f"; exit 1; }
@@ -69,26 +69,6 @@ yamljob() { awk -v j="$2" '
   $0 ~ "^  " j ":[[:space:]]*$" { f=1; print; next }
   f && /^  [A-Za-z_][A-Za-z0-9_-]*:/ { exit }
   f { print }' "$1"; }
-
-# Un-wrap: rejoin exactly the lines a formatter split, with no separator, so a
-# wrapped call reads as the single-line spelling it came from. A line ending in
-# `;` never joins, so independent statements stay apart.
-unwrap() { awk '
-  { L[++n] = $0 }
-  END { i = 1
-    while (i <= n) { cur = L[i]
-      while (i < n) {
-        t = cur; sub(/[ \t]+$/, "", t)
-        nx = L[i+1]; sub(/^[ \t]+/, "", nx)
-        j = 0
-        if (t ~ /[,([{]$/) j = 1
-        if (t ~ /(&&|\|\||->|=>|\+|=|\.)$/) j = 1
-        if (nx ~ /^([.?)\]}])/) j = 1
-        if (t ~ /;$/) j = 0
-        if (j == 0) break
-        cur = t nx; i++
-      }
-      print cur; i++ } }' <<< "$1"; }
 
 # The dependency list of a job, as one flat string, in EITHER YAML spelling:
 #   needs: [changelog, regression-pins]
@@ -110,28 +90,9 @@ needs_of() {
   '
 }
 
-# A Rust fn body plus the attribute lines directly above it, bounded on the fn's
-# OWN closing brace (s323: a window ending at the successor's position swallows
-# the next declaration).
-fn_with_attrs() {
-  awk -v want="$2" '
-    /^[[:space:]]*#\[/ { if (!collecting) { abuf = abuf $0 "\n" }; next }
-    {
-      if (!f && index($0, want)) {
-        printf "%s", abuf; print; f = 1; collecting = 1
-        depth = gsub(/\{/, "{") - gsub(/\}/, "}")
-        if (depth <= 0 && /\{/) { exit }
-        next
-      }
-      if (f) {
-        print
-        depth += gsub(/\{/, "{") - gsub(/\}/, "}")
-        if (depth <= 0) exit
-        next
-      }
-      abuf = ""
-    }' <<< "$1"
-}
+# A Go func body, from its declaration to its closing brace in column 0,
+# comment lines dropped and flattened to one line.
+gofn() { sed -n "/^func $2(/,/^}/p" "$1" | sed 's|^[[:space:]]*//.*||' | tr '\n\t' '  ' | tr -s ' '; }
 
 echo
 echo "§A a red pin must be able to stop a release (S1)"
@@ -190,30 +151,23 @@ fi
 echo
 echo "§B the lab test cannot report success without running (S2)"
 
-LAB=$(fn_with_attrs "$(cat "$RB")" 'fn lab_upload_and_test_survive_forcecommand')
+LAB=$(gofn "$RB" TestLabUploadAndTestSurviveForceCommand)
 if [ -z "$LAB" ]; then
   bad "B0 the lab test could not be extracted — every §B arm below would pass vacuously, which is this suite's own subject"
 else
-  ok "B0 the lab test was extracted ($(wc -l <<< "$LAB") lines)"
+  ok "B0 the lab test was extracted (${#LAB} chars)"
 
-  LABU=$(unwrap "$LAB")
-
-  # B1. Ignored by default => the summary reports it in the `N ignored` column
-  # instead of silently counting a no-op as a pass.
-  if hasE "$LABU" '#\[ignore'; then
-    ok "B1 the lab test is #[ignore]d, so a run that skips it says so in the summary"
+  # B1. Skipped by default => `go test` reports it as SKIP (counted, visible)
+  # instead of silently counting a no-op as a pass. (Rust: #[ignore].)
+  if hasE "$LAB" 't\.Skip(f)?\('; then
+    ok "B1 the lab test calls t.Skip, so a run that skips it says so in the summary"
   else
-    bad "B1 the lab test is not #[ignore]d — an unconfigured run is indistinguishable from a passing one"
+    bad "B1 the lab test never calls t.Skip — an unconfigured run is indistinguishable from a passing one"
   fi
 
-  # B2. The early return is the actual defect. Named as the ABSENCE it is.
-  # The `,? *` is not decoration. rustfmt adds a TRAILING COMMA when it wraps an
-  # argument list, so the un-wrapped text reads `std::env::var("DOCKPANEL_SFTP_LAB",)`
-  # and a pattern demanding `" *\)` misses it. Writing this suite ABOUT #383 I still
-  # shipped #383 into it, and only mutation-testing the arm in the wrapped spelling
-  # caught it. Un-wrapping is half the fix; tolerating what the formatter LEAVES
-  # BEHIND is the other half.
-  if hasE "$LABU" 'let Ok\( *[a-z_]+ *\) *= *std::env::var\( *"DOCKPANEL_SFTP_LAB" *,? *\) *else'; then
+  # B2. The early return is the actual defect. Named as the ABSENCE it is: a
+  # bare `return` in the missing-lab branch reports PASS having executed nothing.
+  if hasE "$LAB" 'if [a-zA-Z_]+ == "" \{ return'; then
     bad "B2 the lab test still returns early when DOCKPANEL_SFTP_LAB is unset — it can pass having executed nothing"
   else
     ok "B2 the lab test does not return early on a missing lab"
@@ -221,10 +175,10 @@ else
 
   # B3. And say positively what it DOES do, so a third behaviour that is neither
   # cannot satisfy B2 by being absent (the v2.95.2 lesson: name the transport).
-  if hasE "$LABU" 'std::env::var\( *"DOCKPANEL_SFTP_LAB" *\) *\. *expect'; then
-    ok "B3 it expects the variable, so running it without a lab panics rather than passing"
+  if hasE "$LAB" '([a-zA-Z_]+) := os\.Getenv\("DOCKPANEL_SFTP_LAB"\) if [a-zA-Z_]+ == "" \{ t\.Skip(f)?\('; then
+    ok "B3 it reads DOCKPANEL_SFTP_LAB and skips (not passes) when it is unset"
   else
-    bad "B3 the lab test does not expect() DOCKPANEL_SFTP_LAB — B2 alone would be satisfied by deleting the read entirely"
+    bad "B3 the lab test does not skip on a missing DOCKPANEL_SFTP_LAB — B2 alone would be satisfied by deleting the read entirely"
   fi
 fi
 

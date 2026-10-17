@@ -18,7 +18,8 @@
 #       explicit `ReadWritePaths=`, and bare `/etc`, `/root` and `/home` are not
 #       in it — measured under the shipped unit with systemd-run, not inferred:
 #       all three refuse a touch and only `/var/www` accepts one. `canary_setup`
-#       wrapped each write in `if …is_ok()` with no `else` and returned only what
+#       (Go: securityCanarySetup) wrapped each write in `if …is_ok()` with no
+#       `else` and returned only what
 #       succeeded, so "armed 4 of 4" and "armed 1 of 4 in silence" were the same
 #       response.
 #
@@ -32,7 +33,7 @@
 #     and asserts each one has a panel-side caller or an explicit allow-list
 #     entry naming why not. The NEXT severed agent endpoint fails the same arm.
 #   * §2 pins the plant set against the SANDBOX rather than against a list, so a
-#     path added to either crate that the agent cannot write, or that the API
+#     path added to either binary that the agent cannot write, or that the API
 #     cannot read, fails without anyone remembering this ever happened.
 #
 # Pure source analysis: no box, no network, no build.
@@ -44,11 +45,11 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-AGENT_SEC=panel/agent/src/routes/security.rs
-AGENT_UNIT=panel/agent/dockpanel-agent.service
-HEALER=panel/backend/src/services/auto_healer.rs
-BACK_SEC=panel/backend/src/routes/security.rs
-ROUTER=panel/backend/src/routes/mod.rs
+AGENT_SEC=panel/go/internal/agent/routes/security.go
+AGENT_UNIT=panel/go/internal/agent/services/dockpanel-agent.service
+HEALER=panel/go/internal/api/svc_auto_healer.go
+BACK_SEC=panel/go/internal/api/rt_security.go
+ROUTER=panel/go/internal/api/core_router.go
 SETTINGS=panel/frontend/src/pages/Settings.tsx
 GUIDE=docs/guides/security-hardening.md
 
@@ -62,20 +63,20 @@ echo "── 1. every agent /security/* route has a panel-side caller ──"
 # An agent endpoint nobody calls is the defect class this suite exists for. The
 # allow-list carries a REASON, so a route can only leave the arm deliberately.
 #
-# `/security/db-backup` is superseded, not severed: auto_healer.rs runs the panel
-# database dump itself with a direct `pg_dump`, under its own comment saying it
-# "doesn't need agent client". That is a decision, and this is where it is recorded.
+# `/security/db-backup` is superseded, not severed: svc_auto_healer.go runs the
+# panel database dump itself with a direct `pg_dump`, under its own comment
+# saying it "doesn't need an agent". That is a decision, and this is where it is recorded.
 REACH=$(python3 - "$AGENT_SEC" <<'PY'
 import os, re, sys
 
 ALLOW = {
     "/security/db-backup":
-        "superseded: auto_healer.rs dumps the panel DB with a direct pg_dump, "
-        "documented in its own comment as not needing the agent client",
+        "superseded: svc_auto_healer.go dumps the panel DB with a direct pg_dump, "
+        "documented in its own comment as not needing an agent",
 }
 
 agent = open(sys.argv[1], encoding="utf-8").read()
-routes = sorted(set(re.findall(r'\.route\(\s*"(/security/[^"]+)"', agent)))
+routes = sorted(set(re.findall(r'r\.Handle\(\s*"[A-Z]+ (/security/[^"]+)"', agent)))
 
 # Assert the enumeration BEFORE trusting it. A parse that yields nothing reads
 # exactly like "every route has a caller".
@@ -84,10 +85,11 @@ if len(routes) < 15:
     raise SystemExit
 
 hay = []
-for root in ("panel/backend/src", "panel/cli/src"):
+for root in ("panel/go/internal/api", "panel/go/internal/cli", "panel/go/internal/mcp",
+             "panel/go/cmd/dockpanel-api", "panel/go/cmd/dockpanel", "panel/go/cmd/dockpanel-mcp"):
     for d, _, fs in os.walk(root):
         for f in fs:
-            if f.endswith(".rs"):
+            if f.endswith(".go") and not f.endswith("_test.go"):
                 hay.append(open(os.path.join(d, f), encoding="utf-8", errors="replace").read())
 hay = "\n".join(hay)
 if len(hay) < 500_000:
@@ -144,27 +146,32 @@ import re, sys
 agent, healer, unit = (open(p, encoding="utf-8").read() for p in sys.argv[1:4])
 
 def const_paths(src, name):
-    # Both shapes occur: a multi-line array of (path, description) tuples and a
-    # single-line array of bare prefixes. A pattern that assumes a newline before
-    # the closing bracket silently returns None for the second — which reads as
-    # "the constant is missing" rather than "the parser is wrong".
-    m = re.search(name + r'\s*:\s*\[\(?&str.*?\]\s*=\s*\[(.*?)\];', src, re.S)
+    # Both shapes occur: a multi-line [N][2]string of {path, description} pairs
+    # and a single-line [N]string of bare prefixes. The literal is bounded by
+    # brace MATCHING, not by a newline before the closing brace, which the
+    # single-line shape does not have — a miss here must read as "the parser is
+    # wrong", never as "the constant is empty".
+    m = re.search(r'^var ' + name + r'\s*=\s*\[\d*\][^{]*\{', src, re.M)
     if not m:
         return None
-    return re.findall(r'"(/[^"]+)"', m.group(1))
+    depth, i = 1, m.end()
+    while depth and i < len(src):
+        depth += {"{": 1, "}": -1}.get(src[i], 0)
+        i += 1
+    return re.findall(r'"(/[^"]+)"', src[m.end():i])
 
-plant_agent = const_paths(agent, "CANARY_PLANT_PATHS")
-plant_back  = const_paths(healer, "CANARY_PLANTABLE")
-watch       = const_paths(healer, "CANARY_WATCH_PATHS")
-masked      = const_paths(healer, "SANDBOX_MASKED_PREFIXES")
+plant_agent = const_paths(agent, "SecurityCanaryPlantPaths")
+plant_back  = const_paths(healer, "AutoHealerCanaryPlantable")
+watch       = const_paths(healer, "AutoHealerCanaryWatchPaths")
+masked      = const_paths(healer, "AutoHealerSandboxMaskedPrefixes")
 
-for label, v in (("CANARY_PLANT_PATHS", plant_agent), ("CANARY_PLANTABLE", plant_back),
-                 ("CANARY_WATCH_PATHS", watch), ("SANDBOX_MASKED_PREFIXES", masked)):
+for label, v in (("SecurityCanaryPlantPaths", plant_agent), ("AutoHealerCanaryPlantable", plant_back),
+                 ("AutoHealerCanaryWatchPaths", watch), ("AutoHealerSandboxMaskedPrefixes", masked)):
     if not v:
         print(f"ENUM-FAIL could not parse {label}")
         raise SystemExit
 
-# The agent's plant paths are file paths; the const holds (path, description)
+# The agent's plant paths are file paths; the var holds {path, description}
 # pairs, so keep only the ones that look like a canary file.
 plant_agent = [p for p in plant_agent if p.endswith(".dockpanel-canary")]
 plant_back  = [p for p in plant_back if p.endswith(".dockpanel-canary")]
@@ -182,7 +189,7 @@ if len(writable) < 5:
 print(f"ENUM-OK plant={len(plant_agent)} watch={len(watch)} writable={len(writable)}")
 
 if plant_agent != plant_back:
-    print(f"DRIFT agent CANARY_PLANT_PATHS {plant_agent} != backend CANARY_PLANTABLE {plant_back}")
+    print(f"DRIFT agent SecurityCanaryPlantPaths {plant_agent} != backend AutoHealerCanaryPlantable {plant_back}")
 
 for p in plant_agent:
     parent = p.rsplit("/", 1)[0]
@@ -193,7 +200,7 @@ for p in plant_agent:
         print(f"MASKED {p} — under {[m for m in masked if p.startswith(m)][0]}, which "
               f"ProtectHome= hides from the process that reads it; planting it changes nothing")
     if p not in watch:
-        print(f"UNWATCHED {p} — planted but not in CANARY_WATCH_PATHS, so nothing reads its atime")
+        print(f"UNWATCHED {p} — planted but not in AutoHealerCanaryWatchPaths, so nothing reads its atime")
 PY
 )
 
@@ -221,32 +228,35 @@ echo
 echo "── 3. the endpoint reports refusals instead of swallowing them ──"
 
 # The defect was `if std::fs::write(path, &content).is_ok() { … }` with no else:
-# a refused write left no trace in the response. Key the arm on the OPERATION,
-# not on a sentence describing it — the comments in this file discuss the old
-# shape, so a bare token search would match the prose that narrates the fix.
-SWALLOW=$(grep -c 'fs::write(path, &content)\.is_ok()' "$AGENT_SEC")
-if [ "$SWALLOW" -eq 0 ]; then
-  ok "canary_setup no longer discards a failed write with a bare is_ok() guard"
+# a refused write left no trace in the response. Its Go shape is
+# `if err := os.WriteFile(path, …); err == nil { … }`. Key the arm on the
+# OPERATION, not on a sentence describing it — the comments in this file discuss
+# the old shape, so a bare token search would match the prose that narrates the fix.
+SWALLOW=$(grep -cE 'os\.WriteFile\(path, .*; err == nil' "$AGENT_SEC")
+HANDLED=$(grep -cE 'if err := os\.WriteFile\(path, \[\]byte\(content\), 0o[0-7]+\); err != nil \{' "$AGENT_SEC")
+if [ "$SWALLOW" -eq 0 ] && [ "$HANDLED" -ge 1 ]; then
+  ok "securityCanarySetup no longer discards a failed write — the WriteFile error is handled ($HANDLED site)"
 else
-  bad "canary_setup still guards its write with .is_ok() at $SWALLOW site(s) — a refusal is invisible again"
+  bad "securityCanarySetup swallows its write (err == nil guards=$SWALLOW, err != nil handlers=$HANDLED) — a refusal is invisible again"
 fi
 
 REFUSED=$(grep -c '"refused": refused' "$AGENT_SEC")
 if [ "$REFUSED" -ge 1 ]; then
-  ok "canary_setup returns a refused list, so a partial arm is distinguishable from a full one"
+  ok "securityCanarySetup returns a refused list, so a partial arm is distinguishable from a full one"
 else
-  bad "canary_setup does not return a refused list — 'armed 1 of 4' reads as success again"
+  bad "securityCanarySetup does not return a refused list — 'armed 1 of 4' reads as success again"
 fi
 
 echo
 echo "── 4. the panel reports the TRIPWIRE, not the setting ──"
 
-STATUS_ROUTE=$(grep -c 'security::canary_status' "$ROUTER")
-ARM_ROUTE=$(grep -c 'security::canary_arm' "$ROUTER")
-if [ "$STATUS_ROUTE" -ge 1 ] && [ "$ARM_ROUTE" -ge 1 ]; then
+STATUS_ROUTE=$(grep -c '"GET /api/security/canary-status", h(rtSecurityCanaryStatus)' "$BACK_SEC")
+ARM_ROUTE=$(grep -c '"POST /api/security/canary/arm", h(rtSecurityCanaryArm)' "$BACK_SEC")
+MOUNTED=$(grep -cE '^[[:space:]]*rtSecurityRegister,' "$ROUTER")
+if [ "$STATUS_ROUTE" -ge 1 ] && [ "$ARM_ROUTE" -ge 1 ] && [ "$MOUNTED" -ge 1 ]; then
   ok "canary-status and canary/arm are both registered in the router"
 else
-  bad "canary routes missing from the router (status=$STATUS_ROUTE arm=$ARM_ROUTE)"
+  bad "canary routes missing from the router (status=$STATUS_ROUTE arm=$ARM_ROUTE mounted=$MOUNTED)"
 fi
 
 # POSITIVE CONTROL for the two absence-shaped reads below: the file really does
@@ -285,16 +295,17 @@ echo "── 4b. arming does not raise its own intrusion alert ──"
 # auto-lockdown. Four pre-existing canaries is four events. (Fixed v2.132.1.)
 CLEARS=$(grep -c 'DELETE FROM settings WHERE key = \$1' "$BACK_SEC")
 if [ "$CLEARS" -ge 1 ]; then
-  ok "canary_arm clears the stored access-time baseline for the paths it plants"
+  ok "rtSecurityCanaryArm clears the stored access-time baseline for the paths it plants"
 else
-  bad "canary_arm leaves the old baseline in place — arming an armed host alerts on every existing canary and can trip auto-lockdown"
+  bad "rtSecurityCanaryArm leaves the old baseline in place — arming an armed host alerts on every existing canary and can trip auto-lockdown"
 fi
 
 # The key is built in two places: the sweeper WRITES it, the arm handler DELETES
 # it. Spelled differently they never meet, and the failure is silent in the
 # alerting direction.
-W=$(grep -c 'canary_atime_{}' "$HEALER")
-D=$(grep -c 'canary_atime_{}' "$BACK_SEC")
+KEYFMT='"canary_atime_" ?\+ ?strings\.ReplaceAll\(path, "/", "_"\)'
+W=$(grep -cE "$KEYFMT" "$HEALER")
+D=$(grep -cE "$KEYFMT" "$BACK_SEC")
 if [ "$W" -ge 1 ] && [ "$D" -ge 1 ]; then
   ok "the sweeper's baseline key and the arm handler's delete share one format (writer=$W deleter=$D)"
 else
