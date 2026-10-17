@@ -1,20 +1,8 @@
 version: 2
 updates:
-  # Rust dependencies
-  - package-ecosystem: "cargo"
-    directory: "/panel/agent"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-
-  - package-ecosystem: "cargo"
-    directory: "/panel/backend"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-
-  - package-ecosystem: "cargo"
-    directory: "/panel/cli"
+  # Go dependencies (every shipped binary: API, agent, CLI, MCP server)
+  - package-ecosystem: "gomod"
+    directory: "/panel/go"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5

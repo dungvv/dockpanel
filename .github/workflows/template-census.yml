@@ -37,7 +37,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'panel/agent/src/services/docker_apps.rs'
+      - 'panel/go/internal/agent/services/docker_apps.go'
       - 'tests/fixtures/app-templates.json'
       - '.github/workflows/template-census.yml'
 
@@ -61,20 +61,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: actions/cache@v5
+      - name: Setup Go
+        uses: actions/setup-go@v6
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            panel/agent/target/
-          key: ${{ runner.os }}-cargo-census-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-census-
+          go-version-file: panel/go/go.mod
+          cache-dependency-path: panel/go/go.sum
 
       # A hosted runner starts with roughly 20 GB free, and the catalogue contains
       # images considerably larger than any one template has a right to be. The
@@ -86,7 +77,7 @@ jobs:
                       /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
           df -h /
 
-      # AS ROOT, and not incidentally. `deploy_app` creates each app's data
+      # AS ROOT, and not incidentally. `DockerAppsDeployApp` creates each app's data
       # directory under /var/lib/dockpanel and chowns it to the uid the image
       # names — both root-only operations, and the agent itself runs as root in
       # production, so this is the faithful configuration rather than a
@@ -103,10 +94,12 @@ jobs:
           # opt-in rather than the default.
           TEMPLATE_CENSUS_PRUNE: '1'
           TEMPLATE_CENSUS_SHARD: '${{ matrix.shard }}/4'
+        # The test binary is compiled as the runner user, then run as root: go
+        # test under sudo would build into root's caches for nothing.
         run: |
-          sudo -E env "PATH=$PATH" \
-            cargo test --manifest-path panel/agent/Cargo.toml \
-            template_census -- --ignored --nocapture
+          cd panel/go
+          go test -c -o /tmp/services.test ./internal/agent/services
+          sudo -E /tmp/services.test -test.run TemplateCensus -test.v -test.timeout 0
 
       - name: Disk after
         if: always()
