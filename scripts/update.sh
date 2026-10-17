@@ -250,7 +250,7 @@ echo ""
 # ── Sync repo to origin/main ──────────────────────────────────────────────
 _dockpanel_stage="sync-repo"
 # Both modes need a fresh tree: the canonical systemd unit
-# (panel/agent/dockpanel-agent.service), nginx templates, install-agent.sh,
+# (panel/go/internal/agent/services/dockpanel-agent.service), nginx templates, install-agent.sh,
 # and a few other repo-resident files are deployed from $REPO_DIR. Without a
 # pull, `bash /opt/dockpanel/scripts/update.sh` would download new binaries
 # but redeploy the OLD canonical unit — exactly what stranded the v2.8.13 →
@@ -572,7 +572,7 @@ fi
 # ── Refresh systemd service files (may have changed between versions) ─────
 _dockpanel_stage="systemd-units"
 log "Updating systemd service files..."
-# Agent unit — deploy from repo (single source of truth: panel/agent/dockpanel-agent.service)
+# Agent unit — deploy from repo (single source of truth: panel/go/internal/agent/services/dockpanel-agent.service)
 # v2.8.13: existing installs upgrading from v2.8.12 or earlier get the strict sandbox here.
 if [ -f "$AGENT_SRC/dockpanel-agent.service" ]; then
     cp "$AGENT_SRC/dockpanel-agent.service" /etc/systemd/system/dockpanel-agent.service
@@ -1282,7 +1282,7 @@ log "Health check: /api/auth/setup-status OK"
 # whether the agent was healthy or dead. A check that fails identically in both
 # states carries no signal; it only taught operators to ignore the warning.
 # The agent's own /health is explicitly exempt from auth
-# (panel/agent/src/routes/mod.rs), which makes it the honest probe.
+# (panel/go/internal/agent/routes/state.go), which makes it the honest probe.
 AGENT_SOCK=/run/dockpanel/agent.sock
 [ -S "$AGENT_SOCK" ] || AGENT_SOCK=/var/run/dockpanel/agent.sock
 if ! curl -sf --max-time 30 --unix-socket "$AGENT_SOCK" http://localhost/health > /dev/null 2>&1; then

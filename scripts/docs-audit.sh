@@ -15,22 +15,22 @@ echo ""
 
 # ─── Count actual values from source ───
 
-# Template count (from agent docker_apps.rs id: definitions)
-ACTUAL_TEMPLATES=$(grep -c 'id: "' panel/agent/src/services/docker_apps.rs 2>/dev/null || echo "?")
+# Template count (catalogue entries in the Go agent)
+ACTUAL_TEMPLATES=$(grep -cE '^\s*ID: +"' panel/go/internal/agent/services/docker_apps.go 2>/dev/null || echo "?")
 
 # E2E test assertions (across all test files — invocations of test_api, test_it, ok, check, assert, etc.)
 ACTUAL_E2E=$(grep -chE '^\s*(test_api|test_contains|test_it|ok|fail|check|assert|expect|skip)\s+' tests/*.sh 2>/dev/null | awk '{s+=$1} END {print s}')
 
-# API endpoint count (.route() registrations in backend + agent)
-ACTUAL_ENDPOINTS_BACKEND=$(grep -rcE '\.route\(' panel/backend/src/ 2>/dev/null | awk -F: '{s+=$2} END {print s}')
-ACTUAL_ENDPOINTS_AGENT=$(grep -rcE '\.route\(' panel/agent/src/ 2>/dev/null | awk -F: '{s+=$2} END {print s}')
+# API endpoint count (route registrations in the API + agent)
+ACTUAL_ENDPOINTS_BACKEND=$(cat panel/go/internal/api/rt_*.go panel/go/internal/api/core_router.go 2>/dev/null | grep -cE 'r\.Handle(Public)?\("')
+ACTUAL_ENDPOINTS_AGENT=$(cat panel/go/internal/agent/routes/*.go 2>/dev/null | grep -v _test | grep -cE 'r\.Handle(Public)?\("')
 ACTUAL_ENDPOINTS=$((ACTUAL_ENDPOINTS_BACKEND + ACTUAL_ENDPOINTS_AGENT))
 
 # Frontend page count
 ACTUAL_PAGES=$(ls panel/frontend/src/pages/*.tsx 2>/dev/null | wc -l)
 
 # Migration count
-ACTUAL_MIGRATIONS=$(ls panel/backend/migrations/*.sql 2>/dev/null | wc -l)
+ACTUAL_MIGRATIONS=$(ls panel/go/internal/api/migrations/*.sql 2>/dev/null | wc -l)
 
 echo "Actual values from source:"
 echo "  Templates:  $ACTUAL_TEMPLATES"

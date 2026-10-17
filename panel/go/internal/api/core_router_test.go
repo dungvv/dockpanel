@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -479,57 +478,6 @@ func TestTimeoutIs504AndCancelsHandler(t *testing.T) {
 	b, _ = io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 || string(b) != "data" {
 		t.Fatal("a response already started must stream past the limit", resp.StatusCode, string(b))
-	}
-}
-
-// TestRustRoutesRegisterWithoutConflict registers every route of
-// panel/backend/src/routes/mod.rs on a Go ServeMux: Go panics on patterns
-// that conflict where axum's matchit picked a winner, so this catches it
-// before the integration pass does.
-func TestRustRoutesRegisterWithoutConflict(t *testing.T) {
-	src, err := os.ReadFile("../../../backend/src/routes/mod.rs")
-	if err != nil {
-		t.Skip("Rust tree not present")
-	}
-	re := regexp.MustCompile(`\.route\(\s*"([^"]+)",\s*((?:\s*\.?\s*(?:get|post|put|delete|patch)\([a-z_:]+\))+)\s*,?\s*\)`)
-	methodRe := regexp.MustCompile(`(get|post|put|delete|patch)\(`)
-	// Patterns matchit accepts but Go's ServeMux rejects as ambiguous. The
-	// owning rt_<m>.go registers one combined pattern and dispatches on the
-	// literal segment instead (see PORTING.md, "Route conflicts").
-	known := map[string]bool{
-		"PUT /api/alerts/runbooks/{alert_type}": true, // vs PUT /api/alerts/{id}/acknowledge|resolve
-	}
-	mux := http.NewServeMux()
-	n := 0
-	for _, m := range re.FindAllStringSubmatch(string(src), -1) {
-		p := regexp.MustCompile(`\{\*([a-z_]+)\}`).ReplaceAllString(m[1], "{$1...}")
-		for _, mm := range methodRe.FindAllStringSubmatch(m[2], -1) {
-			pattern := strings.ToUpper(mm[1]) + " " + p
-			n++
-			if known[pattern] {
-				continue
-			}
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						t.Errorf("%s: %v", pattern, r)
-					}
-				}()
-				mux.HandleFunc(pattern, func(http.ResponseWriter, *http.Request) {})
-			}()
-		}
-	}
-	if n < 400 {
-		t.Fatalf("parsed only %d routes", n)
-	}
-	// Spot-check matchit's static-over-param precedence holds in Go too.
-	_, pat := mux.Handler(httptest.NewRequest("GET", "/api/incidents/summary", nil))
-	if pat != "GET /api/incidents/summary" {
-		t.Fatal(pat)
-	}
-	_, pat = mux.Handler(httptest.NewRequest("GET", "/api/sbom/image/ghcr.io/org/app:v1", nil))
-	if pat != "GET /api/sbom/image/{image...}" {
-		t.Fatal(pat)
 	}
 }
 

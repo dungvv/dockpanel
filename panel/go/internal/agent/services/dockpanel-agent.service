@@ -34,7 +34,7 @@ Environment=LOG_LEVEL=info
 
 # Sandbox hardening (v2.8.13). apt/dpkg/snap/composer-rm operations that need to
 # write outside ReadWritePaths escape via systemd-run — see safe_command_unsandboxed
-# in panel/agent/src/safe_cmd.rs (added v2.8.12).
+# in panel/go/internal/agent/safecmd (added v2.8.12).
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

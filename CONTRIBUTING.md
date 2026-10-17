@@ -106,8 +106,8 @@ panel/
 | What | Where |
 |------|-------|
 | Feature manifest | `FEATURES.md` |
-| API config | `panel/backend/src/config.rs` |
-| Agent startup | `panel/agent/src/main.rs` |
-| API startup | `panel/backend/src/main.rs` |
-| DB schema | `panel/backend/migrations/` |
+| API config | `panel/go/internal/api/core_config.go` |
+| Agent startup | `panel/go/cmd/dockpanel-agent/main.go` |
+| API startup | `panel/go/cmd/dockpanel-api/main.go` + `panel/go/internal/api/core_state.go` |
+| DB schema | `panel/go/internal/api/migrations/` |
 | Frontend routes | `panel/frontend/src/main.tsx` |

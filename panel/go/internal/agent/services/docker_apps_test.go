@@ -409,7 +409,6 @@ func TestTheMeasuredVictimsStillDeclareTheVolumesTheyCouldNotWrite(t *testing.T)
 // checker never has to parse source. Every defect this file has shipped was
 // found by something READING it; a committed artefact plus a test that FAILS
 // when it stops matching stands between a changed template and a merge.
-//
 func dockerAppsGeneratedCatalogue(t *testing.T) string {
 	templates := make([]any, 0, len(dockerAppsTemplates))
 	for _, tpl := range dockerAppsTemplates {

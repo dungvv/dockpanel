@@ -1,5 +1,9 @@
 # Porting dockpanel-api (panel backend) from Rust to Go
 
+> **Historical.** The Rust tree this was ported from was deleted once the Go
+> port shipped; `git log -- panel/agent panel/backend` has it. The Go code is
+> now the only source of truth. The naming and layout rules below still apply.
+
 Source of truth: `panel/backend/src` (Rust, axum + sqlx/Postgres). Target:
 `panel/go/internal/api` (package `api`) + `panel/go/cmd/dockpanel-api`.
 Everything in `../agent/PORTING.md` applies — **read it first**: wire

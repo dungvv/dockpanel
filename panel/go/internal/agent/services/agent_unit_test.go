@@ -1,25 +1,10 @@
 package services
 
 import (
-	"os"
 	"slices"
 	"strings"
 	"testing"
 )
-
-// The embedded copy must not drift from the file the installers deploy.
-func TestAgentUnitIsByteIdenticalToTheInstalledFile(t *testing.T) {
-	src, err := os.ReadFile("../../../../agent/dockpanel-agent.service")
-	if os.IsNotExist(err) {
-		t.Skip("panel/agent/dockpanel-agent.service absent")
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(src) != AgentUnit {
-		t.Fatal("services/dockpanel-agent.service drifted from panel/agent/dockpanel-agent.service — re-copy it")
-	}
-}
 
 // The hardening the fleet spent eighteen releases without.
 func TestAgentUnitCompiledUnitIsTheHardenedOne(t *testing.T) {

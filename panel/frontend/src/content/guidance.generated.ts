@@ -1,4 +1,4 @@
-// DO NOT EDIT — generated from panel/backend/src/services/prerequisites/copy.rs
+// DO NOT EDIT — generated from panel/go/internal/api/svc_guidance.go
 //
 // The passive tier of the guidance layer: the line under a field, and the
 // longer text behind its (i). The reactive and blocking tiers arrive at

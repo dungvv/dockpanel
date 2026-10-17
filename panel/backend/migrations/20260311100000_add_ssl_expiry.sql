@@ -1,1 +1,0 @@
-ALTER TABLE sites ADD COLUMN ssl_expiry TIMESTAMPTZ;

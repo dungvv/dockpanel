@@ -1,4 +1,4 @@
-<!-- DO NOT EDIT — generated from panel/backend/src/services/prerequisites/copy.rs -->
+<!-- DO NOT EDIT — generated from panel/go/internal/api/svc_guidance.go -->
 
 # What DockPanel checks before you commit
 

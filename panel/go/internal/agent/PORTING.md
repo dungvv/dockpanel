@@ -1,5 +1,9 @@
 # Porting dockpanel-agent from Rust to Go
 
+> **Historical.** The Rust tree this was ported from was deleted once the Go
+> port shipped; `git log -- panel/agent panel/backend` has it. The Go code is
+> now the only source of truth. The naming and layout rules below still apply.
+
 Source of truth: `panel/agent/src` (Rust). Target: `panel/go` module
 `github.com/ovexro/dockpanel/panel/go` (go 1.25). The Go agent must be a
 **drop-in replacement**: the panel backend, the CLI, nginx and the installers

@@ -8,28 +8,9 @@ import (
 	"testing"
 
 	"github.com/flosch/pongo2/v6"
-
-	"github.com/ovexro/dockpanel/panel/go/internal/agent/templates"
 )
 
 // ── template parity with the Rust tree ──────────────────────────────────
-
-func TestEmbeddedTemplatesMatchTheRustCopies(t *testing.T) {
-	rustDir := "../../../../agent/src/templates/nginx"
-	if _, err := os.Stat(rustDir); err != nil {
-		t.Skip("Rust template tree not present")
-	}
-	for _, n := range NginxTemplateNames {
-		want, err := os.ReadFile(filepath.Join(rustDir, n))
-		if err != nil {
-			t.Fatal(err)
-		}
-		got, _ := templates.FS.ReadFile("nginx/" + n)
-		if string(got) != string(want) {
-			t.Errorf("%s differs from the Rust copy", n)
-		}
-	}
-}
 
 // Goldens were rendered by Tera 1.20.1 (the Rust agent's engine) from
 // testdata/nginx_golden/cases.json; pongo2 must reproduce them byte for byte.

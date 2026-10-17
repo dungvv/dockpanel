@@ -53,7 +53,7 @@ AGENT_SRC="$REPO_DIR/panel/go/internal/agent/services"   # holds the agent syste
 MCP_SRC="$REPO_DIR/panel/go"
 
 # Directories the agent unit declares in ReadWritePaths, with any `-` prefix
-# stripped. The unit (panel/agent/dockpanel-agent.service) is the single source
+# stripped. The unit (panel/go/internal/agent/services/dockpanel-agent.service) is the single source
 # of truth, so this can never fall behind it the way a hand-copied list does.
 # Prints nothing if no unit is readable; callers must tolerate an empty result.
 agent_rwp_dirs() {
@@ -1263,7 +1263,7 @@ build_frontend() {
 create_services() {
     header "Systemd Services"
 
-    # Agent service — deploy from repo (single source of truth: panel/agent/dockpanel-agent.service)
+    # Agent service — deploy from repo (single source of truth: panel/go/internal/agent/services/dockpanel-agent.service)
     cp "$AGENT_SRC/dockpanel-agent.service" /etc/systemd/system/dockpanel-agent.service
     chmod 644 /etc/systemd/system/dockpanel-agent.service
 
@@ -1443,7 +1443,7 @@ configure_nginx() {
 
     # Drop install-agent.sh into FE_ROOT so the panel's SPA-fallback nginx config
     # serves it via `try_files $uri` (instead of returning the SPA index.html).
-    # Backend at panel/backend/src/routes/servers.rs prints `curl … {panel_url}/install-agent.sh`
+    # Backend at panel/go/internal/api/rt_servers.go prints `curl … {panel_url}/install-agent.sh`
     # in the multi-server install command — this is what makes that URL resolve. (#56, v2.8.14)
     if [ -f "$REPO_DIR/scripts/install-agent.sh" ] && [ -d "$FE_ROOT" ]; then
         cp "$REPO_DIR/scripts/install-agent.sh" "$FE_ROOT/install-agent.sh"

@@ -226,7 +226,7 @@ func prerequisitesCopyExampleVars(o *PrerequisitesCopyOutcome) [][2]string {
 // prerequisitesCopyGeneratedBanner is the header every generated artefact
 // carries. It names the Rust source on purpose: both implementations emit the
 // same bytes, so the committed files stay identical whichever regenerated them.
-const prerequisitesCopyGeneratedBanner = "DO NOT EDIT — generated from panel/backend/src/services/prerequisites/copy.rs"
+const prerequisitesCopyGeneratedBanner = "DO NOT EDIT — generated from panel/go/internal/api/svc_guidance.go"
 
 // PrerequisitesCopyManual renders the registry as the documentation page.
 //

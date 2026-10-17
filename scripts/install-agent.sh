@@ -278,7 +278,7 @@ fi
 # a pin that matches its own explanation cannot fail.
 #
 # The panel's own installers (setup.sh, update.sh) deploy
-# panel/agent/dockpanel-agent.service by copying that file. This script has no
+# panel/go/internal/agent/services/dockpanel-agent.service by copying that file. This script has no
 # repo tree — it is fetched from the panel and downloads a release binary — so
 # it asks the binary it just downloaded, which carries the unit via include_str!
 # for exactly the reason agent-self-update.sh does: it cannot then drift from

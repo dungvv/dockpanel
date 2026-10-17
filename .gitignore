@@ -1,9 +1,3 @@
-# Rust build artifacts
-panel/agent/target/
-panel/backend/target/
-panel/cli/target/
-panel/mcp/target/
-
 # Node.js
 panel/frontend/node_modules/
 panel/frontend/dist/
@@ -37,7 +31,6 @@ Thumbs.db
 *.key
 *.cert
 *.crt
-!panel/agent/src/**
 
 # Databases
 *.sqlite

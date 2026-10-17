@@ -1,9 +1,9 @@
 /**
  * The largest file the file manager accepts, in bytes.
  *
- * ⛔ Must equal `UPLOAD_MAX_FILE_BYTES` in `panel/backend/src/routes/files.rs`,
- * the agent's copy in `panel/agent/src/routes/server_utils.rs`, and the figure
- * published in `docs/guides/file-uploads.md`. Four surfaces, four crates and
+ * ⛔ Must equal the API's limit in `panel/go/internal/api/rt_files.go`, the
+ * agent's copy in `panel/go/internal/agent/routes/server_utils.go`, and the
+ * figure published in `docs/guides/file-uploads.md`. Four surfaces, two
  * languages apart; `upload-refusal-pin-e2e.sh` is what holds them together.
  *
  * It is small because an upload is base64-encoded into a JSON body, and that

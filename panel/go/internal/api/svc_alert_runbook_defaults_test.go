@@ -1,9 +1,6 @@
 package api
 
 import (
-	"bytes"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -71,25 +68,5 @@ func TestAlertRunbookDefaultsFindDefaultWorksForKnownAndUnknown(t *testing.T) {
 	}
 	if AlertRunbookDefaultsFindDefault("does_not_exist") != nil {
 		t.Fatal("unknown type found")
-	}
-}
-
-// The embedded copies must stay byte-identical to the Rust tree's
-// include_str! sources while both exist.
-func TestAlertRunbookDefaultsMatchRustTree(t *testing.T) {
-	rust := "../../../backend/runbooks"
-	if _, err := os.Stat(rust); err != nil {
-		t.Skip("Rust tree not present")
-	}
-	files, _ := filepath.Glob(filepath.Join(rust, "*.md"))
-	if len(files) != len(AlertRunbookDefaultsDefaults) {
-		t.Fatalf("Rust tree has %d runbooks, Go embeds %d", len(files), len(AlertRunbookDefaultsDefaults))
-	}
-	for _, f := range files {
-		want, _ := os.ReadFile(f)
-		got, err := alertRunbookDefaultsFS.ReadFile("runbooks/" + filepath.Base(f))
-		if err != nil || !bytes.Equal(got, want) {
-			t.Errorf("runbooks/%s differs from the Rust tree", filepath.Base(f))
-		}
 	}
 }

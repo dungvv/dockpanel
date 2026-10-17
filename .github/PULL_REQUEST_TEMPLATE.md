@@ -8,7 +8,7 @@
 
 ## Checklist
 
-- [ ] Built all affected crates (`cargo build --release`)
+- [ ] `cd panel/go && go vet ./... && go test ./...` passes
 - [ ] Frontend builds (`npx vite build`)
 - [ ] Tested manually against a running panel
 - [ ] New migrations use `IF NOT EXISTS` where applicable

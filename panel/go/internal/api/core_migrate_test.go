@@ -3,30 +3,9 @@ package api
 import (
 	"bytes"
 	"crypto/sha512"
-	"os"
-	"path/filepath"
 	"testing"
 	"testing/fstest"
 )
-
-func TestMigrationsAreByteIdenticalToTheRustTree(t *testing.T) {
-	rust := "../../../backend/migrations"
-	entries, err := os.ReadDir(rust)
-	if err != nil {
-		t.Skip("Rust tree not present")
-	}
-	embedded, _ := migrationsFS.ReadDir("migrations")
-	if len(embedded) != len(entries) {
-		t.Fatalf("embedded %d files, Rust tree has %d", len(embedded), len(entries))
-	}
-	for _, e := range entries {
-		want, _ := os.ReadFile(filepath.Join(rust, e.Name()))
-		got, err := migrationsFS.ReadFile("migrations/" + e.Name())
-		if err != nil || !bytes.Equal(got, want) {
-			t.Fatalf("%s differs from the Rust tree (copy it byte-for-byte)", e.Name())
-		}
-	}
-}
 
 func TestResolveMigrationsLikeSqlx(t *testing.T) {
 	fsys := fstest.MapFS{
