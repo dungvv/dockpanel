@@ -123,7 +123,7 @@ const SUPPLY_CHAIN = [
     title: 'Per-binary SBOMs',
     since: 'v2.7.10+',
     text:
-      'cargo-sbom emits SPDX 2.3 documents for the agent and API crates, and syft one for the Go CLI/MCP module, alongside ' +
+      'syft emits an SPDX document for the Go module that builds every binary (API, agent, CLI, MCP), alongside ' +
       'every release. Each SBOM is also signed and verifiable with the same cosign command.',
   },
   {

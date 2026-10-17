@@ -1294,7 +1294,7 @@ Type=simple
 ExecStart=/usr/local/bin/dockpanel-api
 Restart=always
 RestartSec=5
-Environment=RUST_LOG=info
+Environment=LOG_LEVEL=info
 EnvironmentFile=/etc/dockpanel/api.env
 NoNewPrivileges=yes
 PrivateTmp=yes

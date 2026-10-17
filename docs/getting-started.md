@@ -2,7 +2,7 @@
 
 ## What is DockPanel?
 
-DockPanel is a free, self-hosted, Docker-native server management panel built in Rust. It lets you manage sites, databases, Docker apps, SSL certificates, backups, email, DNS, and security from a single web interface or CLI. It installs in under 60 seconds, the panel services themselves idle at about ~49MB of RAM (about ~109MB total with the bundled PostgreSQL), and it runs on x86_64 and ARM64 servers with no subscriptions or artificial limits.
+DockPanel is a free, self-hosted, Docker-native server management panel built in Go. It lets you manage sites, databases, Docker apps, SSL certificates, backups, email, DNS, and security from a single web interface or CLI. It installs in under 60 seconds, the panel services themselves idle at about ~49MB of RAM (about ~109MB total with the bundled PostgreSQL), and it runs on x86_64 and ARM64 servers with no subscriptions or artificial limits.
 
 ## System Requirements
 
@@ -44,7 +44,7 @@ The installer will:
 
 On ARM64 servers with less than 2GB RAM, the installer automatically uses pre-built binaries instead of compiling from source.
 
-To use pre-built binaries on any architecture (faster, no Rust toolchain needed):
+To use pre-built binaries on any architecture (faster, no Go toolchain needed):
 
 ```bash
 INSTALL_FROM_RELEASE=1 curl -sL https://dockpanel.dev/install.sh | sudo bash

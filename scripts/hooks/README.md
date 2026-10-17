@@ -7,7 +7,7 @@ clone, CI, or a second machine got nothing.
 | Hook | Gates |
 |---|---|
 | `pre-commit` | Infrastructure-leak scan (real IPs, hostnames, tokens) |
-| `pre-push` | Secrets scan, stale `panel/frontend/dist`, version consistency across the four packages, and `npm audit` + `cargo audit` across all six manifests |
+| `pre-push` | Secrets scan, stale `panel/frontend/dist`, version consistency (`VERSION` vs the frontend `package.json`), and `npm audit` + `govulncheck` |
 
 ## Install
 
@@ -18,24 +18,19 @@ git config core.hooksPath scripts/hooks
 That points git at this directory instead of `.git/hooks`, so the hooks are
 versioned with the code and every clone gets the same gates.
 
-`cargo audit` is the part of the pre-push gate that catches what Dependabot
-misses — it found four RustSec advisories in v2.11.1 (including a CVSS 9.1)
-that Dependabot never surfaced. Install it once:
-
-```bash
-cargo install cargo-audit
-```
-
-Without it the pre-push gate degrades to a yellow warning rather than failing,
-so check for that warning if you expect Rust advisories to be enforced.
+`govulncheck` is the part of the pre-push gate that catches what Dependabot
+misses: it reports Go vulnerabilities (stdlib included, so an outdated
+toolchain shows up too) only on call paths the binaries actually reach. The
+hook installs it on first use; it needs `go` on PATH, and without it the gate
+degrades to a yellow warning rather than failing.
 
 ## Design notes
 
 - No gate ever early-exits; each sets `FOUND=1` and the hook drains at the end,
   so one push reports every problem instead of one per attempt.
-- The audit gate **fails open** on network errors. `npm audit` and `cargo audit`
+- The audit gate **fails open** on network errors. `npm audit` and `govulncheck`
   both exit non-zero when they cannot reach their advisory source, which is
   indistinguishable from a real finding by exit code — a gate that blocks on a
   DNS blip is a gate that gets disabled with `--no-verify`.
-- `cargo audit -n` uses the cached RustSec database. It is refreshed only by a
-  run *without* `-n`, so do that occasionally.
+- `govulncheck` analyses for `GOOS=linux`, the only platform DockPanel ships
+  for; the tool itself is built for the host.

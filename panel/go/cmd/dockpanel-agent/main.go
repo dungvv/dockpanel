@@ -215,12 +215,16 @@ func loadToken(path string) string {
 	return token
 }
 
-// setupLogging: level from RUST_LOG (kept for unit/env compatibility; a bare
-// level like "debug" — directive syntax falls back to info), JSON output when
-// LOG_FORMAT=json.
+// setupLogging: level from LOG_LEVEL (error|warn|info|debug, default info),
+// falling back to RUST_LOG so units written by older installers keep their
+// level; JSON output when LOG_FORMAT=json.
 func setupLogging() {
 	level := slog.LevelInfo
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("RUST_LOG"))) {
+	lv := os.Getenv("LOG_LEVEL")
+	if lv == "" {
+		lv = os.Getenv("RUST_LOG")
+	}
+	switch strings.ToLower(strings.TrimSpace(lv)) {
 	case "trace", "debug":
 		level = slog.LevelDebug
 	case "warn":

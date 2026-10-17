@@ -59,11 +59,16 @@ func main() {
 	}
 }
 
-// setupLogging mirrors tracing_subscriber: RUST_LOG level (default info),
-// LOG_FORMAT=json for JSON lines.
+// setupLogging: level from LOG_LEVEL (error|warn|info|debug, default info),
+// falling back to RUST_LOG so units written by older installers keep their
+// level; JSON output when LOG_FORMAT=json.
 func setupLogging() {
 	level := slog.LevelInfo
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("RUST_LOG"))) {
+	lv := os.Getenv("LOG_LEVEL")
+	if lv == "" {
+		lv = os.Getenv("RUST_LOG")
+	}
+	switch strings.ToLower(strings.TrimSpace(lv)) {
 	case "trace", "debug":
 		level = slog.LevelDebug
 	case "warn":

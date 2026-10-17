@@ -269,7 +269,7 @@ const faqs = [
   // used to close this answer. Nothing derives 20 or 2, and a page arguing from
   // measurement cannot afford a figure it invented. The measured ones make the
   // point without it.
-  { q: 'Why Rust?', a: `${m.binary.total} MB of binaries on disk and about ${m.ram.services} MB of RAM for the two panel services at idle — no JVM, no Node, no Python runtime to keep patched. The panel is a process you can forget about rather than a stack you maintain.` },
+  { q: 'Why Go?', a: `${m.binary.total} MB of static binaries on disk and about ${m.ram.services} MB of RAM for the two panel services at idle — no JVM, no Node, no Python runtime to keep patched. The panel is a process you can forget about rather than a stack you maintain.` },
 ];
 
 /* ── Page ─────────────────────────────────────────────────────────── */
@@ -433,7 +433,7 @@ export default function Landing() {
             <div className="lg:col-span-7">
               {/* Was two pill badges. A licence and an implementation language
                   are facts, so they are set as facts, in the margin. */}
-              <p className="eyebrow mb-7">Open source &nbsp;·&nbsp; Written in Rust</p>
+              <p className="eyebrow mb-7">Open source &nbsp;·&nbsp; Written in Go</p>
 
               {/* Every clause here is checkable against the table beside it.
                   A first draft read "…one binary you can fit on a floppy",

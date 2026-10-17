@@ -6,10 +6,9 @@ Thanks for your interest in contributing! This guide covers development setup, c
 
 ### Prerequisites
 
-- **Rust 1.94+**: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+- **Go 1.26+**: https://go.dev/dl/ (any Go ≥ 1.21 works too: `GOTOOLCHAIN=auto` fetches the pinned toolchain from `panel/go/go.mod`)
 - **Node.js 20+**: For building the frontend
 - **Docker**: For running PostgreSQL locally
-- **Build tools**: `build-essential cmake pkg-config` (Ubuntu/Debian) or `gcc gcc-c++ cmake make` (RHEL/Fedora)
 
 ### Getting Started
 
@@ -18,9 +17,8 @@ git clone https://github.com/ovexro/dockpanel.git
 cd dockpanel
 
 # Enable the repo's git hooks (secrets scan, version consistency,
-# npm audit + cargo audit). See scripts/hooks/README.md.
+# npm audit + govulncheck). See scripts/hooks/README.md.
 git config core.hooksPath scripts/hooks
-cargo install cargo-audit   # otherwise the Rust half of the audit gate only warns
 
 # Start PostgreSQL
 docker run -d --name dockpanel-postgres \
@@ -39,15 +37,13 @@ AGENT_TOKEN=$(uuidgen)
 LISTEN_ADDR=127.0.0.1:3080
 EOF
 
-# Build everything
-cargo build --release --manifest-path panel/agent/Cargo.toml
-cargo build --release --manifest-path panel/backend/Cargo.toml
-bash scripts/build-go.sh panel/go/bin   # CLI + MCP server (Go)
+# Build everything (API, agent, CLI, MCP server — all Go, in panel/go)
+bash scripts/build-go.sh panel/go/bin
 cd panel/frontend && npm install && npx vite build && cd ../..
 
 # Run (agent needs root for system operations)
-sudo ./panel/agent/target/release/dockpanel-agent &
-./panel/backend/target/release/dockpanel-api &
+sudo ./panel/go/bin/dockpanel-agent &
+./panel/go/bin/dockpanel-api &
 cd panel/frontend && npm run dev
 ```
 
@@ -57,15 +53,18 @@ The frontend dev server proxies `/api` to `127.0.0.1:3080` (see `panel/frontend/
 
 ```
 panel/
-├── agent/       # Rust — host-level operations (Docker, Nginx, SSL, terminal)
-│   ├── src/routes/     # HTTP endpoint handlers (39 files)
-│   └── src/services/   # Business logic (40 files)
-├── backend/     # Rust — API server, auth, DB, multi-server dispatch
-│   ├── src/routes/     # REST endpoints (62 files)
-│   ├── src/services/   # Background tasks (36 files)
-│   └── migrations/     # SQL migrations (138 files)
-├── cli/         # Rust — CLI tool (clap-based)
-│   └── src/commands/   # Subcommand handlers (11 files)
+├── go/          # Go module: every shipped binary
+│   ├── cmd/                     # dockpanel-api, dockpanel-agent, dockpanel (CLI), dockpanel-mcp
+│   ├── internal/agent/          # host-level operations (Docker, Nginx, SSL, terminal)
+│   │   ├── routes/              # HTTP endpoint handlers (43 files)
+│   │   ├── services/            # Business logic (42 files)
+│   │   └── safecmd/             # the only way the agent spawns processes
+│   ├── internal/api/            # API server, auth, DB, multi-server dispatch
+│   │   ├── rt_*.go              # REST endpoints (61 files)
+│   │   ├── svc_*.go             # Background tasks and shared logic (44 files)
+│   │   └── migrations/          # SQL migrations (140 files)
+│   ├── internal/cli/            # CLI tool (Cobra)
+│   └── internal/mcp/            # read-only MCP server
 └── frontend/    # React 19 + TypeScript + Tailwind 4
     └── src/pages/      # Lazy-loaded page components (52 files)
 ```
@@ -78,7 +77,7 @@ panel/
 
 ## Code Style
 
-- **Rust**: Edition 2024. Run `cargo fmt` before committing. `cargo clippy` warnings should be addressed.
+- **Go**: `gofmt` and `go vet` must be clean (CI enforces both). Read `panel/go/internal/agent/PORTING.md` and `panel/go/internal/api/PORTING.md` for the package layout and naming rules.
 - **TypeScript**: Strict mode enabled. Minimize `as any` casts. No `console.log` in production code (use `logger.ts`).
 - **SQL migrations**: Use `IF NOT EXISTS` / `IF EXISTS` where possible. Timestamp prefix format: `YYYYMMDDHHMMSS_description.sql`.
 
@@ -87,7 +86,7 @@ panel/
 1. **Fork and branch**: Create a feature branch from `main`.
 2. **Read before editing**: Understand existing code before modifying. Check `FEATURES.md` for the feature manifest.
 3. **Keep it focused**: One feature or fix per PR. Don't bundle unrelated changes.
-4. **Build all crates**: Changes to shared types or agent routes may affect multiple crates.
+4. **Build and test everything**: `cd panel/go && go vet ./... && go test ./...` (set `DATABASE_URL` to run the DB-backed API tests).
 5. **Test manually**: Run the panel locally and verify your changes work end-to-end.
 
 ## Pull Request Process

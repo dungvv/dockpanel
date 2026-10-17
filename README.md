@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>The most feature-packed free server panel ever built.</strong><br>
-  Self-hosted. Docker-native. Written in Rust. Panel services run on <strong>~49MB of RAM</strong>. 840 HTTP routes. 148 app templates. 4544 regression assertions. ~57MB binaries. Zero subscriptions.
+  Self-hosted. Docker-native. Written in Go. Panel services run on <strong>~49MB of RAM</strong>. 840 HTTP routes. 148 app templates. 4544 regression assertions. ~57MB binaries. Zero subscriptions.
 </p>
 
 <p align="center">
@@ -51,7 +51,7 @@ No other free panel gives you Git push-to-deploy with blue-green zero-downtime u
 | | DockPanel | HestiaCP | CloudPanel | RunCloud |
 |---|---|---|---|---|
 | **Price** | **Free** | Free | Free | $8/mo+ |
-| **Stack** | **Rust + React** | PHP | PHP | PHP (SaaS) |
+| **Stack** | **Go + React** | PHP | PHP | PHP (SaaS) |
 | **Docker native** | **148 templates** | No | No | No |
 | **Git deploy** | **Blue-green, zero-downtime** | No | No | Basic |
 | **Multi-server** | **Unlimited** | No | No | Yes |
@@ -240,20 +240,20 @@ found, including what is still broken.
 
 ```
 Browser → React 19 SPA → Nginx
-                           ├── /api/* → API (Rust/Axum)
+                           ├── /api/* → API (Go)
                            │              ├── PostgreSQL 16
                            │              └── Agent (Unix socket / HTTPS)
                            │                     └── Docker, Nginx, SSL, files, terminal
                            └── /*     → Frontend (static files)
 ```
 
-**4 Rust binaries**: Agent (~22MB), API (~25MB), CLI (~3.9MB), MCP server (~6.1MB, opt-in). Runtime RAM: ~35MB agent + ~14MB API ≈ 49MB for the panel itself; ~109MB with the bundled PostgreSQL. 17 supervised background services.
+**4 Go binaries**: Agent (~22MB), API (~25MB), CLI (~3.9MB), MCP server (~6.1MB, opt-in). Runtime RAM: ~35MB agent + ~14MB API ≈ 49MB for the panel itself; ~109MB with the bundled PostgreSQL. 17 supervised background services.
 
 | Component | Tech | Role |
 |-----------|------|------|
-| Agent | Rust/Axum | Root-level host operations (Docker, Nginx, SSL, files) |
-| API | Rust/Axum + SQLx | Auth, business logic, multi-server dispatch, background tasks |
-| CLI | Rust/Clap | Command-line interface for automation |
+| Agent | Go (net/http) | Root-level host operations (Docker, Nginx, SSL, files) |
+| API | Go (net/http + pgx) | Auth, business logic, multi-server dispatch, background tasks |
+| CLI | Go (Cobra) | Command-line interface for automation |
 | Frontend | React 19 + Vite + Tailwind 4 | Browser UI with 6 themes + 3 layouts |
 
 ## Security
@@ -271,9 +271,7 @@ docker run -d --name dockpanel-postgres \
   -p 5450:5432 postgres:16
 
 # Build
-cargo build --release --manifest-path panel/agent/Cargo.toml
-cargo build --release --manifest-path panel/backend/Cargo.toml
-bash scripts/build-go.sh panel/go/bin   # CLI + MCP server (Go)
+bash scripts/build-go.sh panel/go/bin   # API, agent, CLI, MCP server
 cd panel/frontend && npm install && npx vite build
 ```
 

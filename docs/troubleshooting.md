@@ -22,7 +22,7 @@ For verbose output, set the log level in the service config:
 
 ```bash
 # Edit /etc/dockpanel/api.env and add:
-RUST_LOG=debug
+LOG_LEVEL=debug
 
 # Then restart:
 systemctl restart dockpanel-api
