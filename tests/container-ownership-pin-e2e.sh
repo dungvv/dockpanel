@@ -2,7 +2,8 @@
 # container-ownership-pin-e2e.sh — s475
 #
 # The `dockpanel.user.id` Docker label was never a missing primitive — deploy_app
-# stamps it on every container, and list_deployed_apps reads it straight back
+# (Go: DockerAppsDeployApp in panel/go/internal/agent/services/docker_apps.go)
+# stamps it on every container, and list_deployed_apps (DockerAppsListDeployedApps) reads it straight back
 # onto DeployedApp.user_id in every /apps response. Two counters just ignored it:
 #
 #   §A  deploy's own quota check summed the TARGET SERVER's whole container list,
@@ -39,8 +40,8 @@ ok()   { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 skip() { SKIP=$((SKIP+1)); printf '  \033[33m-\033[0m SKIP %s\n' "$1"; }
 
-BACKEND=panel/backend/src/routes/docker_apps.rs
-AGENT=panel/agent/src/services/docker_apps.rs
+BACKEND=panel/go/internal/api/rt_docker_apps.go
+AGENT=panel/go/internal/agent/services/docker_apps.go
 FRONTEND=panel/frontend/src/pages/ContainerPolicies.tsx
 
 for f in "$BACKEND" "$AGENT" "$FRONTEND"; do
@@ -49,12 +50,15 @@ done
 
 # Comments out, CODE INTACT — see ownership-delete-pin-e2e.sh's own header for
 # why the naive `/\*.*?\*/` block-comment strip is unsafe (it eats string
-# literals containing `/*`); mirrored here rather than re-derived.
+# literals containing `/*`); a block comment is only recognised on its own
+# lines. Go line comments: whole-line `//`, and trailing `//` only when
+# preceded by whitespace (so `https://` inside a literal survives).
 code() {
   perl -0777 -pe '
     s{\{/\*.*?\*/\}}{}gs;
     s{^[ \t]*/\*.*?\*/[ \t]*$}{}gms;
-    s{^\s*//.*$}{}gm;
+    s{^[ \t]*//.*$}{}gm;
+    s{[ \t]+//[^"`\n]*$}{}gm;
   ' "$1"
 }
 
@@ -62,33 +66,30 @@ stripper_self_check() {
   local bad_files=0 f raw_decls stripped_decls
   for f in "$@"; do
     [ -f "$f" ] || continue
-    raw_decls=$(grep -cE '^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn ' "$f" || true)
-    stripped_decls=$(grep -cE '^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn ' <<< "$(code "$f")" || true)
+    raw_decls=$(grep -cE '^func ' "$f" || true)
+    stripped_decls=$(grep -cE '^func ' <<< "$(code "$f")" || true)
     if [ "$raw_decls" != "$stripped_decls" ]; then
-      bad "STRIPPER ATE CODE in $f: $raw_decls fn declarations before, $stripped_decls after"
+      bad "STRIPPER ATE CODE in $f: $raw_decls func declarations before, $stripped_decls after"
       bad_files=$((bad_files+1))
     fi
   done
-  [ "$bad_files" -eq 0 ] && ok "comment stripper preserves every fn declaration in all $# subjects"
+  [ "$bad_files" -eq 0 ] && ok "comment stripper preserves every func declaration in all $# subjects"
 }
 
 subj() { local t; t=$(code "$1"); [ -n "$t" ] || return 1; printf '%s' "$t"; }
 has()   { grep -qE -- "$2" <<< "$1"; }
 
-# Only DEAD-CODE markers belong here (lesson #133 — ordinary Rust is not one).
+# Only DEAD-CODE markers belong here (lesson #133 — ordinary code is not one).
 live() {
-  ! grep -qE -- '(if false|&& false|\|\| true|let _unused)' <<< "$1"
+  ! grep -qE -- '(if false|&& false|\|\| true|_ = unused)' <<< "$1"
 }
 
-# The body of one top-level fn, bounded by the NEXT top-level fn (lesson #131 —
-# a fixed -A window is not a function).
+# The body of one top-level Go func (or method), bounded by its own closing
+# `}` at column 0 (lesson #131 — a fixed -A window is not a function).
 fnbody() {
   awk -v name="$2" '
-    /^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn / {
-      if ($0 ~ "(pub |pub\\(crate\\) )?(async )?fn " name "\\(") { inside=1; next }
-      inside=0
-    }
-    inside { print }
+    !inside && (index($0, "func " name "(") == 1 || $0 ~ ("^func \\([^)]*\\) " name "\\(")) { inside=1; next }
+    inside { if ($0 == "}") exit; print }
   ' <<< "$1"
 }
 
@@ -97,23 +98,23 @@ echo "container-ownership-pin-e2e — a per-user quota must count what that user
 echo
 
 echo "§0 the harness measures its own preprocessing"
-stripper_self_check "$BACKEND" "$AGENT" "$FRONTEND"
+stripper_self_check "$BACKEND" "$AGENT"
 
 echo
 echo "§A deploy's own cap check is scoped to the caller, fleet-wide"
 if ! BE=$(subj "$BACKEND"); then
   skip "§A — $BACKEND produced no code after stripping"
 else
-  DEPLOY=$(fnbody "$BE" "deploy")
+  DEPLOY=$(fnbody "$BE" "rtDockerAppsDeploy")
   if [ -z "$DEPLOY" ]; then
-    bad "A0 could not isolate fn deploy in $BACKEND — subject lost"
+    bad "A0 could not isolate func rtDockerAppsDeploy in $BACKEND — subject lost"
   else
-    if has "$DEPLOY" 'count_owned_by\(&apps_json, *claims\.sub\)' && live "$DEPLOY"; then
-      ok "A1 deploy's target-server count is filtered to the calling user (count_owned_by), not every container on the box"
+    if has "$DEPLOY" 'rtDockerAppsCountOwnedBy\(appsJSON, *claims\.Sub\)' && live "$DEPLOY"; then
+      ok "A1 deploy's target-server count is filtered to the calling user (rtDockerAppsCountOwnedBy), not every container on the box"
     else
-      bad "A1 deploy must filter its container count by claims.sub — an unfiltered length lets any user's containers count against another user's cap"
+      bad "A1 deploy must filter its container count by claims.Sub — an unfiltered length lets any user's containers count against another user's cap"
     fi
-    if has "$DEPLOY" 'online_fleet' && has "$DEPLOY" 'count_owned_by\(&peer_apps, *claims\.sub\)' && live "$DEPLOY"; then
+    if has "$DEPLOY" 'OnlineFleet\(' && has "$DEPLOY" 'rtDockerAppsCountOwnedBy\(peer, *claims\.Sub\)' && live "$DEPLOY"; then
       ok "A2 deploy also folds in the caller's containers on every OTHER online server, not just the target"
     else
       bad "A2 deploy must walk the rest of the fleet too — a user confined to a per-server check can exceed their real cap by spreading across servers"
@@ -122,36 +123,29 @@ else
 
   echo
   echo "§B policy_usage answers for the requested user, not the whole fleet"
-  USAGE=$(fnbody "$BE" "policy_usage")
+  USAGE=$(fnbody "$BE" "rtDockerAppsPolicyUsage")
   if [ -z "$USAGE" ]; then
-    bad "B0 could not isolate fn policy_usage in $BACKEND — subject lost"
-  elif has "$USAGE" 'fleet_usage_by_user' && has "$USAGE" 'by_user\.get\(&user_id\)' && live "$USAGE"; then
-    ok "B1 policy_usage derives its count from a per-user map keyed on the requested user_id"
+    bad "B0 could not isolate func rtDockerAppsPolicyUsage in $BACKEND — subject lost"
+  elif has "$USAGE" 'rtDockerAppsFleetUsageByUser' && has "$USAGE" 'byUser\[userID\]' && live "$USAGE"; then
+    ok "B1 rtDockerAppsPolicyUsage derives its count from a per-user map keyed on the requested user_id"
   else
-    bad "B1 policy_usage must scope its count to the requested user_id — summing the whole fleet answers every caller identically"
+    bad "B1 rtDockerAppsPolicyUsage must scope its count to the requested user_id — summing the whole fleet answers every caller identically"
   fi
 
   echo
   echo "§C list_policies carries a real per-row usage figure"
-  LIST=$(fnbody "$BE" "list_policies")
+  LIST=$(fnbody "$BE" "rtDockerAppsListPolicies")
   if [ -z "$LIST" ]; then
-    bad "C0 could not isolate fn list_policies in $BACKEND — subject lost"
-  elif has "$LIST" 'fleet_usage_by_user' && has "$LIST" '"used"' && live "$LIST"; then
-    ok "C1 list_policies embeds a live 'used' count per row, from one shared fleet walk rather than N per-policy ones"
+    bad "C0 could not isolate func rtDockerAppsListPolicies in $BACKEND — subject lost"
+  elif has "$LIST" 'rtDockerAppsFleetUsageByUser' && has "$LIST" '"used"' && live "$LIST"; then
+    ok "C1 rtDockerAppsListPolicies embeds a live 'used' count per row, from one shared fleet walk rather than N per-policy ones"
   else
-    bad "C1 list_policies must embed a per-user used count — the frontend has nothing to render a usage bar from otherwise"
+    bad "C1 rtDockerAppsListPolicies must embed a per-user used count — the frontend has nothing to render a usage bar from otherwise"
   fi
 
   echo
   echo "§D the shared counter fails closed on a missing/malformed owner"
-  OWNER_FN=$(fnbody "$BE" "app_owner")
-  if [ -z "$OWNER_FN" ]; then
-    bad "D0 could not isolate fn app_owner in $BACKEND — subject lost"
-  elif has "$OWNER_FN" 'Uuid::parse_str' && has "$OWNER_FN" '"user_id"' && live "$OWNER_FN"; then
-    ok "D1 app_owner parses the existing user_id field into a real Uuid rather than defaulting a missing/malformed one to some shared bucket"
-  else
-    bad "D1 app_owner must parse user_id into a Uuid and return None on absence — a defaulted owner would misattribute a legacy container"
-  fi
+  # D1 retired: covered by TestPinContainerOwnershipOwnerFailsClosed (panel/go/internal/api/pin_container_ownership_test.go)
 fi
 
 echo
@@ -159,18 +153,18 @@ echo "§E the attribution primitive itself is still being written and read"
 if ! AG=$(subj "$AGENT"); then
   skip "§E — $AGENT produced no code after stripping"
 else
-  DEPLOY_APP=$(fnbody "$AG" "deploy_app")
-  if [ -n "$DEPLOY_APP" ] && has "$DEPLOY_APP" 'dockpanel\.user\.id' && live "$DEPLOY_APP"; then
-    ok "E1 deploy_app still stamps dockpanel.user.id on every container it creates"
+  DEPLOY_APP=$(fnbody "$AG" "DockerAppsDeployApp")
+  if [ -n "$DEPLOY_APP" ] && has "$DEPLOY_APP" 'labels\["dockpanel\.user\.id"\] = \*userID' && live "$DEPLOY_APP"; then
+    ok "E1 DockerAppsDeployApp still stamps dockpanel.user.id on every container it creates"
   else
-    bad "E1 deploy_app must still stamp dockpanel.user.id — every counter above depends entirely on this label existing"
+    bad "E1 DockerAppsDeployApp must still stamp dockpanel.user.id — every counter above depends entirely on this label existing"
   fi
 
-  LIST_APPS=$(fnbody "$AG" "list_deployed_apps")
-  if [ -n "$LIST_APPS" ] && has "$LIST_APPS" 'dockpanel\.user\.id' && has "$LIST_APPS" 'user_id' && live "$LIST_APPS"; then
-    ok "E2 list_deployed_apps still reads dockpanel.user.id back onto DeployedApp.user_id in every /apps response"
+  LIST_APPS=$(fnbody "$AG" "DockerAppsListDeployedApps")
+  if [ -n "$LIST_APPS" ] && has "$LIST_APPS" 'Labels\["dockpanel\.user\.id"\]' && has "$LIST_APPS" 'UserID' && live "$LIST_APPS"; then
+    ok "E2 DockerAppsListDeployedApps still reads dockpanel.user.id back onto DeployedApp.UserID in every /apps response"
   else
-    bad "E2 list_deployed_apps must still surface user_id — the backend has no other way to learn who owns a container"
+    bad "E2 DockerAppsListDeployedApps must still surface user_id — the backend has no other way to learn who owns a container"
   fi
 fi
 

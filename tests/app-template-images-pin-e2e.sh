@@ -40,9 +40,12 @@
 #     `tests/live-surfaces-check.sh`, which asserts things about the world rather
 #     than about this commit, and runs daily from a GitHub runner.
 #
-# WRAP TOLERANCE. Arms that read the TEMPLATE_CMD table canonicalise it by
-# deleting whitespace before matching, and never spell a closing delimiter, so a
-# rustfmt reflow (which adds line breaks AND a trailing comma) cannot blind them.
+# WRAP TOLERANCE. Arms that read the dockerAppsTemplateCmd table canonicalise
+# it by deleting whitespace before matching, and never spell a closing
+# delimiter, so a gofmt reflow (line breaks, alignment padding, a trailing
+# comma) cannot blind them. (The catalogue moved from the Rust
+# services/docker_apps.rs to panel/go/internal/agent/services/docker_apps.go;
+# Go field names are capitalised: `ID:`, `Image:`.)
 # That is lesson #384, which was learned by shipping the defect into the very
 # suite written to pin it.
 #
@@ -55,20 +58,20 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-CATALOGUE=panel/agent/src/services/docker_apps.rs
+CATALOGUE=panel/go/internal/agent/services/docker_apps.go
 ICONS=panel/frontend/src/pages/Apps.tsx
 [ -f "$CATALOGUE" ] || { echo "missing $CATALOGUE"; exit 1; }
 
 # Canonical form: whitespace deleted. Wrapping and indentation become invisible,
-# so one pattern matches the single-line and the rustfmt-wrapped spelling alike.
+# so one pattern matches the single-line and the gofmt-wrapped spelling alike.
 FLAT=$(tr -d ' \t\n' < "$CATALOGUE")
 
 echo "§1 the catalogue still parses (a broken parser must not read as a clean sweep)"
 
 N=$(awk '
-  /static TEMPLATES/ { inside = 1; next }
-  inside && /^\];/   { exit }
-  inside && /^        id: "/ { n++ }
+  /^var dockerAppsTemplates = / { inside = 1; next }
+  inside && /^}/   { exit }
+  inside && /^\t\tID: +"/ { n++ }
   END { print n + 0 }
 ' "$CATALOGUE")
 if [ "$N" -ge 100 ]; then
@@ -108,7 +111,7 @@ DEAD=(
 )
 back=0
 for ref in "${DEAD[@]}"; do
-  if grep -qF "image:\"$ref\"" <<<"$FLAT"; then
+  if grep -qF "Image:\"$ref\"" <<<"$FLAT"; then
     bad "$ref is pinned again — it was measured unpullable; this app cannot deploy at all"
     back=1
   fi
@@ -136,7 +139,7 @@ declare -A LIVE=(
 )
 missing=0
 for t in "${!LIVE[@]}"; do
-  if grep -qF "image:\"${LIVE[$t]}\"" <<<"$FLAT"; then :; else
+  if grep -qF "Image:\"${LIVE[$t]}\"" <<<"$FLAT"; then :; else
     bad "$t no longer pins ${LIVE[$t]} — the resolvable reference was replaced"
     missing=1
   fi
@@ -160,7 +163,7 @@ echo "§4 the five withdrawn templates stay withdrawn"
 # — a read-only proxy suffices for it because listing containers and reading
 # logs is ALL it ever needed, unlike portainer's write-level requirements.
 for id in discourse zabbix strapi stable-diffusion-webui portainer; do
-  if grep -qF "id:\"$id\"" <<<"$FLAT"; then
+  if grep -qF "ID:\"$id\"" <<<"$FLAT"; then
     bad "template '$id' is back in the catalogue — it was withdrawn and should stay withdrawn"
   else
     ok "'$id' withdrawn"
@@ -191,20 +194,25 @@ echo "§5 every start command established by running the image is still declared
 # established by RUNNING the image and observing BOTH directions — without it the
 # container exits, with it the container stays up and answers on its port.
 #
-# Matched against the whitespace-stripped source and deliberately NOT closed with
-# `)`, so a rustfmt reflow — which both breaks lines and adds a trailing comma —
+# Matched against the whitespace-stripped table and deliberately NOT closed with
+# `}`, so a gofmt reflow — which both breaks lines and adds a trailing comma —
 # cannot make these arms silently blind.
+CMD_TABLE=$(sed -n '/^var dockerAppsTemplateCmd = /,/^}/p' "$CATALOGUE" | grep -vE '^[[:space:]]*//')
+CMD_FLAT=$(tr -d ' \t\n' <<<"$CMD_TABLE")
+if [ -z "$CMD_FLAT" ]; then
+  bad "could not isolate dockerAppsTemplateCmd — every §5/§6 arm below would read nothing"
+fi
 declare -A CMD=(
-  [minio]='("minio",&["server","/data","--console-address",":9001"'
-  [cloudflared]='("cloudflared",&["tunnel","run"'
-  [ntfy]='("ntfy",&["serve"'
-  [trivy]='("trivy",&["server","--listen","0.0.0.0:8080"'
-  [keycloak]='("keycloak",&["start-dev"'
+  [minio]='{"minio",[]string{"server","/data","--console-address",":9001"'
+  [cloudflared]='{"cloudflared",[]string{"tunnel","run"'
+  [ntfy]='{"ntfy",[]string{"serve"'
+  [trivy]='{"trivy",[]string{"server","--listen","0.0.0.0:8080"'
+  [keycloak]='{"keycloak",[]string{"start-dev"'
 )
 lost=0
 for id in "${!CMD[@]}"; do
-  if grep -qF "${CMD[$id]}" <<<"$FLAT"; then :; else
-    bad "TEMPLATE_CMD no longer declares '$id' — that container reverts to printing its default and exiting"
+  if grep -qF "${CMD[$id]}" <<<"$CMD_FLAT"; then :; else
+    bad "dockerAppsTemplateCmd no longer declares '$id' — that container reverts to printing its default and exiting"
     lost=1
   fi
 done
@@ -212,13 +220,13 @@ done
 
 # Fail-closed on the table itself: an id here that is not in the catalogue is a
 # command that can never fire, which reads exactly like coverage.
-CMD_IDS=$(awk '/static TEMPLATE_CMD/ {inside=1} inside && /^\];/ {exit}
-               inside && match($0, /\("[a-z0-9-]+"/) { print substr($0, RSTART+2, RLENGTH-3) }' "$CATALOGUE")
+CMD_IDS=$(awk 'match($0, /^\t\{"[a-z0-9-]+"/) { print substr($0, RSTART+3, RLENGTH-4) }' <<<"$CMD_TABLE")
+[ -n "$CMD_IDS" ] || bad "no ids extracted from dockerAppsTemplateCmd — the stray check below examines nothing"
 stray=0
 for id in $CMD_IDS; do
-  grep -qF "id:\"$id\"" <<<"$FLAT" || { bad "TEMPLATE_CMD names '$id', which is not in the catalogue"; stray=1; }
+  grep -qF "ID:\"$id\"" <<<"$FLAT" || { bad "dockerAppsTemplateCmd names '$id', which is not in the catalogue"; stray=1; }
 done
-[ "$stray" -eq 0 ] && ok "every TEMPLATE_CMD id exists in the catalogue"
+[ "$stray" -eq 0 ] && ok "every dockerAppsTemplateCmd id ($(wc -w <<<"$CMD_IDS" | tr -d ' ')) exists in the catalogue"
 
 echo
 echo "§6 the three templates a command cannot fix carry no command"
@@ -227,16 +235,16 @@ echo "§6 the three templates a command cannot fix carry no command"
 #   authentik  — needs PostgreSQL and Redis. With `server` it runs happily and
 #                retries the database for ever: a container that reports healthy
 #                and never serves, which is a SILENT failure where today's is loud.
-#   vllm       — takes its model as a command-line argument, but TEMPLATE_CMD is a
-#                static &[&str] and cannot interpolate the MODEL the template
+#   vllm       — takes its model as a command-line argument, but the command
+#                table is static and cannot interpolate the MODEL the template
 #                collects.
 #   surrealdb  — needs a datastore path AND a writable volume. It runs as
 #                `nonroot` while the agent creates volume dirs root-owned, so it
 #                cannot write /data; without the path it silently keeps everything
 #                in memory and loses it on restart.
 for id in authentik vllm surrealdb; do
-  if grep -qF "(\"$id\"," <<<"$FLAT"; then
-    bad "TEMPLATE_CMD declares '$id' — see this section's comment; that command cannot work"
+  if grep -qF "{\"$id\"," <<<"$CMD_FLAT"; then
+    bad "dockerAppsTemplateCmd declares '$id' — see this section's comment; that command cannot work"
   else
     ok "'$id' carries no command"
   fi
@@ -255,11 +263,11 @@ else
   ok "the catalogue itself never references the host Docker socket path"
 fi
 
-if ! grep -qF '"dozzle",app_sidecar::SidecarDef{' <<<"$FLAT"; then
-  bad "dozzle's TEMPLATE_SIDECAR entry changed or is missing"
-elif grep -qF 'image:"tecnativa/docker-socket-proxy:latest"' <<<"$FLAT"; then
+if ! grep -qF '"dozzle":{' <<<"$(sed -n '/^var dockerAppsTemplateSidecar = /,/^}/p' "$CATALOGUE" | tr -d ' \t\n')"; then
+  bad "dozzle's dockerAppsTemplateSidecar entry changed or is missing"
+elif grep -qF 'Image:"tecnativa/docker-socket-proxy:latest"' <<<"$FLAT"; then
   bad "dozzle's sidecar is back on :latest — a proxy in front of the Docker socket must be version-pinned, not silently changeable underneath a deploy"
-elif grep -qE 'image:"tecnativa/docker-socket-proxy:v[0-9]+\.[0-9]+\.[0-9]+"' <<<"$FLAT"; then
+elif grep -qE 'Image:"tecnativa/docker-socket-proxy:v[0-9]+\.[0-9]+\.[0-9]+"' <<<"$FLAT"; then
   ok "dozzle's sidecar pins the tecnativa/docker-socket-proxy image to a specific version"
 else
   bad "dozzle's sidecar image field changed shape — re-read it"
@@ -271,7 +279,7 @@ fi
 DENY=(POST EXEC IMAGES NETWORKS VOLUMES SERVICES SWARM SYSTEM TASKS BUILD COMMIT AUTH SECRETS CONFIGS DISTRIBUTION NODES PLUGINS SESSION GRPC ALLOW_START ALLOW_STOP ALLOW_RESTARTS ALLOW_PAUSE ALLOW_UNPAUSE)
 denied_ok=1
 for tog in "${DENY[@]}"; do
-  grep -qF "(\"$tog\",\"0\")" <<<"$FLAT" || { bad "DOZZLE_PROXY_ENV no longer denies $tog"; denied_ok=0; }
+  grep -qF "{\"$tog\",\"0\"}" <<<"$FLAT" || { bad "dockerAppsDozzleProxyEnv no longer denies $tog"; denied_ok=0; }
 done
 [ "$denied_ok" -eq 1 ] && ok "all ${#DENY[@]} dangerous socket-proxy endpoints stay denied"
 
@@ -283,17 +291,17 @@ done
 GRANT=(CONTAINERS INFO)
 granted_ok=1
 for tog in "${GRANT[@]}"; do
-  grep -qF "(\"$tog\",\"1\")" <<<"$FLAT" || { bad "DOZZLE_PROXY_ENV no longer grants $tog"; granted_ok=0; }
+  grep -qF "{\"$tog\",\"1\"}" <<<"$FLAT" || { bad "dockerAppsDozzleProxyEnv no longer grants $tog"; granted_ok=0; }
 done
 [ "$granted_ok" -eq 1 ] && ok "the proxy grants exactly the two endpoints dozzle needs (CONTAINERS, INFO)"
 
-SIDECAR=panel/agent/src/services/app_sidecar.rs
+SIDECAR=panel/go/internal/agent/services/app_sidecar.go
 if [ -f "$SIDECAR" ]; then
   SIDECAR_FLAT=$(tr -d ' \t\n' < "$SIDECAR")
-  if grep -qF 'binds:Some(vec!["/var/run/docker.sock:/var/run/docker.sock:ro"' <<<"$SIDECAR_FLAT"; then
+  if grep -qF 'Binds:[]string{"/var/run/docker.sock:/var/run/docker.sock:ro"' <<<"$SIDECAR_FLAT"; then
     ok "only the sidecar container mounts the real socket, and read-only"
   else
-    bad "app_sidecar.rs no longer mounts the host socket into the sidecar — dozzle would be unreachable again"
+    bad "app_sidecar.go no longer mounts the host socket into the sidecar — dozzle would be unreachable again"
   fi
 else
   bad "missing $SIDECAR — the sidecar module was removed but dozzle's catalogue entry was not"
@@ -308,9 +316,7 @@ echo "§8 the 59 images re-pinned off :latest (s472) stay pinned"
 # guess. Checking the REPO string rather than the specific version means this
 # arm never goes stale as a future session bumps one of these to a newer
 # release; it only catches a regression back to the unpinned, non-reproducible
-# form. Fail-closed: an id here that lost its own catalogue entry (renamed,
-# withdrawn) would make `grep -qF "id:\"$id\""` fail to find a matching image
-# line at all, which is exactly what "still pinned" must mean for it.
+# form.
 REPINNED_REPO=(
   'minio/minio' 'nocodb/nocodb' 'photoprism/photoprism' 'ollama/ollama'
   'frooodle/s-pdf' 'actualbudget/actual-server' 'quay.io/hedgedoc/hedgedoc'
@@ -333,7 +339,7 @@ REPINNED_REPO=(
 )
 regressed=0
 for repo in "${REPINNED_REPO[@]}"; do
-  if grep -qF "image:\"$repo:latest\"" <<<"$FLAT"; then
+  if grep -qF "Image:\"$repo:latest\"" <<<"$FLAT"; then
     bad "$repo is back on :latest — it was re-pinned to a verified digest-identical tag"
     regressed=1
   fi

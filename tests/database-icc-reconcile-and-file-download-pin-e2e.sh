@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Regression pins for the s455 dockpanel-fanout run over
-# panel/agent/src/services/database.rs + panel/agent/src/routes/database.rs
+# Regression pins for the s455 dockpanel-fanout run over the agent's
+# database service + files route — now panel/go/internal/agent/services/database.go
+# (databaseReconcileNetworkIccAt) and panel/go/internal/agent/routes/files.go
+# (filesDownload)
 # (workflow wf_42ca36ed-5e2; project_dockpanel_tech_debt ledger p194).
 #
 #   D1  `reconcile_network_icc` (the one-time pre-s242 ICC-hardening migration
@@ -13,7 +15,7 @@
 #       network (never the real `dockpanel-db`): two real containers
 #       straddling a deliberately-unconnectable id both ended up reconnected
 #       after the fix, and the aggregated error named exactly the bad id.
-#   D2  `routes/files.rs::download_file` read an entire file into a `Vec<u8>`
+#   D2  the files route's `download_file` (Go: filesDownload) read an entire file into a `Vec<u8>`
 #       (`tokio::fs::read`) before sending a single response byte, with no
 #       size cap — unlike its sibling `read_file` (2MB cap, same file). The
 #       agent is the ONE process per box mediating deploys/backups/terminal/
@@ -33,22 +35,24 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-# Strip comments and the test module, so a pin can never be satisfied (or
-# tripped) by prose describing the very thing it forbids.
-code()  { sed '/#\[cfg(test)\]/q' "$1" | grep -vE '^[[:space:]]*(///|//!|//|\*|/\*)'; }
+# Strip comments, so a pin can never be satisfied (or tripped) by prose
+# describing the very thing it forbids. Go keeps tests in _test.go files, so
+# no test module needs cutting.
+code()  { grep -vE '^[[:space:]]*(//|\*|/\*)' "$1"; }
 has()   { [ -n "$(code "$1" | grep -F -- "$2")" ]; }
 hasre() { [ -n "$(code "$1" | grep -E -- "$2")" ]; }
 
-# One named function's body, comment-stripped. Never pipe this into `grep
-# -q` — see security-firewalld-ssh-include-pin-e2e.sh's own header for why
-# (the exact SIGPIPE-under-pipefail class this project tracks).
+# One named Go function's body, comment-stripped: from the line matching $2 to
+# the first closing `}` at column 0. Never pipe this into `grep -q` — see
+# security-firewalld-ssh-include-pin-e2e.sh's own header for why (the exact
+# SIGPIPE-under-pipefail class this project tracks).
 fnbody()    { code "$1" | awk "/$2/,/^}/"; }
 bodyhas()   { [ -n "$(fnbody "$1" "$2" | grep -F -- "$3")" ]; }
 bodyhasre() { [ -n "$(fnbody "$1" "$2" | grep -E -- "$3")" ]; }
 
-DB_SVC=panel/agent/src/services/database.rs
-FILES_ROUTE=panel/agent/src/routes/files.rs
-FILES_SVC=panel/agent/src/services/files.rs
+DB_SVC=panel/go/internal/agent/services/database.go
+FILES_ROUTE=panel/go/internal/agent/routes/files.go
+FILES_SVC=panel/go/internal/agent/services/files.go
 
 for f in "$DB_SVC" "$FILES_ROUTE" "$FILES_SVC"; do
   [ -f "$f" ] || { echo "missing source file: $f"; exit 1; }
@@ -56,78 +60,64 @@ done
 
 echo "── 1. D1: the ICC-network reconcile is best-effort, not abort-on-first-failure ──"
 
-if has "$DB_SVC" "fn reconcile_network_icc_at"; then
-  ok "reconcile_network_icc is path/network-parameterized for testability"
+if has "$DB_SVC" "func databaseReconcileNetworkIccAt("; then
+  ok "the ICC reconcile is path/network-parameterized for testability (databaseReconcileNetworkIccAt)"
 else
-  bad "reconcile_network_icc_at is gone"
+  bad "databaseReconcileNetworkIccAt is gone"
 fi
 
-if bodyhasre "$DB_SVC" "fn reconcile_network_icc_at" 'if let Err\(e\) = docker'; then
-  ok "the reconnect loop catches each failure instead of propagating with ?"
+if bodyhasre "$DB_SVC" "^func databaseReconcileNetworkIccAt\(" 'if _, err := docker\.NetworkConnect\(.*err != nil \{'; then
+  ok "the reconnect loop catches each failure instead of returning on it"
 else
   bad "the reconnect loop no longer catches individual failures — abort-on-first-failure may be back"
 fi
 
-if bodyhasre "$DB_SVC" "fn reconcile_network_icc_at" '\.connect_network\('; then
-  ok "connect_network is still called from the reconcile function"
-else
-  bad "connect_network call is gone from reconcile_network_icc_at"
-fi
+# "connect_network is still called", "failed.push" and "failed.join" retired:
+# covered by TestPinDatabaseIccReconcileReconnectsEveryContainerDespiteOneBadID
+# (panel/go/internal/agent/services/pin_database_icc_reconcile_and_file_download_test.go),
+# which drives the function against a fake Docker API and asserts every later
+# container is reconnected and the error names exactly the failed one.
 
-if bodyhas "$DB_SVC" "fn reconcile_network_icc_at" "failed.push"; then
-  ok "every reconnect failure is collected, not just the first"
+# The Rust live-Docker regression test was not ported (it needed a daemon); the
+# hermetic Go test above replaces it. This arm's point was "that test exists and
+# passes", so it is run.
+GT=$(cd panel/go && go test ./internal/agent/services/ -run '^TestPinDatabaseIccReconcileReconnectsEveryContainerDespiteOneBadID$' -count=1 -v 2>&1)
+if grep -q -- '--- PASS: TestPinDatabaseIccReconcileReconnectsEveryContainerDespiteOneBadID' <<< "$GT"; then
+  ok "a regression test for this exact shape (one bad id mid-batch) exists and passes"
 else
-  bad "failures are no longer accumulated — the aggregated error report is gone"
-fi
-
-if bodyhas "$DB_SVC" "fn reconcile_network_icc_at" "failed.join"; then
-  ok "the returned error names every failed container, not just one"
-else
-  bad "the error no longer lists every failed container"
-fi
-
-# Deliberately NOT using has() here — has()/code() strip the #[cfg(test)]
-# module (so a pin can't be tautologically satisfied by test-only code), but
-# this assertion's whole point is confirming a specific TEST exists.
-if grep -qF "reconcile_network_icc_reconnects_every_container_despite_one_bad_id" "$DB_SVC"; then
-  ok "a live Docker-backed regression test exists for this exact shape"
-else
-  bad "the live reconnect-loop regression test is gone"
+  bad "the reconnect-loop regression test is gone or failing — $(grep -E -- '--- FAIL|^FAIL|_test.go:|no tests' <<< "$GT" | head -3 | tr '\n' ' ')"
 fi
 
 echo
 echo "── 2. D2: file download streams instead of buffering the whole file in memory ──"
 
-if bodyhas "$FILES_ROUTE" "async fn download_file" "tokio::fs::read(&safe)"; then
-  bad "download_file reads the whole file into memory again — the OOM path is back"
+if bodyhasre "$FILES_ROUTE" "^func filesDownload\(" 'os\.ReadFile\(|io\.ReadAll\('; then
+  bad "filesDownload reads the whole file into memory again — the OOM path is back"
 else
-  ok "download_file no longer reads the whole file into a Vec<u8>"
+  ok "filesDownload no longer reads the whole file into a []byte"
 fi
 
-if bodyhasre "$FILES_ROUTE" "async fn download_file" 'ReaderStream::new|Body::from_stream'; then
-  ok "download_file streams the response instead of buffering it"
+if bodyhasre "$FILES_ROUTE" "^func filesDownload\(" 'io\.Copy\(w, f\)'; then
+  ok "filesDownload streams the response instead of buffering it"
 else
-  bad "download_file no longer streams — check what replaced tokio::fs::read"
+  bad "filesDownload no longer streams — check what replaced io.Copy"
 fi
 
-if has "$FILES_ROUTE" "tokio::fs::File::open(&safe)"; then
-  ok "download_file opens the file for streaming rather than reading it eagerly"
+if bodyhas "$FILES_ROUTE" "^func filesDownload\\(" "os.Open(safe)"; then
+  ok "filesDownload opens the file for streaming rather than reading it eagerly"
 else
-  bad "download_file no longer opens the file via tokio::fs::File — streaming path may be gone"
+  bad "filesDownload no longer opens the file via os.Open — streaming path may be gone"
 fi
 
-if hasre "panel/agent/Cargo.toml" '^tokio-util'; then
-  ok "tokio-util is a direct dependency (ReaderStream needs it, not just a transitive one)"
-else
-  bad "tokio-util is no longer a direct dependency — the streaming fix cannot compile without it"
-fi
+# "tokio-util is a direct dependency" retired (obsolete in Go): the stream is
+# stdlib io.Copy; there is no crate dependency to keep.
 
 # The sibling function's own cap must be untouched — this pin suite is about
 # the DOWNLOAD path specifically, not about relaxing the text-editor guard.
-if bodyhasre "$FILES_SVC" "pub async fn read_file" '2 \* 1024 \* 1024'; then
-  ok "read_file's own 2MB text-editor cap is still in place, untouched"
+if bodyhasre "$FILES_SVC" "^func FilesReadFile\(" '2 ?\* ?1024 ?\* ?1024'; then
+  ok "FilesReadFile's own 2MB text-editor cap is still in place, untouched"
 else
-  bad "read_file's 2MB cap is gone — unrelated regression"
+  bad "FilesReadFile's 2MB cap is gone — unrelated regression"
 fi
 
 echo

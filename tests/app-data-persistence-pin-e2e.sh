@@ -4,9 +4,13 @@
 # Pins the fix for GitHub #110: pressing "Update" on a Docker App destroyed the
 # app's data, and nothing in the panel said it would.
 #
+# (Subjects now live in panel/go: internal/agent/services/docker_apps.go —
+# DockerAppsMigrateUnmountedVolumes, DockerAppsUpdateApp, … — and the api's
+# rt_docker_apps.go / rt_mail.go / rt_system.go.)
+#
 # The mechanism is worth stating precisely, because the guard that was already
 # there is CORRECT and was never the problem. Every recreate path removes the
-# container with `RemoveContainerOptions { v: false }` — "keep the volumes" — and
+# container keeping its volumes — "keep the volumes" — and
 # a comment above it says data therefore persists. That is true of volumes. It is
 # not true of DATA: a container with no mount keeps its state in its own writable
 # layer, and `docker rm` deletes the writable layer whatever `v` says. n8n's
@@ -68,79 +72,73 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-AGENT_SVC=panel/agent/src/services/docker_apps.rs
-AGENT_RT=panel/agent/src/routes/docker_apps.rs
-BE_APPS=panel/backend/src/routes/docker_apps.rs
-BE_MAIL=panel/backend/src/routes/mail.rs
-BE_SYS=panel/backend/src/routes/system.rs
-BE_AGENT=panel/backend/src/services/agent.rs
+AGENT_SVC=panel/go/internal/agent/services/docker_apps.go
+BE_APPS=panel/go/internal/api/rt_docker_apps.go
+BE_MAIL=panel/go/internal/api/rt_mail.go
+BE_SYS=panel/go/internal/api/rt_system.go
 MAIL_TSX=panel/frontend/src/pages/Mail.tsx
 
-for f in "$AGENT_SVC" "$AGENT_RT" "$BE_APPS" "$BE_MAIL" "$BE_SYS" "$BE_AGENT" "$MAIL_TSX"; do
+for f in "$AGENT_SVC" "$BE_APPS" "$BE_MAIL" "$BE_SYS" "$MAIL_TSX"; do
   [ -f "$f" ] || bad "MISSING SUBJECT FILE: $f"
 done
 
 # Comments out, CODE INTACT. Copied from the FIXED stripper (lesson #136): the
 # naive s{/\*.*?\*/}{}gs deletes real code because `/*` occurs inside string
 # literals, and a truncated subject makes an ABSENCE arm pass on code the
-# stripper merely removed — failure in the reassuring direction.
-#
-# The trailing `#[cfg(test)] mod tests { ... }` block is ALSO cut, to end of
-# file — matched only by that exact two-line marker (never a bare `#[cfg(test)]`
-# on a single function elsewhere), so this can only ever remove the whole-file
-# test module this codebase's convention always puts last, never production
-# code partway through a file. §A's census is about what SHIPS: a test helper
-# can share the create+remove shape a real recreate path has (a probe
-# container has no data-loss stakes to migrate) without being one, and
-# `#[cfg(test)]` code never reaches a customer's server to have this bug in
-# the first place.
+# stripper merely removed — failure in the reassuring direction. Go line
+# comments: whole-line `//`, and trailing `//` only after whitespace (so a
+# `https://` literal survives). Go tests live in _test.go files, so there is no
+# test module to cut: §A's census is over shipping code by construction.
 code() {
   perl -0777 -pe '
     s{\{/\*.*?\*/\}}{}gs;
     s{^[ \t]*/\*.*?\*/[ \t]*$}{}gms;
-    s{^\s*//.*$}{}gm;
-    s{^\#\[cfg\(test\)\]\nmod tests \{.*\z}{}ms;
+    s{^[ \t]*//.*$}{}gm;
+    s{[ \t]+//[^"`\n]*$}{}gm;
   ' "$1"
 }
 
 subj() { local t; t=$(code "$1"); [ -n "$t" ] || return 1; printf '%s' "$t"; }
 
-# The body of one top-level fn, bounded by the NEXT top-level fn. A fixed
-# `grep -A n` window is not a function (lessons #131/#172).
+# The body of one top-level Go func (or method), bounded by its own closing `}`
+# at column 0. A fixed `grep -A n` window is not a function (lessons #131/#172).
 fnbody() {
   awk -v name="$2" '
-    /^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn / {
-      if ($0 ~ "(pub |pub\\(crate\\) )?(async )?fn " name "\\(") { inside=1; next }
-      inside=0
-    }
-    inside { print }
+    !inside && (index($0, "func " name "(") == 1 || $0 ~ ("^func \\([^)]*\\) " name "\\(")) { inside=1; next }
+    inside { if ($0 == "}") exit; print }
   ' <<< "$1"
 }
 
-# Names of the top-level fns in $1 (stripped source) whose body matches $2.
-# The enclosing-fn map is COMPUTED, never assumed — this is what makes §A a
+# Names of the top-level funcs in $1 (stripped source) whose body matches $2.
+# The enclosing-func map is COMPUTED, never assumed — this is what makes §A a
 # census rather than a list.
 fns_matching() {
   awk -v pat="$2" '
-    /^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn / {
+    /^func / {
       cur=$0
-      sub(/^.*fn[[:space:]]+/, "", cur)
-      sub(/[(<].*$/, "", cur)
+      sub(/^func (\([^)]*\) )?/, "", cur)
+      sub(/[(\[].*$/, "", cur)
+      next
     }
-    $0 ~ pat { if (cur != "" && !seen[cur]++) print cur }
+    /^}/ { cur=""; next }
+    cur != "" && $0 ~ pat { if (!seen[cur]++) print cur }
   ' <<< "$1"
 }
 
 # First 1-based line number in $1 matching $2, or empty.
 lineof() { awk -v pat="$2" '$0 ~ pat { print NR; exit }' <<< "$1"; }
 
+# A container leaves through docker.ContainerRemove directly or through the
+# stop+remove helper; both are a remove.
+RM_PAT='ContainerRemove[(]|dockerAppsStopRemove[(]'
+
 echo "== §A  every recreate path migrates before it removes =="
 
 if S=$(subj "$AGENT_SVC"); then
   # A recreate path is a function that BOTH removes a container and creates one.
   # Derived from the source, so a fourth one added later is judged automatically.
-  removers=$(fns_matching "$S" 'remove_container[(]')
-  creators=$(fns_matching "$S" 'create_container[(]')
+  removers=$(fns_matching "$S" "$RM_PAT")
+  creators=$(fns_matching "$S" 'ContainerCreate[(]')
   recreate=$(comm -12 <(sort <<< "$removers") <(sort <<< "$creators"))
   n_recreate=$(grep -c . <<< "$recreate")
 
@@ -149,24 +147,21 @@ if S=$(subj "$AGENT_SVC"); then
   # three of them and silently stopped judging the rest; worse, an exclusion that
   # is not written down is revocable by whoever next edits the file (lesson #426).
   # The exemptions, each checked against the source below:
-  #   blue_green_update     — creates the replacement and removes the ORIGINAL, so
-  #                           it does destroy a writable layer. It is exempt because
-  #                           `update_app` refuses to reach it while a migration is
-  #                           pending (arm B2); the exemption is enforced there, not
-  #                           granted here.
-  #   deploy_app            — the remove is collision cleanup before a FIRST create.
+  #   dockerAppsBlueGreenUpdate — creates the replacement and removes the ORIGINAL,
+  #                           so it does destroy a writable layer. It is exempt
+  #                           because DockerAppsUpdateApp refuses to reach it while
+  #                           a migration is pending (arm B2); the exemption is
+  #                           enforced there, not granted here.
+  #   DockerAppsDeployApp   — the remove is collision cleanup before a FIRST create.
   #                           There is no prior data by construction.
-  #   read_file_from_image  — makes a throwaway container to read one file out of an
-  #                           image and removes it. It never held app data.
-  #   seed_volume_from_image — the same shape as read_file_from_image, for the same
-  #                           reason: it CREATES a container purely so Docker's copy
-  #                           API has a filesystem to read, never starts it, and
-  #                           removes it again. The container it removes is one it
-  #                           made microseconds earlier and nobody's data was ever
-  #                           in it. It is enumerated here because the census keys
-  #                           on remove+create, which is the right proxy for a
-  #                           recreate path and the wrong one for a probe.
-  EXEMPT="blue_green_update deploy_app read_file_from_image seed_volume_from_image"
+  #   dockerAppsCopyOutOfImage — the Go merge of Rust's read_file_from_image and
+  #                           seed_volume_from_image: it CREATES a container purely
+  #                           so Docker's copy API has a filesystem to read, never
+  #                           starts it, and removes it again. Nobody's data was
+  #                           ever in it. Enumerated because the census keys on
+  #                           remove+create, the right proxy for a recreate path
+  #                           and the wrong one for a probe.
+  EXEMPT="dockerAppsBlueGreenUpdate DockerAppsDeployApp dockerAppsCopyOutOfImage"
 
   if [ "$n_recreate" -eq 0 ]; then
     bad "A0 enumeration found ZERO recreate paths — the census examined nothing"
@@ -197,7 +192,7 @@ if S=$(subj "$AGENT_SVC"); then
     fi
 
     # A1 — it migrates at all.
-    if grep -q 'migrate_unmounted_volumes' <<< "$body"; then
+    if grep -q 'DockerAppsMigrateUnmountedVolumes(' <<< "$body"; then
       ok "A1 $fn migrates unmounted volumes"
     else
       bad "A1 $fn removes and recreates a container WITHOUT migrating its data (#110)"
@@ -205,8 +200,8 @@ if S=$(subj "$AGENT_SVC"); then
 
     # A2 — ORDER. A migration after the remove reads identically to a presence
     # grep and rescues nothing: the data is already gone.
-    l_mig=$(lineof "$body" 'migrate_unmounted_volumes')
-    l_rm=$(lineof "$body" 'remove_container[(]')
+    l_mig=$(lineof "$body" 'DockerAppsMigrateUnmountedVolumes[(]')
+    l_rm=$(lineof "$body" "$RM_PAT")
     if [ -n "$l_mig" ] && [ -n "$l_rm" ] && [ "$l_mig" -lt "$l_rm" ]; then
       ok "A2 $fn migrates BEFORE it removes (line $l_mig < $l_rm)"
     else
@@ -214,188 +209,87 @@ if S=$(subj "$AGENT_SVC"); then
     fi
 
     # A3 — the failure ABORTS. A migration whose error is swallowed is followed by
-    # a `docker rm` that destroys exactly what the call was there to save.
-    seg=$(awk '/migrate_unmounted_volumes/{f=1} f{print} /remove_container[(]/{if(f)exit}' <<< "$body")
+    # a remove that destroys exactly what the call was there to save. In Go that
+    # is the migration's own `err != nil` branch returning, between the call and
+    # the remove.
+    seg=$(awk -v rm="$RM_PAT" '/DockerAppsMigrateUnmountedVolumes[(]/{f=1} f{print} f && $0 ~ rm {exit}' <<< "$body")
     if [ -z "$seg" ]; then
       bad "A3 $fn — could not isolate the migrate..remove segment, the arm examined nothing"
-    elif grep -qE '\?;' <<< "$seg"; then
-      ok "A3 $fn propagates a migration failure instead of removing anyway"
+    elif awk '/DockerAppsMigrateUnmountedVolumes[(]/{f=1} f && /err != nil \{/{g=1} g && /^[[:space:]]*return /{found=1; exit} END{exit !found}' <<< "$seg"; then
+      ok "A3 $fn returns on a migration failure instead of removing anyway"
     else
       bad "A3 $fn swallows a migration failure and removes the container regardless"
     fi
   done <<< "$recreate"
 
   # A4 — THE CAPABILITY, pinned separately from the call (#472). Every call site
-  # above can be present and correct while this function quietly returns Ok on a
+  # above can be present and correct while this function quietly returns nil on a
   # failed copy, and no call-site arm can see that.
-  mig=$(fnbody "$S" "migrate_unmounted_volumes")
+  mig=$(fnbody "$S" "DockerAppsMigrateUnmountedVolumes")
   if [ -z "$mig" ]; then
-    bad "A4 migrate_unmounted_volumes does not exist as a top-level fn"
+    bad "A4 DockerAppsMigrateUnmountedVolumes does not exist as a top-level func"
   else
     # The COPY-FAILURE path specifically, not a count of error paths anywhere in
     # the body. A count is satisfied by the failures that were never in question
-    # (mkdir, canonicalize, prefix) while the one that decides whether a `docker
-    # rm` follows a lost copy is quietly deleted — which is exactly what the
+    # (mkdir, canonicalize, prefix) while the one that decides whether a remove
+    # follows a lost copy is quietly deleted — which is exactly what the
     # mutation run demonstrated against the first cut of this arm.
-    cp_branch=$(awk '/if !out\.status\.success\(\)/{f=1} f{print} f&&/^        \}$/{exit}' <<< "$mig")
+    cp_branch=$(awk '/if !out\.Success\(\) \{/{f=1} f{print} f&&/^\t\t\}$/{exit}' <<< "$mig")
     if [ -z "$cp_branch" ]; then
       bad "A4 could not isolate the docker-cp failure branch — the arm examined nothing"
-    elif grep -q 'return Err(' <<< "$cp_branch"; then
-      ok "A4 a failed copy returns Err, so the caller never reaches the remove"
+    elif grep -q 'return nil, fmt.Errorf(' <<< "$cp_branch"; then
+      ok "A4 a failed copy returns an error, so the caller never reaches the remove"
     else
-      bad "A4 a failed copy does NOT return Err — the container is removed anyway and the data is gone"
+      bad "A4 a failed copy does NOT return an error — the container is removed anyway and the data is gone"
     fi
     # It must decline rather than merge into a directory that already holds data.
-    if grep -q 'read_dir' <<< "$mig"; then
-      ok "A4b migrate_unmounted_volumes refuses a non-empty destination"
+    if grep -qE 'dockerAppsDirIsEmpty\(hostDir\); ok && !empty \{' <<< "$mig"; then
+      ok "A4b DockerAppsMigrateUnmountedVolumes refuses a non-empty destination"
     else
-      bad "A4b migrate_unmounted_volumes would merge into an existing directory"
+      bad "A4b DockerAppsMigrateUnmountedVolumes would merge into an existing directory"
     fi
     # The prefix check must survive symlink resolution, as the deploy path's does.
-    if grep -q 'canonicalize' <<< "$mig" && grep -q 'starts_with' <<< "$mig"; then
-      ok "A4c migrate_unmounted_volumes re-checks the prefix AFTER canonicalizing"
+    l_canon=$(lineof "$mig" 'filepath[.]EvalSymlinks[(]')
+    l_pref=$(lineof "$mig" 'strings[.]HasPrefix[(]resolved,')
+    if [ -n "$l_canon" ] && [ -n "$l_pref" ] && [ "$l_canon" -lt "$l_pref" ]; then
+      ok "A4c DockerAppsMigrateUnmountedVolumes re-checks the prefix AFTER canonicalizing"
     else
-      bad "A4c migrate_unmounted_volumes does not re-check its prefix after canonicalizing"
+      bad "A4c DockerAppsMigrateUnmountedVolumes does not re-check its prefix after canonicalizing"
     fi
   fi
 
-  # A5 — the census that decides WHAT to migrate reads both mount spellings. A
-  # container may express a mount as Binds or as Mounts; keyed on one, this
-  # would re-migrate over a path the operator had already mounted the other way.
-  md=$(fnbody "$S" "mounted_destinations")
-  if [ -n "$md" ] && grep -q 'binds' <<< "$md" && grep -q 'mounts' <<< "$md"; then
-    ok "A5 mounted_destinations reads BOTH binds and mounts"
-  else
-    bad "A5 mounted_destinations is keyed on one mount spelling and is blind to the other"
-  fi
-
-  # A6 — only OUR containers. The migration writes to the host and must never
-  # touch a container the operator built themselves.
-  udv=$(fnbody "$S" "unmounted_declared_volumes")
-  if [ -n "$udv" ] && grep -q 'dockpanel.managed' <<< "$udv" && grep -q 'dockpanel.app.template' <<< "$udv"; then
-    ok "A6 unmounted_declared_volumes acts only on dockpanel-managed template apps"
-  else
-    bad "A6 unmounted_declared_volumes does not confine itself to managed template apps"
-  fi
+  # A5 retired: covered by TestAManagedContainerOutsideTheCatalogueStillDeclaresItsState (panel/go/internal/agent/services/docker_apps_test.go) — both Binds and Mounts spellings
+  # A6 retired: covered by TestAManagedContainerOutsideTheCatalogueStillDeclaresItsState (panel/go/internal/agent/services/docker_apps_test.go) — unmanaged and compose containers get nothing
 fi
 
 echo "== §B  blue-green never runs two writers against one mount =="
 
 if S=$(subj "$AGENT_SVC"); then
-  ua=$(fnbody "$S" "update_app")
+  ua=$(fnbody "$S" "DockerAppsUpdateApp")
   if [ -z "$ua" ]; then
-    bad "B0 update_app body is empty — §B examined nothing"
+    bad "B0 DockerAppsUpdateApp body is empty — §B examined nothing"
   else
-    l_guard=$(lineof "$ua" 'shares_persistent_state')
-    l_bg=$(lineof "$ua" 'blue_green_update[(]')
+    l_guard=$(lineof "$ua" 'DockerAppsSharesPersistentState')
+    l_bg=$(lineof "$ua" 'dockerAppsBlueGreenUpdate[(]')
     if [ -n "$l_guard" ] && [ -n "$l_bg" ] && [ "$l_guard" -lt "$l_bg" ]; then
-      ok "B1 update_app consults shares_persistent_state before blue-green"
+      ok "B1 DockerAppsUpdateApp consults DockerAppsSharesPersistentState before blue-green"
     else
-      bad "B1 update_app reaches blue-green without asking whether state is shared"
+      bad "B1 DockerAppsUpdateApp reaches blue-green without asking whether state is shared"
     fi
-    l_un=$(lineof "$ua" 'unmounted[.]is_empty[(][)]')
+    l_un=$(lineof "$ua" 'len[(]unmounted[)] > 0')
     if [ -n "$l_un" ] && [ -n "$l_bg" ] && [ "$l_un" -lt "$l_bg" ]; then
-      ok "B2 update_app declines blue-green when a migration is pending"
+      ok "B2 DockerAppsUpdateApp declines blue-green when a migration is pending"
     else
-      bad "B2 update_app could blue-green a container whose data still needs migrating"
+      bad "B2 DockerAppsUpdateApp could blue-green a container whose data still needs migrating"
     fi
   fi
-
-  sps=$(fnbody "$S" "shares_persistent_state")
-  if [ -z "$sps" ]; then
-    bad "B3 shares_persistent_state does not exist"
-  else
-    miss=""
-    for field in binds mounts volumes_from; do
-      grep -q "$field" <<< "$sps" || miss="$miss $field"
-    done
-    if [ -z "$miss" ]; then
-      ok "B3 shares_persistent_state reads all three sharing spellings"
-    else
-      bad "B3 shares_persistent_state ignores:$miss — a container sharing state that way still blue-greens"
-    fi
-  fi
+  # B3 retired: covered by TestPinAppDataPersistenceEverySharingSpellingCounts (panel/go/internal/agent/services/pin_app_data_persistence_test.go)
 fi
 
 echo "== §C  templates whose state lives in the container declare where =="
-
-if S=$(subj "$AGENT_SVC"); then
-  # The template block for one id, bounded by the next AppTemplateDef.
-  #
-  # ⚠ It now really is bounded by the next AppTemplateDef, which is what this
-  # comment always claimed. It used to end the block at the first line matching
-  # `},` — fine while every entry wrote its env_vars inline, and wrong the moment
-  # one spelled them as a multi-line array, because each EnvVarDef closes with
-  # exactly that line. Capture then stopped INSIDE env_vars and the arm reported
-  # that the template did not declare a volume it declares four lines further
-  # down: a false RED, on correct code, from a template merely being reformatted.
-  # Lesson #172's shape — a delimiter guessed from today's formatting is not a
-  # declaration boundary.
-  tmpl() {
-    awk -v id="\"$1\"," '
-      /AppTemplateDef \{/ { if (cap && want) { print buf; exit } buf=""; cap=1; want=0 }
-      cap { buf = buf $0 "\n"; if ($0 ~ "id: " id) want=1 }
-      END { if (cap && want) print buf }
-    ' <<< "$S"
-  }
-  # The `volumes:` array ONLY — never the whole template block.
-  #
-  # ⚠ This arm used to grep the block, and that made it unfalsifiable the moment
-  # a template mentioned its own data path anywhere else in its own declaration.
-  # Ghost now carries `/var/lib/ghost/content/data/ghost.db` as the default of a
-  # SQLite filename field, which contains the volume path as a substring — so
-  # deleting the volume outright left this arm GREEN. Caught by mutating the
-  # catalogue and watching the arm fail to notice (lesson #144: a check that
-  # cannot go red is not a check).
-  vols_of() {
-    awk '/volumes:[[:space:]]*&\[/ { cap=1 }
-         cap { buf = buf $0 "\n" }
-         cap && /\],[[:space:]]*$/ { print buf; exit }' <<< "$1"
-  }
-
-  # id -> the path its data actually lives at, established upstream.
-  while IFS='|' read -r id path; do
-    [ -n "$id" ] || continue
-    blk=$(tmpl "$id")
-    vols=$(vols_of "$blk")
-    if [ -z "$blk" ]; then
-      bad "C1 template '$id' not found in the catalogue"
-    elif [ -z "$vols" ]; then
-      bad "C1 $id — could not isolate a volumes: array, the arm examined nothing"
-    elif grep -qF "$path" <<< "$vols"; then
-      ok "C1 $id declares $path"
-    else
-      bad "C1 $id does NOT declare $path — a recreate loses its data (#110)"
-    fi
-  done <<'EOF'
-n8n|/home/node/.n8n
-ghost|/var/lib/ghost/content
-redis|/data
-searxng|/etc/searxng
-activepieces|/root/.activepieces
-EOF
-
-  # C2 — n8n's basic-auth pair is GONE. n8n removed basic auth in 1.0 and the
-  # template pins :1, so the deploy form was offering an "Admin Password" that
-  # protected nothing. A retired name needs a census of the CONCEPT, not of one
-  # spelling — check the catalogue as a whole, not just n8n's own block.
-  n_ba=$(grep -c 'N8N_BASIC_AUTH' <<< "$S")
-  if [ "$n_ba" -eq 0 ]; then
-    ok "C2 the inert N8N_BASIC_AUTH_* fields are gone from the catalogue"
-  else
-    bad "C2 $n_ba N8N_BASIC_AUTH_* reference(s) remain — the form promises auth the image ignores"
-  fi
-
-  # C3 — BOTH HALVES OR NEITHER. Activepieces defaults to external Postgres and
-  # Redis, so without the embedded pair it cannot start and the volume beneath it
-  # is inert. Shipping the volume alone would look like a fix and do nothing.
-  ap=$(tmpl "activepieces")
-  if [ -n "$ap" ] && grep -q 'PGLITE' <<< "$ap" && grep -q 'MEMORY' <<< "$ap"; then
-    ok "C3 activepieces ships the embedded DB/queue that make its volume meaningful"
-  else
-    bad "C3 activepieces declares a volume but still targets an external DB/queue it has none of"
-  fi
-fi
+# C1 retired: covered by TestPinAppDataPersistenceStatefulTemplatesDeclareTheirVolume (panel/go/internal/agent/services/pin_app_data_persistence_test.go)
+# C2 retired: covered by TestPinAppDataPersistenceCatalogueEnvShape (panel/go/internal/agent/services/pin_app_data_persistence_test.go)
+# C3 retired: covered by TestPinAppDataPersistenceCatalogueEnvShape (panel/go/internal/agent/services/pin_app_data_persistence_test.go)
 
 echo "== §D  the verbs that do real work are long ones =="
 
@@ -407,25 +301,24 @@ if B=$(subj "$BE_APPS"); then
   # that as "no short-verb dispatches found" and printed GREEN. An extraction that
   # failed and an extraction that found nothing are indistinguishable unless you
   # prove the instrument can still find something (lessons #461, #473).
-  ctl=$(grep -cE '\.(post|put|post_long|put_long)\(' <<< "$B")
+  ctl=$(grep -cE '\.(Post|Put|PostLong|PutLong)\(' <<< "$B")
   if [ "${ctl:-0}" -lt 5 ]; then
     bad "D1-control matched only ${ctl:-0} agent dispatches in the apps route — the grep is broken, every §D verdict below is void"
   else
     ok "D1-control the dispatch grep matches $ctl call sites, so an empty result below means absence"
-    # Census the HANDLERS, not the call text. The /update dispatch builds its path
-    # into `agent_path` first, so a pattern keyed on a literal "/apps/.../update"
-    # at the call site matches nothing there and passes for the wrong reason.
-    handlers=$(fns_matching "$B" '/apps/[{][^}]*[}]/(update|env|change-image)')
+    # Census the HANDLERS, not the call text: Go builds each path inline as
+    # "/apps/"+cid+"/<verb>".
+    handlers=$(fns_matching "$B" '"/apps/"[+][a-zA-Z]+[+]"/(update|env|change-image)')
     n_h=$(grep -c . <<< "$handlers")
     # Written-down exemptions, each verified against the agent it dispatches to:
-    #   app_env       — GET /apps/{id}/env. Reads, never recreates.
-    #   update_limits — POST /apps/{id}/update-limits, which the agent serves with
-    #                   `docker update`: an in-place change to cgroup limits on the
-    #                   RUNNING container. Nothing is removed, so nothing is lost.
+    #   rtDockerAppsAppEnv       — GET /apps/{id}/env. Reads, never recreates.
+    #   rtDockerAppsUpdateLimits — POST /apps/{id}/update-limits, which the agent
+    #                   serves with `docker update`: an in-place change to cgroup
+    #                   limits on the RUNNING container. Nothing is removed.
     # The name-match is deliberately loose (it catches "update-limits" on the word
     # "update"), and an exemption is the honest way to narrow it — a tighter regex
     # would have hidden these two rather than adjudicating them.
-    D_EXEMPT="app_env update_limits"
+    D_EXEMPT="rtDockerAppsAppEnv rtDockerAppsUpdateLimits"
     d_bad=0
     if [ "$n_h" -lt 3 ]; then
       bad "D1 enumerated only $n_h handlers — implausibly few, the census is broken"
@@ -442,11 +335,11 @@ if B=$(subj "$BE_APPS"); then
         if [ -z "$hb" ]; then
           bad "D1 $h — empty body, the arm examined nothing"; d_bad=1; continue
         fi
-        if grep -qE 'agent\s*$|agent\.(post|put)\(' <<< "$(grep -E '\.(post|put)\(' <<< "$hb")"; then
+        if grep -qE 'agent\.(Post|Put)\([^,]*"/apps/"' <<< "$hb"; then
           bad "D1 $h dispatches a container recreate on the SHORT verb"
           d_bad=1
         fi
-        if ! grep -qE '\.(post_long|put_long)\(' <<< "$hb"; then
+        if ! grep -qE '\.(PostLong|PutLong)\(' <<< "$hb"; then
           bad "D1 $h has no long-verb dispatch at all"
           d_bad=1
         fi
@@ -455,7 +348,7 @@ if B=$(subj "$BE_APPS"); then
     [ "$d_bad" -eq 0 ] && ok "D1 all three app-recreate dispatches use a long verb"
   fi
 
-  n_long=$(grep -cE '\.(post_long|put_long)\(' <<< "$B")
+  n_long=$(grep -cE '\.(PostLong|PutLong)\(' <<< "$B")
   if [ "$n_long" -ge 3 ]; then
     ok "D1b $n_long long-verb dispatches present in the apps route"
   else
@@ -465,39 +358,33 @@ fi
 
 if M=$(subj "$BE_MAIL"); then
   # A census of the INSTALLERS, keyed on what they do rather than on a list.
-  short=$(grep -nE '\.post\("/mail/(install|uninstall|rspamd/install|webmail/install)"' <<< "$M")
+  short=$(grep -nE '\.Post\([^,]+, "/mail/(install|uninstall|rspamd/install|webmail/install)"' <<< "$M")
   if [ -z "$short" ]; then
     ok "D2 no mail installer is dispatched on the 60s verb"
   else
     bad "D2 mail installer(s) still on the short verb: $(tr -s ' ' <<< "$short" | head -4)"
   fi
-  n_ml=$(grep -cE '\.post_long\("/mail/(install|uninstall|rspamd/install|webmail/install)"' <<< "$M")
+  n_ml=$(grep -cE '\.PostLong\([^,]+, "/mail/(install|uninstall|rspamd/install|webmail/install)"' <<< "$M")
   if [ "$n_ml" -eq 4 ]; then
-    ok "D2b all four mail installers use post_long"
+    ok "D2b all four mail installers use PostLong"
   else
-    bad "D2b $n_ml of 4 mail installers use post_long"
+    bad "D2b $n_ml of 4 mail installers use PostLong"
   fi
 fi
 
 if Y=$(subj "$BE_SYS"); then
-  if grep -q 'post("/services/install/powerdns"' <<< "$Y"; then
+  if grep -qE '\.Post\([^,]+, "/services/install/powerdns"' <<< "$Y"; then
     bad "D3 the PowerDNS installer is still on the 60s verb"
+  elif grep -qE '\.PostLong\([^,]+, "/services/install/powerdns"' <<< "$Y"; then
+    ok "D3 the PowerDNS installer is dispatched on the long verb"
   else
-    ok "D3 the PowerDNS installer is not on the short verb"
+    bad "D3 no PowerDNS install dispatch found at all — the absence above would be vacuous"
   fi
 fi
 
-if G=$(subj "$BE_AGENT"); then
-  # put_long has to exist on every client, or the apps route cannot compile
-  # against one of them — and a missing arm here is how that silently regresses
-  # into "put with a comment about timeouts".
-  n_pl=$(grep -c 'async fn put_long' <<< "$G")
-  if [ "$n_pl" -eq 3 ]; then
-    ok "D4 put_long is implemented on all three agent clients"
-  else
-    bad "D4 put_long exists on $n_pl of 3 agent clients"
-  fi
-fi
+# D4 retired (obsolete in Go): PutLong is a method of the AgentHandle interface
+# (panel/go/internal/api/svc_agent.go), so the compiler refuses any agent client
+# that lacks it — the per-client count this arm kept is now a type check.
 
 echo "== §E  the mail banner names the term that is actually false =="
 

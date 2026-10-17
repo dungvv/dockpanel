@@ -3,8 +3,9 @@
 # vars are filled in from the domain the operator claimed, and the Apps env
 # editor can compose an arbitrary key.
 #
-# The DERIVATION itself is covered by mutation-proved Rust unit tests in
-# panel/agent/src/services/docker_apps.rs. This suite pins the things a unit
+# The DERIVATION itself is covered by unit tests in
+# panel/go/internal/agent/services/docker_apps_test.go (ported from the
+# mutation-proved Rust ones). This suite pins the things a unit
 # test cannot reach: the frontend affordance, the entry gate, the validation
 # parity on the door the new affordance makes reachable, and the both-ends
 # payload contract between the React client and the agent DTO (the client cast
@@ -22,9 +23,9 @@ eq()   { [ "$2" = "$3" ] && ok "$1" || bad "$1" "expected '$3', got '$2'"; }
 G=/usr/bin/grep
 
 APPS=panel/frontend/src/pages/Apps.tsx
-AGENT=panel/agent/src/services/docker_apps.rs
-AGENT_ROUTES=panel/agent/src/routes/docker_apps.rs
-API=panel/backend/src/routes/docker_apps.rs
+AGENT=panel/go/internal/agent/services/docker_apps.go
+AGENT_ROUTES=panel/go/internal/agent/routes/docker_apps.go
+API=panel/go/internal/api/rt_docker_apps.go
 
 for f in "$APPS" "$AGENT" "$AGENT_ROUTES" "$API"; do
   [ -f "$f" ] || { bad "SETUP" "$f missing"; exit 1; }
@@ -34,51 +35,34 @@ echo "── A. The catalogue mechanism ─────────────�
 
 # A1 is an ENUMERATION arm, so it asserts its own subject list first: a census
 # that silently reads zero rows prints green (lesson #143).
-# Matches the tuple opener at top-level indent in BOTH shapes rustfmt produces —
-# inline `("ghost", &[...])` and the split form whose id is on the next line.
-# Inner pairs are indented deeper, so they cannot inflate this.
-ENTRIES=$($G -c '^    (' <<<"$(sed -n '/^static TEMPLATE_DOMAIN_ENV/,/^];/p' "$AGENT")")
-[ "${ENTRIES:-0}" -ge 6 ] && ok "A1 TEMPLATE_DOMAIN_ENV enumerates $ENTRIES templates" \
+# Each gofmt'd entry opens with `{"<id>", []dockerAppsDomainVar{` at one tab;
+# the inner pairs are indented deeper, so they cannot inflate this.
+ENTRIES=$($G -cE '^	\{"[a-z0-9-]+", \[\]dockerAppsDomainVar\{' <<<"$(sed -n '/^var dockerAppsTemplateDomainEnv /,/^}/p' "$AGENT")")
+[ "${ENTRIES:-0}" -ge 6 ] && ok "A1 dockerAppsTemplateDomainEnv enumerates $ENTRIES templates" \
   || bad "A1" "expected >=6 keyed templates, extracted $ENTRIES — the window read nothing"
 
-# A2: n8n is the reason the derived-append loop exists. If its row ever declares
-# env vars, the vars stop flowing through that branch and the unit test that
-# asserts the branch would be testing a path production no longer takes.
-N8N_EMPTY=$(sed -n '/^        id: "n8n",$/,/^    },$/p' "$AGENT" | $G -c 'env_vars: &\[\],')
-eq "A2 n8n still declares no catalogue env vars" "$N8N_EMPTY" "1"
-
-# A3: the four names n8n needs, each present exactly once in the keyed list.
-for v in N8N_HOST N8N_PROTOCOL WEBHOOK_URL N8N_PROXY_HOPS; do
-  N=$(sed -n '/^static TEMPLATE_DOMAIN_ENV/,/^];/p' "$AGENT" | $G -c "\"$v\"")
-  eq "A3 $v keyed once" "$N" "1"
-done
-
-# A4: a derived value must never carry the container port — through nginx the
-# public URL has none, and shipping one recreates the very defect being fixed.
-PORTED=$(sed -n '/^fn domain_env_for/,/^}/p' "$AGENT" | $G -cE 'https://\{domain\}:[0-9]')
-eq "A4 no derived URL template carries a port" "$PORTED" "0"
-# POSITIVE CONTROL for A4: the same shape must match a real ported literal
-# elsewhere, or the zero above proves only that the pattern never runs.
-CTL=$($G -cE 'http://localhost:[0-9]+' "$AGENT")
-[ "$CTL" -gt 0 ] && ok "A4-control ported-URL pattern matches $CTL real literals" \
-  || bad "A4-control" "pattern matched nothing anywhere — A4's zero is vacuous"
+# A2 retired: covered by TestN8nGetsAllFourOfItsURLVarsFromTheClaimedDomain (panel/go/internal/agent/services/docker_apps_test.go)
+# A3 retired: covered by TestN8nGetsAllFourOfItsURLVarsFromTheClaimedDomain (panel/go/internal/agent/services/docker_apps_test.go)
+# A4 retired: covered by TestADerivedURLNeverCarriesTheContainerPort (panel/go/internal/agent/services/docker_apps_test.go)
+# A4-control retired: covered by TestADerivedURLNeverCarriesTheContainerPort (panel/go/internal/agent/services/docker_apps_test.go) — the test evaluates every derived value, so it cannot be vacuous
 
 echo "── B. The deploy path actually consults it ────────────────────────────"
 
+DEPLOY_FN=$(sed -n '/^func DockerAppsDeployApp(/,/^}/p' "$AGENT")
 # B1: severed-pair guard. A keyed list nothing reads is the
 # GPU_RECOMMENDED_TEMPLATES / stable-diffusion-webui shape, which sat unnoticed
 # for 19 releases.
-eq "B1 deploy_app derives from the claimed domain" \
-   "$(sed -n '/^pub async fn deploy_app/,/^}/p' "$AGENT" | $G -c 'domain_env_for')" "1"
+eq "B1 DockerAppsDeployApp derives from the claimed domain" \
+   "$($G -c 'dockerAppsDomainEnvFor(' <<<"$DEPLOY_FN")" "1"
 
-# B2: the merge helper is reached by deploy_app rather than orphaned by a later
+# B2: the merge helper is reached by the deploy rather than orphaned by a later
 # refactor (the #150 shape — extracting a helper moves the subject).
-eq "B2 deploy_app builds its env through the merge helper" \
-   "$(sed -n '/^pub async fn deploy_app/,/^}/p' "$AGENT" | $G -c 'merge_deploy_env(')" "1"
+eq "B2 DockerAppsDeployApp builds its env through the merge helper" \
+   "$($G -c 'dockerAppsMergeDeployEnv(' <<<"$DEPLOY_FN")" "1"
 
 # B3: the flag the deploy form reads is emitted by the converter.
 eq "B3 the serialized template carries the derived flag" \
-   "$($G -c 'domain_derived: is_domain_derived(' "$AGENT")" "1"
+   "$($G -cE 'DomainDerived: +dockerAppsIsDomainDerived\(' "$AGENT")" "1"
 
 echo "── C. The editor can compose a key (the actual #111 gap) ──────────────"
 
@@ -117,7 +101,7 @@ echo "── D. Validation parity on the door this makes reachable ────�
 # D1..D3: the PUT /env door had none of these until the editor could compose an
 # arbitrary key. Asserted on the handler's own body, not the file, so the
 # deploy door's identical checks cannot satisfy them.
-ENVFN=$(sed -n '/^pub async fn update_env(/,/^}/p' "$API")
+ENVFN=$(sed -n '/^func rtDockerAppsUpdateEnv(/,/^}/p' "$API")
 eq "D1 PUT /env caps the variable count"  "$($G -c 'Too many environment variables' <<<"$ENVFN")" "1"
 eq "D2 PUT /env caps the value size"      "$($G -c 'Environment variable value too large' <<<"$ENVFN")" "1"
 eq "D3 PUT /env refuses a name with '='"  "$($G -c "may not contain" <<<"$ENVFN")" "1"
@@ -125,11 +109,11 @@ eq "D3 PUT /env refuses a name with '='"  "$($G -c "may not contain" <<<"$ENVFN"
 echo "── E. Both-ends payload contract ──────────────────────────────────────"
 
 # The client casts the response and posts a bare object, so neither tsc nor
-# serde catches a key rename on either side. Pin the wire name at both ends.
+# encoding/json catches a key rename on either side. Pin the wire name at both ends.
 eq "E1 client posts the env under its wire name" \
    "$($G -c 'api\.put(`/apps/\${envTarget}/env`, { env: payload })' "$APPS")" "1"
 eq "E2 agent DTO reads the same wire name" \
-   "$(sed -n '/^struct UpdateEnvRequest/,/^}/p' "$AGENT_ROUTES" | $G -c 'env: HashMap<String, String>')" "1"
+   "$(sed -n '/^func dockerAppsUpdateEnv(/,/^}/p' "$AGENT_ROUTES" | $G -cE 'Env +map\[string\]string +`json:"env"`')" "1"
 
 echo
 echo "PASS $PASS · FAIL $FAIL"

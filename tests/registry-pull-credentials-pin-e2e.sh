@@ -13,7 +13,8 @@
 # immediately after a successful login.
 #
 # Fix: `list_registries` reads `DOCKER_CONFIG_DIR`; a new
-# `registry_credentials_for(image)` helper (services/docker_apps.rs) looks up
+# `registry_credentials_for(image)` helper (now
+# panel/go/internal/agent/services/docker_apps.go DockerAppsRegistryCredentialsFor) looks up
 # saved credentials by the image's parsed registry and is wired into all 4
 # production `create_image` call sites (3 in docker_apps.rs, 1 in
 # compose.rs). A 5th `create_image` call exists only in a `#[cfg(test)]`
@@ -39,27 +40,28 @@ code() {
   [ -f "$1" ] || return 0
   perl -0777 -pe '
     s{^[ \t]*/\*.*?\*/[ \t]*$}{}gms;
-    s{^\s*//.*$}{}gm;
-    s{^\s*///.*$}{}gm;
+    s{^[ \t]*//.*$}{}gm;
+    s{[ \t]+//[^"`\n]*$}{}gm;
   ' "$1"
 }
 has()  { grep -qE -- "$2" <<< "$1"; }
 flat() { tr '\n' ' ' <<< "$1" | tr -s ' '; }
 
+# One Go func (or method) body, bounded by its own closing `}` at column 0.
 fnbody() {
   awk -v fn="$2" '
-    index($0, "fn " fn "(") && !started { started=1 }
-    started {
-      n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
-      if (opened || n>0) opened=1
-      if (opened && depth<=0) exit
+    !started && (index($0, "func " fn "(") == 1 || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) {
+      started=1; print
+      o=gsub(/\{/,"{"); c=gsub(/\}/,"}"); if (o>0 && o==c) exit
+      next
     }
+    started { print; if ($0 == "}") exit }
   ' <<< "$1"
 }
 
-SERVICES=panel/agent/src/services/docker_apps.rs
-ROUTES=panel/agent/src/routes/docker_apps.rs
-COMPOSE=panel/agent/src/services/compose.rs
+SERVICES=panel/go/internal/agent/services/docker_apps.go
+ROUTES=panel/go/internal/agent/routes/docker_apps.go
+COMPOSE=panel/go/internal/agent/services/compose.go
 for f in "$SERVICES" "$ROUTES" "$COMPOSE"; do
   [ -f "$f" ] || { bad "SETUP subject missing: $f"; exit 1; }
 done
@@ -68,60 +70,64 @@ ROUTES_SRC=$(code "$ROUTES")
 
 # ── §A list_registries reads the config DOCKER_CONFIG actually points at ────
 
-LISTREG=$(flat "$(fnbody "$ROUTES_SRC" "list_registries")")
+LISTREG=$(flat "$(fnbody "$ROUTES_SRC" "dockerAppsListRegistries")")
 if [ -z "$LISTREG" ]; then
-  bad "A0 could not extract list_registries"
-elif has "$LISTREG" 'DOCKER_CONFIG_DIR'; then
-  ok "A1 list_registries reads crate::safe_cmd::DOCKER_CONFIG_DIR, not a hardcoded /root path"
+  bad "A0 could not extract dockerAppsListRegistries"
+elif has "$LISTREG" 'safecmd\.DockerConfigDir'; then
+  ok "A1 dockerAppsListRegistries reads safecmd.DockerConfigDir, not a hardcoded /root path"
 else
-  bad "A1 list_registries still reads a path other than DOCKER_CONFIG_DIR — logins land somewhere this route never looks"
+  bad "A1 dockerAppsListRegistries still reads a path other than safecmd.DockerConfigDir — logins land somewhere this route never looks"
 fi
 
-# ── §B registry_credentials_for exists and is reachable outside this module ─
+# ── §B DockerAppsRegistryCredentialsFor exists and is reachable outside this file ─
 
-RCF=$(flat "$(fnbody "$SERVICES_SRC" "registry_credentials_for")")
+RCF=$(flat "$(fnbody "$SERVICES_SRC" "DockerAppsRegistryCredentialsFor")")
 if [ -z "$RCF" ]; then
-  bad "B0 could not extract registry_credentials_for"
+  bad "B0 could not extract DockerAppsRegistryCredentialsFor"
 else
-  ok "B0 registry_credentials_for extracted"
-  if has "$RCF" 'DOCKER_CONFIG_DIR' && has "$RCF" 'auths'; then
-    ok "B1 registry_credentials_for reads DOCKER_CONFIG_DIR's config.json auths map"
+  ok "B0 DockerAppsRegistryCredentialsFor extracted"
+  if has "$RCF" 'safecmd\.DockerConfigDir' && has "$RCF" 'json:"auths"'; then
+    ok "B1 DockerAppsRegistryCredentialsFor reads safecmd.DockerConfigDir's config.json auths map"
   else
-    bad "B1 registry_credentials_for doesn't read the same auths map docker login writes"
+    bad "B1 DockerAppsRegistryCredentialsFor doesn't read the same auths map docker login writes"
   fi
 fi
-if grep -qE 'pub\(crate\) fn registry_credentials_for' "$SERVICES"; then
-  ok "B2 registry_credentials_for is pub(crate) — reachable from compose.rs"
+# B2 retired (obsolete in Go): pub(crate) visibility has no Go analogue — the
+# helper is an exported identifier and compose.go calling it (C3) only
+# compiles because it is.
+
+# ── §C every production pull passes real credentials ───────────────────────
+# Go wraps bollard's create_image as DockerAppsPullImage(ctx, docker, image,
+# creds); docker.ImagePull is called only inside that wrapper. Test code lives
+# in _test.go files, so the whole file is production code.
+
+PULL_DEFS=$(grep -c '^func DockerAppsPullImage(' <<< "$SERVICES_SRC")
+RAW_PULLS=$(grep -c 'docker\.ImagePull(' <<< "$SERVICES_SRC")
+if [ "$PULL_DEFS" -eq 1 ] && [ "$RAW_PULLS" -eq 1 ]; then
+  ok "C0 docker.ImagePull is reached in docker_apps.go only through DockerAppsPullImage"
 else
-  bad "B2 registry_credentials_for is not pub(crate) — compose.rs cannot call it"
+  bad "C0 docker_apps.go has $RAW_PULLS direct docker.ImagePull call(s) / $PULL_DEFS wrapper definition(s), expected 1/1 — a pull bypasses the credentials parameter"
 fi
-
-# ── §C every production create_image site passes real credentials ──────────
-# Scoped to code before the first #[cfg(test)] module — a test-only pull of a
-# public image needs no credentials and must not inflate this count.
-
-PROD_SERVICES=$(awk '/^#\[cfg\(test\)\]/{exit} {print}' "$SERVICES")
-CI_COUNT=$(grep -c 'create_image(' <<< "$PROD_SERVICES")
-RCF_COUNT=$(grep -c 'registry_credentials_for(' <<< "$PROD_SERVICES")
-# 3 create_image call sites in docker_apps.rs; registry_credentials_for
-# appears once as its own definition plus once per call site = 4.
+SITES=$(grep -E 'DockerAppsPullImage\(' <<< "$SERVICES_SRC" | grep -v '^func ')
+CI_COUNT=$(grep -c . <<< "$SITES")
+WIRED=$(grep -c 'DockerAppsRegistryCredentialsFor(' <<< "$SITES")
 if [ "$CI_COUNT" -eq 3 ]; then
-  ok "C1 docker_apps.rs has 3 production create_image sites (test-only probe excluded)"
+  ok "C1 docker_apps.go has 3 production pull sites"
 else
-  bad "C1 docker_apps.rs has $CI_COUNT production create_image sites, expected 3 — this suite's count needs updating"
+  bad "C1 docker_apps.go has $CI_COUNT production pull sites, expected 3 — this suite's count needs updating"
 fi
-if [ "$RCF_COUNT" -eq 4 ]; then
-  ok "C2 registry_credentials_for appears 4 times (1 definition + 3 call sites) — every production pull is wired"
+if [ "$CI_COUNT" -gt 0 ] && [ "$WIRED" -eq "$CI_COUNT" ]; then
+  ok "C2 every one of the $CI_COUNT pull sites passes DockerAppsRegistryCredentialsFor"
 else
-  bad "C2 registry_credentials_for appears $RCF_COUNT times, expected 4 — a create_image site still passes None"
+  bad "C2 only $WIRED of $CI_COUNT pull sites pass DockerAppsRegistryCredentialsFor — a pull still passes nil"
 fi
 
 COMPOSE_SRC=$(code "$COMPOSE")
-DEPLOY_SVC=$(flat "$(fnbody "$COMPOSE_SRC" "deploy_service")")
-if has "$DEPLOY_SVC" 'registry_credentials_for'; then
-  ok "C3 compose.rs deploy_service passes registry_credentials_for, not None"
+DEPLOY_SVC=$(flat "$(fnbody "$COMPOSE_SRC" "composeDeployService")")
+if has "$DEPLOY_SVC" 'DockerAppsPullImage\([^)]*DockerAppsRegistryCredentialsFor'; then
+  ok "C3 compose.go composeDeployService passes DockerAppsRegistryCredentialsFor, not nil"
 else
-  bad "C3 compose.rs deploy_service still pulls with credentials: None"
+  bad "C3 compose.go composeDeployService still pulls with nil credentials"
 fi
 
 echo
