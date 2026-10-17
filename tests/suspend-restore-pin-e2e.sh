@@ -43,12 +43,14 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-HELPERS=panel/backend/src/helpers.rs
-USERS=panel/backend/src/routes/users.rs
-AUTH=panel/backend/src/routes/auth.rs
-WHMCS=panel/backend/src/routes/whmcs.rs
-MODELS=panel/backend/src/models.rs
-MIGDIR=panel/backend/migrations
+# The Go port (panel/go/internal/api, one flat package) is what ships.
+API=panel/go/internal/api
+HELPERS=$API/core_helpers.go
+USERS=$API/rt_users.go
+AUTH=$API/rt_auth.go
+WHMCS=$API/rt_whmcs.go
+MODELS=$API/core_models.go
+MIGDIR=$API/migrations
 
 for f in "$HELPERS" "$USERS" "$AUTH" "$WHMCS" "$MODELS"; do
   [ -f "$f" ] || bad "MISSING SUBJECT FILE: $f"
@@ -92,7 +94,7 @@ sqlcode() { perl -pe 's{--.*$}{}' "$1"; }
 # the prose that NARRATES a call exactly as readily as the call itself. Four arms
 # in the first draft of this suite used `grep -rl` directly, and E1 stayed green
 # with every helper call deleted from `users.rs` because two doc comments there
-# still spelled `helpers::suspend_account`. This suite built a comment stripper
+# still spelled the helper's name. This suite built a comment stripper
 # and then did not use it — `feedback_source_pin_prose_trap`, inside the file
 # written to avoid it. Every census below strips first.
 files_matching() {
@@ -105,7 +107,8 @@ files_matching() {
   printf '%s' "$out"
 }
 
-BACKEND_RS=$(find panel/backend/src -name '*.rs' | sort)
+# Production sources only: Go tests live in separate _test.go files.
+BACKEND_RS=$(find "$API" -maxdepth 1 -name '*.go' ! -name '*_test.go' | sort)
 
 # One function's body, bounded by its OWN closing brace — a `}` in column 0 —
 # and never by a comment or a fixed line offset.
@@ -142,7 +145,7 @@ fi
 # A2 — THE BOOT ARM. `role` is varchar(20); `reset_token` is varchar(255) and
 # holds a 64-char SHA-256 digest. An unguarded `prior_role = reset_token` fails
 # with "value too long for type character varying(20)" on any install carrying a
-# live or stale reset hash — and `sqlx::migrate!` runs at startup, so a failed
+# live or stale reset hash — and the migrator runs at startup, so a failed
 # migration is a panel that does not come up. The guard is also what stops the
 # migration GUESSING a role for a row whose stash was already destroyed, which is
 # the defect it exists to remove.
@@ -153,10 +156,10 @@ elif ! has "$(sqlcode "$MIG")" 'prior_role[[:space:]]*=[[:space:]]*reset_token';
 elif has "$(sqlcode "$MIG")" "reset_token IN \\('admin', 'reseller', 'user', 'client'\\)"; then
   ok "A2 the backfill copies only exact role values — a 64-char token cannot overflow varchar(20), and a destroyed stash is left NULL rather than guessed"
 else
-  bad "A2 the backfill copies reset_token unguarded — it will exceed varchar(20) on any install holding a reset hash, and sqlx::migrate! runs at startup"
+  bad "A2 the backfill copies reset_token unguarded — it will exceed varchar(20) on any install holding a reset hash, and migrations run at startup"
 fi
 
-# A3 — `prior_role` must NOT join `models::User`. That struct derives FromRow and
+# A3 — `prior_role` must NOT join the User model (core_models.go). That struct is scanned and
 # is loaded with `SELECT *` by the queries that authenticate a login; a database
 # restored from a snapshot older than the migration would then fail EVERY login
 # rather than degrading the one endpoint that reads the stash.
@@ -167,9 +170,9 @@ elif [ -z "$MIG" ]; then
   # ONLY arm green at the previous tag, which is precisely the tell.
   : # already reported by A1
 elif has "$MODELS_S" 'prior_role'; then
-  bad "A3 prior_role is a field on models::User — a pre-migration schema would break every SELECT * login query, not just the restore"
+  bad "A3 prior_role is a field on the User model — a pre-migration schema would break every SELECT * login query, not just the restore"
 else
-  ok "A3 prior_role is read by a narrow SELECT, never through models::User"
+  ok "A3 prior_role is read by a narrow SELECT, never through the User model"
 fi
 
 echo "§B  nothing but the password-reset flow writes reset_token"
@@ -182,26 +185,27 @@ echo "§B  nothing but the password-reset flow writes reset_token"
 # code that was deleted, which is the lesson-#237 trap this suite's own header
 # warns about, in the arm the header calls the headline. `users.rs` has no
 # business naming the password-reset column at all, in any statement, in any
-# order, so that is what is asserted.
+# order, so that is what is asserted. (rt_users.go's comments discuss the old
+# column; they are stripped.)
 if [ -z "$USERS_S" ]; then
   bad "B1 could not read $USERS"
 elif has "$USERS_S" 'reset_token'; then
-  bad "B1 users.rs mentions reset_token again — the suspend stash is back in the password-reset column"
+  bad "B1 rt_users.go mentions reset_token again — the suspend stash is back in the password-reset column"
 else
-  ok "B1 users.rs never touches reset_token"
+  ok "B1 rt_users.go never touches reset_token"
 fi
 
 # B2 — the same absence over the WHOLE backend, so a copy in a module nobody
-# thought of is caught too. Only `auth.rs` (the reset flow) and `models.rs` (the
-# struct field) may name it. Stripped, so a comment discussing the old design
+# thought of is caught too. Only `rt_auth.go` (the reset flow) and
+# `core_models.go` (the struct field) may name it. Stripped, so a comment discussing the old design
 # does not count as a writer; and the total is printed so a grep that found
 # nothing cannot be mistaken for a subsystem that is clean.
 RT_FILES=$(files_matching 'reset_token' $BACKEND_RS)
 RT_TOTAL=$(echo "$BACKEND_RS" | wc -l)
 if [ "$RT_TOTAL" -lt 10 ]; then
   bad "B2 only ${RT_TOTAL} backend source files found — this arm is measuring nothing"
-elif [ "$RT_FILES" = "panel/backend/src/models.rs panel/backend/src/routes/auth.rs " ]; then
-  ok "B2 across ${RT_TOTAL} backend files, reset_token is named only by auth.rs and models.rs"
+elif [ "$RT_FILES" = "$API/core_models.go $API/rt_auth.go " ]; then
+  ok "B2 across ${RT_TOTAL} backend files, reset_token is named only by rt_auth.go and core_models.go"
 else
   bad "B2 reset_token is named outside the password-reset flow: ${RT_FILES:-<none>}"
 fi
@@ -216,46 +220,29 @@ echo "§C  the restore never invents a role"
 # (`helpers::role_to_restore`) precisely so it can be both pinned and unit-tested
 # — the async DB-bound wrapper can be neither.
 
-RTR=$(fn_body '^pub fn role_to_restore' "$HELPERS_S")
-UNSUS=$(fn_body '^pub async fn unsuspend_account' "$HELPERS_S")
+# (Rust helpers::role_to_restore → Go roleToRestore, unsuspend_account →
+# unsuspendAccount, suspend_account → suspendAccount.)
+UNSUS=$(fn_body '^func unsuspendAccount[(]' "$HELPERS_S")
 
-# C1 — THE ARM. No branch anywhere in the decision may produce a role the caller
-# did not record. Any `unwrap_or`/`unwrap_or_else`/`unwrap_or_default` here is a
-# default, and a default is a guess.
-if [ -z "$RTR" ]; then
-  bad "C1 could not extract role_to_restore — this arm is measuring nothing"
-elif ! has "$RTR" 'stashed'; then
-  bad "C1 the extracted window is not role_to_restore — this arm is measuring nothing"
-elif has "$RTR" 'unwrap_or'; then
-  bad "C1 the restore decision has a default — an unknown prior role would be GUESSED, which is the defect this suite exists to prevent"
-elif has "$RTR" '"(user|admin|reseller|client)"'; then
-  bad "C1 the restore decision names a role literal — it must only ever return what was recorded"
-else
-  ok "C1 the restore decision has no default and names no role literal — an unknown stash cannot be guessed"
-fi
+# C1 retired: covered by TestUnknownPriorRoleIsNeverGuessed and
+# TestEveryRecordedRoleComesBackAsItself (panel/go/internal/api/core_helpers_test.go)
+# — a default or a role literal in roleToRestore fails one of them.
 
-# C2 — the decision is actually the one the caller uses. C1 could be pinning a
-# pure function nothing calls.
+# C2 — the decision is actually the one the caller uses. The tests could be
+# pinning a pure function nothing calls.
 if [ -z "$UNSUS" ]; then
-  bad "C2 could not extract unsuspend_account — this arm is measuring nothing"
-elif ! has "$UNSUS" 'role_to_restore\('; then
-  bad "C2 unsuspend_account does not use role_to_restore — the pinned decision is dead code and the live one is unpinned"
-elif has "$UNSUS" 'unwrap_or'; then
-  bad "C2 unsuspend_account applies a default of its own, bypassing the pinned decision"
+  bad "C2 could not extract unsuspendAccount — this arm is measuring nothing"
+elif ! has "$UNSUS" 'role := roleToRestore\('; then
+  bad "C2 unsuspendAccount does not use roleToRestore — the pinned decision is dead code and the live one is unpinned"
+elif has "$UNSUS" '"(user|admin|reseller|client)"'; then
+  bad "C2 unsuspendAccount applies a default of its own, bypassing the pinned decision"
+elif ! has "$UNSUS" 'if role == nil \{'; then
+  bad "C2 unsuspendAccount no longer stops on a nil decision — an unknown stash would be written as something"
 else
-  ok "C2 unsuspend_account reaches the pinned decision and adds no default of its own"
+  ok "C2 unsuspendAccount reaches the pinned decision and adds no default of its own"
 fi
 
-# C2b — the stash is validated against the assignable set, so a leftover 64-char
-# reset token is never written into a CHECK-constrained column (a 500 on the
-# button an administrator presses to undo their own action).
-if [ -z "$RTR" ]; then
-  : # already reported by C1
-elif has "$RTR" 'ASSIGNABLE_ROLES.contains'; then
-  ok "C2b a stashed value is validated against ASSIGNABLE_ROLES before being restored"
-else
-  bad "C2b the restore does not validate the stash — a leftover reset token would be written into a CHECK-constrained column"
-fi
+# C2b retired: covered by TestLeftoverPasswordDigestIsRefused (panel/go/internal/api/core_helpers_test.go)
 
 # C3 — the stash is consumed. A stash left behind is applied again by a later
 # un-suspend, silently overriding a role an administrator chose in between.
@@ -284,9 +271,9 @@ fi
 # shared helper made it reachable for the first time.
 if [ -z "$WHMCS_S" ]; then
   bad "C5 could not read $WHMCS"
-elif ! has "$WHMCS_S" 'unsuspend_account'; then
+elif ! has "$WHMCS_S" 'unsuspendAccount'; then
   bad "C5 whmcs does not un-suspend at all — this arm is measuring nothing"
-elif has "$WHMCS_S" 'unsuspend_account\(&state, user_id, &\["admin", "reseller"\]\)'; then
+elif has "$WHMCS_S" 'unsuspendAccount\(ctx, st, \*userID, \[\]string\{"admin", "reseller"\}\)'; then
   ok "C5 the billing webhook cannot restore a privileged role"
 else
   bad "C5 the billing webhook restores whatever was recorded — including admin, to an account the panel suspended"
@@ -298,10 +285,10 @@ fi
 # until it expires two hours later. The panel always revoked. The billing webhook
 # never did, so a billing suspension did nothing whatsoever for up to two hours —
 # on the path the guide describes as following the same rules.
-SUSP=$(fn_body '^pub async fn suspend_account' "$HELPERS_S")
+SUSP=$(fn_body '^func suspendAccount[(]' "$HELPERS_S")
 if [ -z "$SUSP" ]; then
-  bad "C6 could not extract suspend_account — this arm is measuring nothing"
-elif has "$SUSP" 'revoke_all_user_sessions'; then
+  bad "C6 could not extract suspendAccount — this arm is measuring nothing"
+elif has "$SUSP" 'st\.revokeAllUserSessions\(ctx, id\)'; then
   ok "C6 suspending revokes the account's sessions, for every caller"
 else
   bad "C6 suspending does not revoke sessions — a suspended account keeps working until its token expires"
@@ -309,7 +296,7 @@ fi
 
 echo "§D  the password-reset doors refuse a suspended account, silently"
 
-# D1/D2 — both doors. `forgot_password` was the ONLY entry point in the whole
+# D1/D2 — both doors. `forgot_password` (rtAuthForgotPassword) was the ONLY entry point in the whole
 # auth surface with no role test: login, the JWT middleware, 2FA, passkeys and
 # OAuth all refuse a suspended account explicitly.
 # ⚠ WIDENED AT s328, because this arm was SEVERED from most of what it claimed.
@@ -322,13 +309,14 @@ echo "§D  the password-reset doors refuse a suspended account, silently"
 # A MEMBERSHIP test over the session-minting surfaces, not a count over one file
 # (#303: a count is satisfied by the defect). Each is stripped of comments first,
 # so the prose naming a door cannot stand in for the door.
-MINTERS="auth.rs routes/auth.rs routes/oauth.rs routes/passkeys.rs"
+# Go: core_auth.go (the JWT middleware), rt_auth.go, rt_oauth.go, rt_passkeys.go.
+MINTERS="core_auth.go rt_auth.go rt_oauth.go rt_passkeys.go"
 MISSING=""; SEEN=0
 for f in $MINTERS; do
-  s=$(subj "panel/backend/src/$f" || true)
+  s=$(subj "$API/$f" || true)
   if [ -z "$s" ]; then
     MISSING="$MISSING $f(unreadable)"
-  elif has "$s" 'role == "suspended"'; then
+  elif has "$s" '[Rr]ole == "suspended"'; then
     SEEN=$((SEEN+1))
   else
     MISSING="$MISSING $f"
@@ -360,14 +348,15 @@ fi
 # scoped to a whole file is satisfied by an unrelated occurrence elsewhere, which
 # is how B-remove of the transfer pin was green while measuring nothing.
 #
-FP=$(fn_body '^pub async fn forgot_password' "$AUTH_S")
+FP=$(fn_body '^func rtAuthForgotPassword[(]' "$AUTH_S")
 if [ -z "$FP" ]; then
-  bad "D2 could not extract forgot_password — this arm is measuring nothing"
-elif ! has "$FP" 'role == "suspended"'; then
+  bad "D2 could not extract rtAuthForgotPassword — this arm is measuring nothing"
+elif ! has "$FP" 'user\.Role == "suspended"'; then
   bad "D2 forgot_password does not refuse a suspended account — it is the door with no role check"
-elif has "$FP" 'role == "suspended" \{[[:space:]]*$'; then
-  # the guard exists; now insist its body returns the success value, not an Err
-  if has "$(awk '/role == "suspended"/,/^    \}/' <<< "$FP")" 'return Ok\(Json\(success_msg\)\)'; then
+elif has "$FP" 'user\.Role == "suspended" \{[[:space:]]*$'; then
+  # the guard exists; now insist its body returns the success value, not an error
+  GUARD=$(awk '/user\.Role == "suspended"/,/^\t\}/' <<< "$FP")
+  if has "$GUARD" 'writeJSON\(w, http\.StatusOK, success\)' && ! has "$GUARD" 'apiErr|internalError'; then
     ok "D2 forgot_password refuses a suspended account SILENTLY — no enumeration oracle"
   else
     bad "D2 forgot_password refuses a suspended account with an error — that discloses which addresses are suspended to an unauthenticated caller"
@@ -378,12 +367,12 @@ fi
 
 # D3 — the second corruptor. A token minted before the account was suspended must
 # not be redeemable, and the refusal must read exactly like an unknown token.
-RP=$(fn_body '^pub async fn reset_password' "$AUTH_S")
+RP=$(fn_body '^func rtAuthResetPassword[(]' "$AUTH_S")
 if [ -z "$RP" ]; then
-  bad "D3 could not extract reset_password — this arm is measuring nothing"
+  bad "D3 could not extract rtAuthResetPassword — this arm is measuring nothing"
 elif ! has "$RP" 'Invalid or expired reset token'; then
-  bad "D3 the extracted window is not reset_password — this arm is measuring nothing"
-elif has "$RP" 'role == "suspended"'; then
+  bad "D3 the extracted window is not rtAuthResetPassword — this arm is measuring nothing"
+elif has "$RP" 'user\.Role == "suspended"'; then
   ok "D3 reset_password refuses a suspended account, in the same words an unknown token gets"
 else
   bad "D3 reset_password does not refuse a suspended account — a token minted before suspension still clears the stash"
@@ -398,9 +387,11 @@ echo "§E  one statement each, not a private copy per caller"
 # green with every helper call deleted from users.rs, because two doc comments
 # there still spelled the helper's name. Each arm also names each helper
 # separately: an OR let a file reaching only one of the two count as reaching both.
-E1_SUS=$(files_matching 'helpers::suspend_account\(' panel/backend/src/routes/*.rs)
-E1_UNS=$(files_matching 'helpers::unsuspend_account\(' panel/backend/src/routes/*.rs)
-EXPECTED="panel/backend/src/routes/users.rs panel/backend/src/routes/whmcs.rs "
+# (Go: `unsuspendAccount(` contains `suspendAccount(`, so the suspend census is
+# anchored on a non-letter before the name.)
+E1_SUS=$(files_matching '(^|[^A-Za-z])suspendAccount\(' "$API"/rt_*.go)
+E1_UNS=$(files_matching '(^|[^A-Za-z])unsuspendAccount\(' "$API"/rt_*.go)
+EXPECTED="$API/rt_users.go $API/rt_whmcs.go "
 if [ "$E1_SUS" = "$EXPECTED" ] && [ "$E1_UNS" = "$EXPECTED" ]; then
   ok "E1 the panel and the billing webhook each reach BOTH shared statements"
 else
@@ -412,11 +403,11 @@ fi
 # ⚠ Keyed on the ASSIGNMENT, not on `SET role = 'suspended'`. The first draft
 # matched only that exact word order and was green against
 # `SET updated_at = NOW(), role = 'suspended'` — the same order-dependence that
-# made B1 vacuous. Stripped too, so the comments in whmcs.rs and users.rs that
+# made B1 vacuous. Stripped too, so the comments in rt_whmcs.go and rt_users.go that
 # discuss the old statement do not count as one.
 HANDROLLED=""
 for f in $BACKEND_RS; do
-  case "$f" in */helpers.rs) continue ;; esac
+  case "$f" in */core_helpers.go) continue ;; esac
   if grep -qE "role[[:space:]]*=[[:space:]]*'suspended'" <<< "$(code "$f")"; then HANDROLLED="$HANDROLLED$f "; fi
 done
 ALLROLE=$(files_matching "SET role" $BACKEND_RS)
