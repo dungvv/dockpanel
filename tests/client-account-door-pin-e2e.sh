@@ -21,7 +21,8 @@
 #       and linked them to `/settings` — the one page their nav does not carry.
 #
 #   §E  A LOST AUTHENTICATOR IS RECOVERABLE.
-#       `twofa_disable` accepted ONLY `check_current`, so the recovery codes let
+#       `twofa_disable` (Go: rtAuthTwofaDisable in panel/go/internal/api/rt_auth.go)
+#       accepted ONLY `check_current`, so the recovery codes let
 #       you log IN and then nothing could turn 2FA off or enrol a new device, and
 #       there is no admin-side 2FA reset. The frontend made it unreachable twice
 #       over by stripping non-digits and demanding exactly six.
@@ -70,10 +71,11 @@ code() {
 has() { grep -qE -- "$2" <<< "$1"; }
 flat() { tr '\n' ' ' <<< "$1" | tr -s ' '; }
 
-# A function body, bounded on ITS OWN braces (s323).
+# A function body, bounded on ITS OWN braces (s323). Go: `func Name(` or a
+# method `func (x *T) Name(`; anchored on the `(` so a prefix name cannot match.
 fnbody() {
   awk -v fn="$2" '
-    index($0, "fn " fn) && !started { started=1 }
+    (index($0, "func " fn "(") || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) && !started { started=1 }
     started {
       n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
       if (opened || n>0) opened=1
@@ -107,7 +109,7 @@ CARDS=panel/frontend/src/components/AccountSecurity.tsx
 SETTINGS=panel/frontend/src/pages/Settings.tsx
 NOTIF=panel/frontend/src/pages/Notifications.tsx
 PALETTE=panel/frontend/src/components/CommandPalette.tsx
-AUTH=panel/backend/src/routes/auth.rs
+AUTH=panel/go/internal/api/rt_auth.go
 
 # Subjects that exist at BOTH tags. If one of these is gone the suite is pointed
 # at something that is not this repo, and every arm below would be vacuous.
@@ -223,22 +225,26 @@ done
 echo
 echo "── §E the recovery codes can actually turn 2FA off ──"
 
-# `try_recovery_code` is ALSO called by the login path, so a file-wide grep
-# passes on a tree where `twofa_disable` never learned about it. Scope to the
+# `rtAuthTryRecoveryCode` is ALSO called by the login path, so a file-wide grep
+# passes on a tree where the disable handler never learned about it. Scope to the
 # handler's OWN body — the s324 #292 lesson, applied before it could bite.
-DISABLE_BODY=$(fnbody "$AUTH_C" "twofa_disable")
-if has "$DISABLE_BODY" 'try_recovery_code'; then
-  ok "E1 twofa_disable accepts a recovery code"
+# Go shape: rtAuthTwofaDisable delegates to rtAuthTwofaCodeOrRecovery (shared
+# with regenerate), whose body is the one that falls back to the recovery code.
+DISABLE_BODY=$(fnbody "$AUTH_C" "rtAuthTwofaDisable")
+SHARED_BODY=$(fnbody "$AUTH_C" "rtAuthTwofaCodeOrRecovery")
+if has "$DISABLE_BODY" 'rtAuthTwofaCodeOrRecovery\(' && has "$SHARED_BODY" 'rtAuthTryRecoveryCode\('; then
+  ok "E1 rtAuthTwofaDisable accepts a recovery code"
 else
-  bad "E1 twofa_disable takes only a live TOTP code — a lost device is a dead end"
+  bad "E1 rtAuthTwofaDisable takes only a live TOTP code — a lost device is a dead end"
 fi
 
 # The control for E1: the login path must still have its own call, or `fnbody`
 # is simply matching everything and E1 is vacuous.
-if has "$(fnbody "$AUTH_C" "twofa_verify")" 'try_recovery_code'; then
-  ok "E2 twofa_verify still accepts one too (fnbody is discriminating)"
+if has "$(fnbody "$AUTH_C" "rtAuthTwofaVerify")" 'rtAuthTryRecoveryCode\(' \
+   && ! has "$(fnbody "$AUTH_C" "rtAuthTwofaStatus")" 'rtAuthTryRecoveryCode\('; then
+  ok "E2 rtAuthTwofaVerify still accepts one too, rtAuthTwofaStatus does not (fnbody is discriminating)"
 else
-  bad "E2 twofa_verify lost its recovery branch — or fnbody is broken"
+  bad "E2 rtAuthTwofaVerify lost its recovery branch — or fnbody is broken"
 fi
 
 # The UI half: the code field must admit an 8-character hex recovery code.
@@ -327,13 +333,13 @@ else
   bad "G2 AccountSecurity.tsx is implausibly small (${#CARDS_C} bytes)"
 fi
 
-# Anchored on the name's END: `pub async fn twofa_disable` is a PREFIX of
-# `twofa_disable_renamed`, so the unanchored form survived a mutation that
+# Anchored on the name's END: `func rtAuthTwofaDisable` is a PREFIX of
+# `rtAuthTwofaDisableRenamed`, so the unanchored form survived a mutation that
 # renamed the handler out from under §E entirely.
-if has "$AUTH_C" 'pub async fn twofa_disable\('; then
-  ok "G3 twofa_disable still exists (control for §E)"
+if has "$AUTH_C" '^func rtAuthTwofaDisable\(' && has "$AUTH_C" '^func rtAuthTwofaCodeOrRecovery\('; then
+  ok "G3 rtAuthTwofaDisable and rtAuthTwofaCodeOrRecovery still exist (control for §E)"
 else
-  bad "G3 twofa_disable is gone — §E is measuring nothing"
+  bad "G3 rtAuthTwofaDisable is gone — §E is measuring nothing"
 fi
 
 echo

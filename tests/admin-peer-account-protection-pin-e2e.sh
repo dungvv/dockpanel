@@ -8,7 +8,8 @@
 # TENANT's resource" bug class across alerts/on_call/escalation_policies/
 # dashboard/drift/servers/monitors/incidents — but never applied it to the
 # one resource whose compromise subsumes all the others: the user account
-# itself. Every mutation in `panel/backend/src/routes/users.rs` was gated
+# itself. Every mutation in the users routes (now
+# `panel/go/internal/api/rt_users.go`) was gated
 # only on `AdminUser` (a role check, nothing else), so any two admin
 # accounts on the same install were fully interchangeable:
 #   - `reset_password` set ANY user's password, including another admin's
@@ -51,6 +52,10 @@
 # nothing — the same lesson project_dockpanel_tech_debt_p178's
 # registry_login mutation drew: a text-presence arm alone cannot tell
 # "guarded" from "guarded too late".
+#
+# GO PORT: handler names are rtUsers{Update,ResetPassword,Remove,
+# ToggleSuspend,Reset2fa,List,Create}; the guard is rtUsersIsOtherAdmin and
+# its logic is unit-tested by TestRtUsersIsOtherAdmin.
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
@@ -82,7 +87,7 @@ has()  { grep -qE -- "$2" <<< "$1"; }
 # bare name, so a rename to a prefixed/suffixed sibling cannot satisfy it.
 fnbody() {
   awk -v fn="$2" '
-    index($0, "fn " fn "(") && !started { started=1 }
+    (index($0, "func " fn "(") == 1 || $0 ~ ("^func \\([^)]*\\) " fn "\\(")) && !started { started=1 }
     started {
       n=gsub(/\{/,"{"); m=gsub(/\}/,"}"); depth += n - m; print
       if (opened || n>0) opened=1
@@ -112,55 +117,46 @@ before() {
   [ "$o1" != -1 ] && [ "$o2" != -1 ] && [ "$o1" -lt "$o2" ]
 }
 
-USERS=panel/backend/src/routes/users.rs
+USERS=panel/go/internal/api/rt_users.go
 USERS_C=$(code "$USERS")
 
-UPDATE_BODY=$(fnbody "$USERS_C" "update")
-RESET_PW_BODY=$(fnbody "$USERS_C" "reset_password")
-REMOVE_BODY=$(fnbody "$USERS_C" "remove")
-TOGGLE_BODY=$(fnbody "$USERS_C" "toggle_suspend")
-RESET_2FA_BODY=$(fnbody "$USERS_C" "reset_2fa")
-LIST_BODY=$(fnbody "$USERS_C" "list")
-CREATE_BODY=$(fnbody "$USERS_C" "create")
-HELPER_BODY=$(fnbody "$USERS_C" "is_other_admin")
+UPDATE_BODY=$(fnbody "$USERS_C" "rtUsersUpdate")
+RESET_PW_BODY=$(fnbody "$USERS_C" "rtUsersResetPassword")
+REMOVE_BODY=$(fnbody "$USERS_C" "rtUsersRemove")
+TOGGLE_BODY=$(fnbody "$USERS_C" "rtUsersToggleSuspend")
+RESET_2FA_BODY=$(fnbody "$USERS_C" "rtUsersReset2fa")
+LIST_BODY=$(fnbody "$USERS_C" "rtUsersList")
+CREATE_BODY=$(fnbody "$USERS_C" "rtUsersCreate")
+HELPER_BODY=$(fnbody "$USERS_C" "rtUsersIsOtherAdmin")
 
 # ── §A the guard itself ─────────────────────────────────────────────────────
-echo "── §A is_other_admin exists and checks role + identity ──"
+echo "── §A rtUsersIsOtherAdmin exists and checks role + identity ──"
 
 if [ -n "$HELPER_BODY" ]; then
-  ok "A1 is_other_admin exists"
+  ok "A1 rtUsersIsOtherAdmin exists"
 else
-  bad "A1 is_other_admin is missing — every arm below is measuring nothing"
+  bad "A1 rtUsersIsOtherAdmin is missing — every arm below is measuring nothing"
 fi
 
-if has "$HELPER_BODY" 'role\s*==\s*"admin"'; then
-  ok "A2 the guard checks the target's role against \"admin\""
-else
-  bad "A2 the guard does not check for role == \"admin\" — it cannot be the peer-admin gate"
-fi
-
-if has "$HELPER_BODY" '!='; then
-  ok "A3 the guard excludes the caller's OWN id (an inequality check is present)"
-else
-  bad "A3 the guard has no inequality check — it would also block an admin acting on themselves"
-fi
+# A2 retired: covered by TestRtUsersIsOtherAdmin (panel/go/internal/api/rt_users_test.go)
+# A3 retired: covered by TestRtUsersIsOtherAdmin (panel/go/internal/api/rt_users_test.go)
 
 # ── §B update() ──────────────────────────────────────────────────────────────
 echo "── §B update() is gated before either mutating branch ──"
 
-if has "$UPDATE_BODY" 'is_other_admin'; then
-  ok "B1 update() calls is_other_admin"
+if has "$UPDATE_BODY" 'rtUsersIsOtherAdmin'; then
+  ok "B1 update() calls rtUsersIsOtherAdmin"
 else
-  bad "B1 update() never calls is_other_admin — the role AND password branches are both still open"
+  bad "B1 update() never calls rtUsersIsOtherAdmin — the role AND password branches are both still open"
 fi
 
-if before "$UPDATE_BODY" "is_other_admin" "SET role"; then
+if before "$UPDATE_BODY" "rtUsersIsOtherAdmin" "SET role"; then
   ok "B2 the guard runs before the role-change UPDATE"
 else
   bad "B2 the guard does not precede the role-change UPDATE — present-but-too-late is the same as absent"
 fi
 
-if before "$UPDATE_BODY" "is_other_admin" "SET password_hash"; then
+if before "$UPDATE_BODY" "rtUsersIsOtherAdmin" "SET password_hash"; then
   ok "B3 the guard runs before the password-change UPDATE"
 else
   bad "B3 the guard does not precede the password-change UPDATE — a second, ungated door to the same takeover"
@@ -169,13 +165,13 @@ fi
 # ── §C reset_password() ─────────────────────────────────────────────────────
 echo "── §C reset_password() is gated before the password UPDATE ──"
 
-if has "$RESET_PW_BODY" 'is_other_admin'; then
-  ok "C1 reset_password() calls is_other_admin"
+if has "$RESET_PW_BODY" 'rtUsersIsOtherAdmin'; then
+  ok "C1 reset_password() calls rtUsersIsOtherAdmin"
 else
-  bad "C1 reset_password() never calls is_other_admin — one admin can still take over another's account"
+  bad "C1 reset_password() never calls rtUsersIsOtherAdmin — one admin can still take over another's account"
 fi
 
-if before "$RESET_PW_BODY" "is_other_admin" "SET password_hash"; then
+if before "$RESET_PW_BODY" "rtUsersIsOtherAdmin" "SET password_hash"; then
   ok "C2 the guard runs before the password UPDATE"
 else
   bad "C2 the guard does not precede the password UPDATE — present-but-too-late is the same as absent"
@@ -184,19 +180,19 @@ fi
 # ── §D remove() ──────────────────────────────────────────────────────────────
 echo "── §D remove() is gated before the delete + server reassignment ──"
 
-if has "$REMOVE_BODY" 'is_other_admin'; then
-  ok "D1 remove() calls is_other_admin"
+if has "$REMOVE_BODY" 'rtUsersIsOtherAdmin'; then
+  ok "D1 remove() calls rtUsersIsOtherAdmin"
 else
-  bad "D1 remove() never calls is_other_admin — deleting a peer admin still transfers their fleet to the caller"
+  bad "D1 remove() never calls rtUsersIsOtherAdmin — deleting a peer admin still transfers their fleet to the caller"
 fi
 
-if before "$REMOVE_BODY" "is_other_admin" "SET user_id = \$1"; then
+if before "$REMOVE_BODY" "rtUsersIsOtherAdmin" "SET user_id = \$1"; then
   ok "D2 the guard runs before the server-reassignment UPDATE"
 else
   bad "D2 the guard does not precede the server reassignment — present-but-too-late is the same as absent"
 fi
 
-if before "$REMOVE_BODY" "is_other_admin" "DELETE FROM users"; then
+if before "$REMOVE_BODY" "rtUsersIsOtherAdmin" "DELETE FROM users"; then
   ok "D3 the guard runs before the DELETE"
 else
   bad "D3 the guard does not precede the DELETE — present-but-too-late is the same as absent"
@@ -205,13 +201,13 @@ fi
 # ── §E toggle_suspend() ──────────────────────────────────────────────────────
 echo "── §E toggle_suspend() is gated before the role flip ──"
 
-if has "$TOGGLE_BODY" 'is_other_admin'; then
-  ok "E1 toggle_suspend() calls is_other_admin"
+if has "$TOGGLE_BODY" 'rtUsersIsOtherAdmin'; then
+  ok "E1 toggle_suspend() calls rtUsersIsOtherAdmin"
 else
-  bad "E1 toggle_suspend() never calls is_other_admin — a peer admin can still be locked out unilaterally"
+  bad "E1 toggle_suspend() never calls rtUsersIsOtherAdmin — a peer admin can still be locked out unilaterally"
 fi
 
-if before "$TOGGLE_BODY" "is_other_admin" "suspend_account"; then
+if before "$TOGGLE_BODY" "rtUsersIsOtherAdmin" "uspendAccount("; then
   ok "E2 the guard runs before the suspend/unsuspend helpers"
 else
   bad "E2 the guard does not precede the suspend/unsuspend call — present-but-too-late is the same as absent"
@@ -220,25 +216,25 @@ fi
 # ── §F reset_2fa() — deliberately UNGUARDED (control) ────────────────────────
 echo "── §F reset_2fa() deliberately does not call the guard ──"
 
-if ! has "$RESET_2FA_BODY" 'is_other_admin'; then
-  ok "F1 reset_2fa() does not call is_other_admin — deliberate, it does not grant sign-in by itself"
+if [ -n "$RESET_2FA_BODY" ] && ! has "$RESET_2FA_BODY" 'rtUsersIsOtherAdmin'; then
+  ok "F1 reset_2fa() does not call rtUsersIsOtherAdmin — deliberate, it does not grant sign-in by itself"
 else
-  bad "F1 reset_2fa() now calls is_other_admin — the documented recovery path for a locked-out peer admin is gone; if this was intentional, update this suite AND the doc comment together"
+  bad "F1 reset_2fa() now calls rtUsersIsOtherAdmin — the documented recovery path for a locked-out peer admin is gone; if this was intentional, update this suite AND the doc comment together"
 fi
 
 # ── §G list()/create() — deliberately UNGUARDED (control) ───────────────────
 echo "── §G list()/create() deliberately do not call the guard ──"
 
-if ! has "$LIST_BODY" 'is_other_admin'; then
-  ok "G1 list() does not call is_other_admin — seeing the directory does not hand over an account"
+if [ -n "$LIST_BODY" ] && ! has "$LIST_BODY" 'rtUsersIsOtherAdmin'; then
+  ok "G1 list() does not call rtUsersIsOtherAdmin — seeing the directory does not hand over an account"
 else
-  bad "G1 list() now calls is_other_admin — an admin would no longer see the full user directory, a behaviour change beyond this fix's scope"
+  bad "G1 list() now calls rtUsersIsOtherAdmin — an admin would no longer see the full user directory, a behaviour change beyond this fix's scope"
 fi
 
-if ! has "$CREATE_BODY" 'is_other_admin'; then
-  ok "G2 create() does not call is_other_admin — there is no existing account to hijack when minting a new one"
+if [ -n "$CREATE_BODY" ] && ! has "$CREATE_BODY" 'rtUsersIsOtherAdmin'; then
+  ok "G2 create() does not call rtUsersIsOtherAdmin — there is no existing account to hijack when minting a new one"
 else
-  bad "G2 create() now calls is_other_admin — there is no target row yet for the guard to inspect"
+  bad "G2 create() now calls rtUsersIsOtherAdmin — there is no target row yet for the guard to inspect"
 fi
 
 # ── §H rejection messages name the action they refuse ────────────────────────

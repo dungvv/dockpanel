@@ -13,17 +13,22 @@
 #       provider's redirect back to this panel (a real code+state pair for the
 #       ATTACKER's own account) without letting their own browser follow it,
 #       and hands that exact callback URL to a victim. The old code validated
-#       `state` purely against `oauth_states` — which the attacker's `state`
+#       `state` purely against `oauth_states` (Go: st.OAuthStates) — which the attacker's `state`
 #       legitimately is a member of — and would have logged the victim's
 #       browser into the ATTACKER's account.
 #
 #   §B  An OAuth provider's `email_verified: false` (or equivalent) cannot walk
-#       straight into the account-linking/auto-login logic. `oauth.rs`'s
+#       straight into the account-linking/auto-login logic. The callback's
 #       existing-account branches link or log in by EMAIL MATCH ALONE once a
 #       provider hands back an email; nothing checked whether the provider
 #       itself considers that email verified. Google's OIDC userinfo endpoint
 #       (the one this panel calls) does return `email_verified` and it was
 #       never read.
+#
+# GO PORT: the subject is panel/go/internal/api/rt_oauth.go — authorize ->
+# rtOauthAuthorize, callback -> rtOauthCallback, jsonwebtoken::encode ->
+# encodeJWT. The end-to-end browser binding is also exercised against a real
+# DB by TestDBRtOauthStateIsBoundToTheBrowser (rt_oauth_test.go).
 #
 # Pure source analysis: no box, no network, no build.
 #
@@ -38,7 +43,7 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-OAUTH=panel/backend/src/routes/oauth.rs
+OAUTH=panel/go/internal/api/rt_oauth.go
 
 [ -f "$OAUTH" ] || bad "MISSING SUBJECT FILE: $OAUTH"
 
@@ -56,28 +61,24 @@ code() {
 
 subj() { local t; t=$(code "$1"); [ -n "$t" ] || return 1; printf '%s' "$t"; }
 
-# The body of one top-level fn, bounded by the NEXT top-level fn. A fixed
-# `grep -A n` window is not a function (lesson #131/#172).
+# The body of one top-level Go func, bounded by the NEXT top-level
+# declaration. A fixed `grep -A n` window is not a function (lesson #131/#172).
 fnbody() {
   awk -v name="$2" '
-    /^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn / {
-      if ($0 ~ "(pub |pub\\(crate\\) )?(async )?fn " name "\\(") { inside=1; next }
+    /^(func|type|var|const) / {
+      if (index($0, "func " name "(") == 1 || $0 ~ ("^func \\([^)]*\\) " name "\\(")) { inside=1; next }
       inside=0
     }
     inside { print }
   ' <<< "$1"
 }
 
-# The DECLARATION of one top-level fn: its line plus the parameter list, up to
-# the return arrow. Stops before the body so it can never read a call inside the
-# function as if it were an extractor.
+# The DECLARATION of one top-level func: its signature line only. Stops before
+# the body so it can never read a call inside the function as if it were a
+# parameter.
 fnsig() {
   awk -v name="$2" '
-    /^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn / {
-      inside = ($0 ~ "(pub |pub\\(crate\\) )?(async )?fn " name "\\(")
-    }
-    inside { print }
-    inside && /\)[[:space:]]*->/ { inside=0 }
+    index($0, "func " name "(") == 1 { print; exit }
   ' <<< "$1"
 }
 
@@ -92,10 +93,10 @@ first_offset() {
 echo "== §A  /authorize's state is bound to the issuing browser (login-CSRF) =="
 
 if S=$(subj "$OAUTH"); then
-  AUTHSIG=$(fnsig "$S" authorize)
-  AUTHBODY=$(fnbody "$S" authorize)
-  CALLSIG=$(fnsig "$S" callback)
-  CALLBODY=$(fnbody "$S" callback)
+  AUTHSIG=$(fnsig "$S" rtOauthAuthorize)
+  AUTHBODY=$(fnbody "$S" rtOauthAuthorize)
+  CALLSIG=$(fnsig "$S" rtOauthCallback)
+  CALLBODY=$(fnbody "$S" rtOauthCallback)
 
   # Floor the four subjects first. An fnbody/fnsig whose pattern stops matching
   # yields an empty subject, and every arm below it would then pass green for a
@@ -104,33 +105,35 @@ if S=$(subj "$OAUTH"); then
   && [ "${#CALLSIG}" -ge 80 ] && [ "${#CALLBODY}" -ge 800 ]; then
     ok "A0 function subjects resolved (authorize sig ${#AUTHSIG}c/body ${#AUTHBODY}c, callback sig ${#CALLSIG}c/body ${#CALLBODY}c)"
 
-    if grep -qE 'headers: *axum::http::HeaderMap' <<< "$AUTHSIG"; then
+    # Go handlers always receive *http.Request; what matters is that the
+    # cookie's Secure flag is derived from it rather than hard-coded.
+    if grep -qE 'r \*http\.Request' <<< "$AUTHSIG" \
+    && grep -qE 'oauth_csrf=.*rtAuthCookieSecureFlag\(r\)' <<< "$AUTHBODY"; then
       ok "A1 authorize() takes the request headers (needed to set the Secure flag correctly)"
     else
       bad "A1 authorize() takes the request headers"
     fi
 
-    if grep -qE 'oauth_csrf=\{csrf_state\}' <<< "$AUTHBODY" \
-    && grep -qE 'HttpOnly' <<< "$AUTHBODY" \
-    && grep -qE 'SameSite=Lax' <<< "$AUTHBODY"; then
+    if grep -qE '"oauth_csrf=%s; HttpOnly%s; SameSite=Lax;[^"]*", csrf,' <<< "$AUTHBODY" \
+    && grep -qE 'st\.OAuthStates\[csrf\] = ' <<< "$AUTHBODY"; then
       ok "A2 authorize() sets an HttpOnly, SameSite=Lax oauth_csrf cookie carrying the state value"
     else
       bad "A2 authorize() sets an HttpOnly, SameSite=Lax oauth_csrf cookie carrying the state value"
     fi
 
-    if grep -qE 'header::SET_COOKIE' <<< "$AUTHBODY"; then
+    if grep -qE 'w\.Header\(\)\.Set\("Set-Cookie", fmt\.Sprintf\("oauth_csrf=' <<< "$AUTHBODY"; then
       ok "A3 authorize()'s response actually carries a Set-Cookie header (not just a formatted string that goes unused)"
     else
       bad "A3 authorize()'s response actually carries a Set-Cookie header"
     fi
 
-    if grep -qE "strip_prefix\\(\"oauth_csrf=\"\\)" <<< "$CALLBODY"; then
+    if grep -qE 'strings\.CutPrefix\(.*"oauth_csrf="\)' <<< "$CALLBODY"; then
       ok "A4 callback() reads the oauth_csrf cookie back out of the request"
     else
       bad "A4 callback() reads the oauth_csrf cookie back out of the request"
     fi
 
-    if grep -qE 'csrf_cookie\.as_deref\(\) *!= *Some\(query\.state\.as_str\(\)\)' <<< "$CALLBODY"; then
+    if grep -qE 'if csrfCookie == nil \|\| \*csrfCookie != query\.State \{' <<< "$CALLBODY"; then
       ok "A5 callback() rejects when the cookie is absent or does not match query.state"
     else
       bad "A5 callback() rejects when the cookie is absent or does not match query.state"
@@ -140,8 +143,8 @@ if S=$(subj "$OAUTH"); then
     # the handler, not stapled on after the point where a session could already
     # have been minted. Anchor against the final JWT-issuing line — the cookie
     # check must run BEFORE it exists at all in program order.
-    o_check=$(first_offset "$CALLBODY" 'csrf_cookie\.as_deref')
-    o_issue=$(first_offset "$CALLBODY" 'let token = jsonwebtoken::encode')
+    o_check=$(first_offset "$CALLBODY" 'if csrfCookie == nil')
+    o_issue=$(first_offset "$CALLBODY" 'token, err := encodeJWT\(')
     if [ -n "$o_check" ] && [ -n "$o_issue" ] && [ "$o_check" -lt "$o_issue" ]; then
       ok "A6 the browser-binding check runs before a session can be issued, not after"
     else
@@ -158,7 +161,7 @@ fi
 echo "== §B  an unverified provider email cannot auto-link or auto-login =="
 
 if S=$(subj "$OAUTH"); then
-  CALLBODY=$(fnbody "$S" callback)
+  CALLBODY=$(fnbody "$S" rtOauthCallback)
 
   if [ "${#CALLBODY}" -ge 800 ]; then
     # NOT a bare 'email_verified' substring check: the users table has its own
@@ -166,20 +169,22 @@ if S=$(subj "$OAUTH"); then
     # a bare-word arm here is vacuous (matches even pre-fix code, verified by
     # mutation test). Require the specific call shape that reads it off the
     # PROVIDER's response.
-    if grep -qE 'userinfo\.get\("email_verified"\)' <<< "$CALLBODY"; then
+    if grep -qE 'info\["email_verified"\]\.\(bool\)' <<< "$CALLBODY"; then
       ok "B1 callback() reads email_verified from the provider's userinfo response"
     else
       bad "B1 callback() reads email_verified from the provider's userinfo response"
     fi
 
-    if grep -qE '\.and_then\(\|v\| v\.as_bool\(\)\)\.unwrap_or\(true\)' <<< "$CALLBODY"; then
+    # Go: the comma-ok form `v, ok := ...(bool); ok && !v` — absent (ok=false)
+    # never reaches the refusal.
+    if grep -qE 'if v, ok := info\["email_verified"\]\.\(bool\); ok && !v \{' <<< "$CALLBODY"; then
       ok "B2 an ABSENT field is treated as verified (GitLab/GitHub-profile paths never send it — this must not become a new rejection)"
     else
       bad "B2 an absent email_verified field defaults to allow, not deny"
     fi
 
-    if grep -qE 'if !email_verified' <<< "$CALLBODY" \
-    && grep -qE 'not verified' <<< "$CALLBODY"; then
+    if grep -qE 'ok && !v \{' <<< "$CALLBODY" \
+    && grep -qE 'return apiErr\(http\.Status[A-Za-z]+, "[^"]*not verified' <<< "$CALLBODY"; then
       ok "B3 an explicit email_verified=false is rejected with a real error, not silently ignored"
     else
       bad "B3 an explicit email_verified=false is rejected"
@@ -189,7 +194,7 @@ if S=$(subj "$OAUTH"); then
     # email has already been used to look up/link/create an account by the time
     # it runs. Anchor against the user lookup, the earliest point email trust
     # starts mattering.
-    o_gate=$(first_offset "$CALLBODY" 'if !email_verified')
+    o_gate=$(first_offset "$CALLBODY" 'info\["email_verified"\]')
     o_lookup=$(first_offset "$CALLBODY" 'SELECT \* FROM users WHERE email = \$1')
     if [ -n "$o_gate" ] && [ -n "$o_lookup" ] && [ "$o_gate" -lt "$o_lookup" ]; then
       ok "B4 the verification gate runs BEFORE the user is looked up or created, not after"
@@ -216,10 +221,10 @@ echo "== §C  a matching provider NAME does not bypass a mismatched provider acc
 # provider's short name.
 
 if S=$(subj "$OAUTH"); then
-  CALLBODY=$(fnbody "$S" callback)
+  CALLBODY=$(fnbody "$S" rtOauthCallback)
 
   if [ "${#CALLBODY}" -ge 800 ]; then
-    if grep -qE 'oauth_id\.as_deref\(\) *!= *Some\(oauth_id\.as_str\(\)\)' <<< "$CALLBODY"; then
+    if grep -qE 'user\.OAuthID == nil \|\| \*user\.OAuthID != oauthID' <<< "$CALLBODY"; then
       ok "C1 callback() compares the incoming provider account id against the stored oauth_id, not just the provider name"
     else
       bad "C1 callback() compares the incoming provider account id against the stored oauth_id"
@@ -228,8 +233,8 @@ if S=$(subj "$OAUTH"); then
     # Order matters: the oauth_id check must sit INSIDE the "provider name
     # already matches" arm — textually AFTER the provider-name-mismatch reject,
     # never before it (which would misfire on a genuinely different provider).
-    o_provider_mismatch=$(first_offset "$CALLBODY" 'oauth_provider\.as_deref\(\) *!= *Some\(provider_name\.as_str\(\)\)')
-    o_id_mismatch=$(first_offset "$CALLBODY" 'oauth_id\.as_deref\(\) *!= *Some\(oauth_id\.as_str\(\)\)')
+    o_provider_mismatch=$(first_offset "$CALLBODY" 'user\.OAuthProvider == nil \|\| \*user\.OAuthProvider != name')
+    o_id_mismatch=$(first_offset "$CALLBODY" 'user\.OAuthID == nil \|\| \*user\.OAuthID != oauthID')
     if [ -n "$o_provider_mismatch" ] && [ -n "$o_id_mismatch" ] && [ "$o_provider_mismatch" -lt "$o_id_mismatch" ]; then
       ok "C2 the oauth_id check sits in the 'same provider name' branch, after the provider-name check"
     else
@@ -239,7 +244,7 @@ if S=$(subj "$OAUTH"); then
     # A mismatch must actually REJECT, not merely be observed. This handler had
     # exactly 2 CONFLICT returns before this fix (the different-provider reject
     # + the auto-create duplicate-email reject) and 3 after.
-    conflict_count=$(grep -coE 'StatusCode::CONFLICT' <<< "$CALLBODY")
+    conflict_count=$(grep -coE 'http\.StatusConflict' <<< "$CALLBODY")
     if [ "$conflict_count" -ge 3 ]; then
       ok "C3 a third CONFLICT reject exists (the id-mismatch branch actually returns an error)"
     else
@@ -261,7 +266,7 @@ if S=$(subj "$OAUTH"); then
       bad "C5 the auto-create INSERT writes oauth_provider and oauth_id together"
     fi
 
-    o_issue=$(first_offset "$CALLBODY" 'let token = jsonwebtoken::encode')
+    o_issue=$(first_offset "$CALLBODY" 'token, err := encodeJWT\(')
     if [ -n "$o_id_mismatch" ] && [ -n "$o_issue" ] && [ "$o_id_mismatch" -lt "$o_issue" ]; then
       ok "C6 the oauth_id check runs before a session can be issued, not after"
     else

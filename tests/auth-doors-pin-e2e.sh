@@ -5,6 +5,10 @@
 # cross-cutting access gates were written per-handler, and by v2.46.0 they had
 # drifted into four different opinions about who may sign in:
 #
+# (Subjects are the shipped Go tree, panel/go: the API's rt_auth.go / rt_oauth.go /
+# rt_passkeys.go, and the agent's routes package (panel/go/internal/agent/routes).
+# Rust names below — `login`, `twofa_verify`, `oauth::callback` — are the history.)
+#
 #   D1  THE IP ALLOWLIST GATED ONE DOOR. `allowed_panel_ips` gates login — s276
 #       gave it range matching, save-time validation and a control. It lived
 #       inline in `login` alone, so an operator who restricted the panel to their
@@ -95,7 +99,7 @@ bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 # NEGATIVE arm (match ⇒ bad) silently green, which is the direction that ships.
 comment_marker_for() {
   case "$1" in
-    *.rs|*.mjs|*.js|*.ts|*.tsx)                echo '//' ;;
+    *.go|*.mjs|*.js|*.ts|*.tsx)                echo '//' ;;
     *.json)                                    echo ''   ;;  # JSON has no comments
     *)                                         echo '#'  ;;  # .sh, .service, .gitignore, .toml
   esac
@@ -162,24 +166,26 @@ has_code()   { local f="$1"; shift; [ "$(code_count "$f" "$@")" -gt 0 ]; }
 # True file line numbers, because code_lines blanks rather than deletes.
 code_lineno() { local f="$1"; shift; code_lines "$f" | grep -n "$@" 2>/dev/null | head -1 | cut -d: -f1 || true; }
 
-BE=panel/backend/src
-ROUTES=$BE/routes
+# The Go API is ONE flat package: routes are rt_*.go, services svc_*.go, the
+# shared core core_*.go. ROUTES and BE therefore name the same directory.
+BE=panel/go/internal/api
+ROUTES=$BE
 
 [ -d "$ROUTES" ] || { echo "missing dir: $ROUTES"; exit 1; }
 
 # The named subjects. §9 scans this file for any arm that reads one of them
 # without going through code_lines; the guide is deliberately NOT among them.
-AUTH_RS=$ROUTES/auth.rs
-OAUTH_RS=$ROUTES/oauth.rs
-PASSKEYS_RS=$ROUTES/passkeys.rs
-SEC_RS=$ROUTES/security.rs
-SET_RS=$ROUTES/settings.rs
-WS_RS=$ROUTES/ws_metrics.rs
-HELPERS=$BE/helpers.rs
-HEALER=$BE/services/auto_healer.rs
+AUTH_RS=$ROUTES/rt_auth.go
+OAUTH_RS=$ROUTES/rt_oauth.go
+PASSKEYS_RS=$ROUTES/rt_passkeys.go
+SEC_RS=$ROUTES/rt_security.go
+SET_RS=$ROUTES/rt_settings.go
+WS_RS=$ROUTES/rt_ws_metrics.go
+HELPERS=$BE/core_helpers.go
+HEALER=$BE/svc_auto_healer.go
 SET_TSX=panel/frontend/src/pages/Settings.tsx
-AGENT_SEC=panel/agent/src/routes/security.rs
-TERM_SRC=panel/agent/src/routes/terminal.rs
+AGENT_SEC=panel/go/internal/agent/routes/security.go
+TERM_SRC=panel/go/internal/agent/routes/terminal.go
 
 # PROSE BY DESIGN — read RAW, deliberately. The three arms over it assert
 # SENTENCES a human wrote for a human; there is no code in it to isolate, and the
@@ -206,14 +212,14 @@ trap 'rm -rf "$FIXDIR"' EXIT
 # down a different path than the arm proves nothing about the arm.
 door_body() {   # <file> <fn>
   code_lines "$1" | FN="$2" perl -0777 -ne '
-    if (/pub async fn\s+\Q$ENV{FN}\E\s*\(/g) {
+    if (/^func\s+\Q$ENV{FN}\E\s*\(/mg) {
       my $rest = substr($_, pos($_));
-      my ($b) = $rest =~ /^(.*?)(?=\npub (?:async )?fn |\z)/s;
+      my ($b) = $rest =~ /^(.*?)(?=\nfunc |\z)/s;
       print $b;
     }'
 }
-panic_body() { code_lines "$1" | sed -n '/pub async fn panic_button/,/^}/p'; }
-kill_body()  { code_lines "$1" | sed -n '/async fn kill_terminals/,/^}/p'; }
+panic_body() { code_lines "$1" | sed -n '/^func rtSecurityPanicButton(/,/^}/p'; }
+kill_body()  { code_lines "$1" | sed -n '/^func securityKillTerminals(/,/^}/p'; }
 
 # The §3 predicate, factored out so §8 can drive the identical code path over a
 # planted file. Returns the members of the given list that touch the settings key
@@ -230,26 +236,30 @@ inline_allowlist_files() {
 
 # ── Discovery ───────────────────────────────────────────────────────────────
 #
-# A door is a `pub async fn` whose body emits an auth session cookie. We look for
-# the two ways the tree does that: calling the shared issuer, or formatting the
-# session cookie inline. Logout is excluded by construction — it emits an empty
-# value to CLEAR the cookie, and clearing a session is not minting one.
+# A door is an HTTP handler — a top-level `func rtX(st *AppState, w
+# http.ResponseWriter, ...)` — whose body emits an auth session cookie. We look
+# for the two ways the tree does that: calling the shared issuer
+# (rtAuthIssueSession), or formatting the session cookie inline (`"token=%s; `).
+# The issuer itself is not a handler, so the signature excludes it. Logout is
+# excluded by construction — it emits an empty value to CLEAR the cookie, and
+# clearing a session is not minting one.
 #
 # Read per file through code_lines, so a handler that has been commented out is
 # not discovered as a live door — the discovery count is the denominator for
 # eight arms below, and inflating it with dead code inflates them all.
 
-DOORS=$(for f in "$ROUTES"/*.rs; do
+DOORS=$(for f in "$ROUTES"/rt_*.go; do
+  [[ $f == *_test.go ]] && continue
   code_lines "$f" | SUBJ="$f" perl -0777 -ne '
-    while (/pub async fn\s+(\w+)\s*\(/g) {
+    while (/^func\s+(\w+)\s*\(\s*\w+\s+\*AppState,\s*\w+\s+http\.ResponseWriter/mg) {
       my $name = $1;
       my $start = pos($_);
       my $rest = substr($_, $start);
-      # body = up to the next top-level `pub async fn` / `pub fn` / end of file
-      my ($body) = $rest =~ /^(.*?)(?=\npub (?:async )?fn |\z)/s;
+      # body = up to the next top-level `func` / end of file
+      my ($body) = $rest =~ /^(.*?)(?=\nfunc |\z)/s;
       next unless defined $body;
-      next unless $body =~ /issue_session(?:_pub)?\s*\(/
-               || $body =~ /"token=\{token\}/;
+      next unless $body =~ /rtAuthIssueSession\s*\(/
+               || $body =~ /"token=%s; /;
       print "$ENV{SUBJ}:$name\n";
     }'
 done 2>/dev/null | sort -u)
@@ -259,8 +269,8 @@ DOORS_N=$(printf '%s\n' "$DOORS" | grep -c . || true)
 echo "── discovery ──"
 printf '%s\n' "$DOORS" | sed 's/^/  door: /'
 
-# §0 — the discovery itself. Four doors are known to exist (login, twofa_verify,
-# passkeys::auth_complete, oauth::callback). Fewer means the pattern broke and
+# §0 — the discovery itself. Four doors are known to exist (rtAuthLogin,
+# rtAuthTwofaVerify, rtPasskeysAuthComplete, rtOauthCallback). Fewer means the pattern broke and
 # every arm below would pass by inspecting nothing.
 if [ "$DOORS_N" -ge 4 ]; then
   ok "discovered $DOORS_N session-minting doors (>= 4 known to exist)"
@@ -273,7 +283,7 @@ echo "── §1 allowed_panel_ips covers every door ──"
 for d in $DOORS; do
   file=${d%%:*}; fn=${d##*:}
   body=$(door_body "$file" "$fn")
-  n=$(printf '%s' "$body" | grep -c "enforce_panel_ip_allowlist" || true)
+  n=$(printf '%s' "$body" | grep -c "rtAuthEnforcePanelIPAllowlist(" || true)
   if [ "$n" -ge 1 ]; then
     ok "$(basename "$file")::$fn enforces the IP allowlist"
   else
@@ -286,7 +296,7 @@ echo "── §2 lockdown covers every door ──"
 for d in $DOORS; do
   file=${d%%:*}; fn=${d##*:}
   body=$(door_body "$file" "$fn")
-  n=$(printf '%s' "$body" | grep -c "is_locked_down" || true)
+  n=$(printf '%s' "$body" | grep -c "SecurityHardeningIsLockedDown(" || true)
   if [ "$n" -ge 1 ]; then
     ok "$(basename "$file")::$fn enforces lockdown"
   else
@@ -304,25 +314,21 @@ done
 # clean tree over a genuinely duplicated gate. §8 plants the real duplicate and
 # requires this predicate to fire.
 echo "── §3 one implementation, not a copy per door ──"
-INLINE=$(inline_allowlist_files "$ROUTES"/*.rs)
-# auth.rs holds the helper; settings.rs validates the value on save. Any third
-# route file touching the key is an inline re-implementation.
-UNEXPECTED=$(printf '%s\n' "$INLINE" | grep -v -e 'routes/auth\.rs$' -e 'routes/settings\.rs$' || true)
-if [ -z "$UNEXPECTED" ]; then
-  ok "allowed_panel_ips is referenced only by the helper (auth.rs) and its validator (settings.rs)"
+# The Go package is flat, so the scan is every non-test file in it, not routes only.
+INLINE=$(inline_allowlist_files $(ls "$ROUTES"/*.go | grep -v '_test\.go$'))
+# rt_auth.go holds the helper; rt_settings.go validates the value on save. Any
+# third file touching the key is an inline re-implementation.
+UNEXPECTED=$(printf '%s\n' "$INLINE" | grep -v -e '/rt_auth\.go$' -e '/rt_settings\.go$' || true)
+if [ -z "$UNEXPECTED" ] && [ -n "$INLINE" ]; then
+  ok "allowed_panel_ips is referenced only by the helper (rt_auth.go) and its validator (rt_settings.go)"
 else
   bad "inline allowlist re-implementation in: $(printf '%s ' $UNEXPECTED) — it will drift from the helper"
 fi
 
-# The helper must fail closed. `panel_ip_allowed` returns false for an
-# unparseable client address; a well-meaning permissive fallback here would admit
-# every request that arrives without a forwarded-address header.
-HELPER_OK=$(code_lines "$HELPERS" | perl -0777 -ne 'print "1" if /fn panel_ip_allowed.*?let Ok\(client\).*?else \{.*?return false;/s')
-if [ -n "$HELPER_OK" ]; then
-  ok "panel_ip_allowed fails CLOSED when the client address is unusable"
-else
-  bad "panel_ip_allowed no longer visibly fails closed on an unparseable client address"
-fi
+# The helper must fail closed: panelIPAllowed returns false for an unparseable
+# client address; a permissive fallback would admit every request that arrives
+# without a forwarded-address header.
+# helper-fail-closed retired: covered by TestPanelIPAllowlist (panel/go/internal/api/core_helpers_test.go) — {"10.0.0.0/8", ""} and "not-an-ip" must be refused
 
 # ── §4 ingestion preserves when an event HAPPENED ───────────────────────────
 # Auto-lockdown counts "N events within M minutes" over created_at. Stamping an
@@ -333,13 +339,13 @@ fi
 # every non-admin out. Driven on a real box: 16 events spread over ~3 minutes of
 # real time landed within 105ms of each other, and the tenant got a 503.
 echo "── §4 suspicious-event ingestion honours the event's own timestamp ──"
-n=$(code_lines "$HEALER" | perl -0777 -ne 'print "1" if /record_suspicious_event_at\s*\(/s' | grep -c 1 || true)
+n=$(code_lines "$HEALER" | perl -0777 -ne 'print "1" if /SecurityHardeningRecordSuspiciousEventAt\s*\(/s' | grep -c 1 || true)
 if [ "$n" -ge 1 ]; then
   ok "the jsonl ingest records events at their occurrence time, not at ingest time"
 else
   bad "the ingest no longer passes an occurrence time — a queued backlog will trip auto-lockdown on the first tick"
 fi
-n=$(code_lines "$HEALER" | perl -0777 -ne 'print "1" if /event\["timestamp"\]/s' | grep -c 1 || true)
+n=$(code_lines "$HEALER" | perl -0777 -ne 'print "1" if /jsonGet\(event, "timestamp"\)/s' | grep -c 1 || true)
 if [ "$n" -ge 1 ]; then
   ok "the agent's per-event timestamp is read (the agent has always written it)"
 else
@@ -353,7 +359,7 @@ fi
 # check-in), so reporting a flat "disabled" is a claim it can itself falsify —
 # lesson #104a, one layer out.
 echo "── §5 the recording toggle discloses fleet members it cannot control ──"
-n=$(code_count "$SET_RS" -F -e 'recording_coverage')
+n=$(code_count "$SET_RS" -F -e 'rtSettingsRecordingCoverage')
 if [ "$n" -ge 1 ]; then
   ok "backend exposes recording coverage across the fleet"
 else
@@ -381,9 +387,9 @@ echo "── s308: the panic button ──"
 
 PANIC=$(panic_body "$SEC_RS")
 if [ -z "$PANIC" ]; then
-  bad "could not extract panic_button — every arm below is measuring nothing"
+  bad "could not extract rtSecurityPanicButton — every arm below is measuring nothing"
 else
-  ok "extracted panic_button ($(wc -l <<< "$PANIC") lines) — the arms below read real code"
+  ok "extracted rtSecurityPanicButton ($(wc -l <<< "$PANIC") lines) — the arms below read real code"
 fi
 
 if grep -q "sessions_revoked_at" <<< "$PANIC"; then
@@ -406,22 +412,41 @@ fi
 # which this block used to make below, was false — it dodged only the prose that
 # already existed, never a comment someone writes tomorrow.
 #
-# Class arm: every hand-rolled Claims decode outside the AuthUser extractor must
-# consult the watermark, and both halves — the enumeration and the per-file
-# check — now read code only.
-DECODERS=$(for f in $(find "$BE" -name '*.rs' | sort); do
-  case "$f" in */auth.rs) continue ;; esac
-  has_code "$f" -F -e 'decode::<Claims>' && printf '%s\n' "$f"
+# Class arm: every hand-rolled JWT decode (a `decodeJWT(` call) outside the
+# authUser extractor in core_auth.go must consult the watermark
+# (`sessionsRevokedAt()`) IN THE SAME FUNCTION. Both halves — the enumeration
+# and the per-function check — read code only.
+#
+# One exemption, named rather than hidden: rtSettingsBranding decodes an
+# OPTIONAL token only to choose a reseller's logo/colours for the login page;
+# it grants nothing and a revoked token there yields only branding. The Rust
+# handler did the same (spelled `decode::<crate::auth::Claims>`, which the
+# Rust-era pattern never matched); the Go spelling is uniform, so it is
+# enumerated now and must be exempted explicitly.
+DECODER_EXEMPT=' rt_settings.go:rtSettingsBranding '
+decoder_fns() {  # <file> → "file:fn" for each top-level func calling decodeJWT( in code
+  code_lines "$1" | SUBJ="$1" perl -0777 -ne '
+    while (/^func\s+(?:\([^)]*\)\s*)?(\w+)\s*\(/mg) {
+      my $name = $1; my $rest = substr($_, pos($_));
+      my ($b) = $rest =~ /^(.*?)(?=\nfunc |\z)/s;
+      print "$ENV{SUBJ}:$name\n" if defined $b && $b =~ /(?<!func )decodeJWT\(/;
+    }'
+}
+DECODERS=$(for f in $(find "$BE" -name '*.go' ! -name '*_test.go' | sort); do
+  [[ $f == */core_auth.go ]] && continue
+  decoder_fns "$f"
 done)
 if [ -z "$DECODERS" ]; then
-  bad "found no hand-rolled Claims decoders at all — this arm is measuring nothing"
+  bad "found no hand-rolled JWT decoders at all — this arm is measuring nothing"
 else
-  ok "enumerated $(wc -l <<< "$DECODERS") hand-rolled Claims decoder file(s) outside auth.rs"
-  for f in $DECODERS; do
-    if has_code "$f" -F -e 'sessions_revoked_at.read()'; then
-      ok "  $(basename "$f") enforces session revocation on its own decode path"
+  ok "enumerated $(wc -l <<< "$DECODERS") hand-rolled JWT decoder function(s) outside core_auth.go"
+  for d in $DECODERS; do
+    f=${d%%:*}; fn=${d##*:}; tag="$(basename "$f"):$fn"
+    case "$DECODER_EXEMPT" in *" $tag "*) ok "  $tag exempt: branding-only read, grants nothing"; continue ;; esac
+    if door_body "$f" "$fn" | grep -qF 'sessionsRevokedAt()'; then
+      ok "  $tag enforces session revocation on its own decode path"
     else
-      bad "  $(basename "$f") decodes a JWT by hand and never checks sessions_revoked_at — panic cannot close this channel"
+      bad "  $tag decodes a JWT by hand and never checks sessionsRevokedAt — panic cannot close this channel"
     fi
   done
 fi
@@ -469,18 +494,20 @@ fi
 # the control could not reach.
 AGENT_KILL=$(kill_body "$AGENT_SEC")
 if [ -z "$AGENT_KILL" ]; then
-  bad "could not extract kill_terminals — the arms below are measuring nothing"
+  bad "could not extract securityKillTerminals — the arms below are measuring nothing"
 else
-  ok "extracted kill_terminals — the arms below read real code"
+  ok "extracted securityKillTerminals — the arms below read real code"
 fi
-if grep -q "TERMINAL_PIDS" <<< "$AGENT_KILL"; then
+if grep -q "TerminalPids" <<< "$AGENT_KILL"; then
   ok "the kill walks a registry of shells this agent started, rather than guessing by user"
 else
   bad "the kill still guesses by user and command name, so a root server terminal survives it"
 fi
 # NEGATIVE ARM: a match means BAD. §8 plants the real counter-reset and requires
 # this to fire.
-if grep -qE 'ACTIVE_TERMINALS\.swap\(0' <<< "$AGENT_KILL"; then
+# Go: the reset this guards against is a Swap(0) of the counter (the Store(0) AFTER
+# the kill loop is the legitimate "zero is fact, not decree").
+if grep -qE 'TerminalActiveTerminals\.Swap\(0' <<< "$AGENT_KILL"; then
   bad "the session counter is zeroed without killing — an attacker gets a fresh full quota"
 else
   ok "the counter is not zeroed independently of the kill"
@@ -488,7 +515,9 @@ fi
 
 # Both ends of the registry, because either alone leaks: register without forget
 # grows for ever and kills reaped pids; forget without register kills nothing.
-if has_code "$TERM_SRC" -F -e 'register_terminal(child_pid' && has_code "$TERM_SRC" -F -e 'forget_terminal(child_pid'; then
+# Call sites, not definitions: `func TerminalRegisterTerminal(pid int, …)` does not
+# contain `(pid,` and `func TerminalForgetTerminal(pid int)` does not contain `(pid)`.
+if has_code "$TERM_SRC" -F -e 'TerminalRegisterTerminal(pid,' && has_code "$TERM_SRC" -F -e 'TerminalForgetTerminal(pid)'; then
   ok "every spawned shell is registered on open and forgotten on close"
 else
   bad "the pid registry is written at only one end — it either leaks or kills nothing"
@@ -564,16 +593,16 @@ run_the TOKENWORD --now
 echo "a literal hash # inside a string keeps TOKENSTR"
 FIX
 
-cat > "$FIXDIR/f.rs" <<'FIX'
+cat > "$FIXDIR/f.go" <<'FIX'
 // TOKENWORD in a line comment
 /*
  * TOKENWORD in a block comment
  */
-let live = call(TOKENWORD);
-let trail = other(); // TOKENWORD trailing
-let url = "https://example.invalid/TOKENURL";
-let glob = "COPY /app/target/release/*";
-let after_glob = keep(TOKENAFTER);
+live := call(TOKENWORD)
+trail := other() // TOKENWORD trailing
+url := "https://example.invalid/TOKENURL"
+glob := "COPY /app/target/release/*"
+afterGlob := keep(TOKENAFTER)
 FIX
 
 cat > "$FIXDIR/f.tsx" <<'FIX'
@@ -598,25 +627,25 @@ else
   bad "shell: the stripper ate a '#' inside a string — a negative arm would now pass on broken code"
 fi
 
-if [ "$(code_count "$FIXDIR/f.rs" -F -e 'TOKENWORD')" -eq 1 ]; then
-  ok "rust: '//' line, '/* */' block and trailing '//' all blanked (1 code hit of 4)"
+if [ "$(code_count "$FIXDIR/f.go" -F -e 'TOKENWORD')" -eq 1 ]; then
+  ok "go: '//' line, '/* */' block and trailing '//' all blanked (1 code hit of 4)"
 else
-  bad "rust: expected exactly 1 code hit for TOKENWORD, got $(code_count "$FIXDIR/f.rs" -F -e 'TOKENWORD')"
+  bad "go: expected exactly 1 code hit for TOKENWORD, got $(code_count "$FIXDIR/f.go" -F -e 'TOKENWORD')"
 fi
 
-if [ "$(code_count "$FIXDIR/f.rs" -F -e 'TOKENURL')" -eq 1 ]; then
-  ok "rust: '//' inside a quoted string survives — a URL is not a comment"
+if [ "$(code_count "$FIXDIR/f.go" -F -e 'TOKENURL')" -eq 1 ]; then
+  ok "go: '//' inside a quoted string survives — a URL is not a comment"
 else
-  bad "rust: the stripper cut a line at the '//' of a URL inside a string literal"
+  bad "go: the stripper cut a line at the '//' of a URL inside a string literal"
 fi
 
 # s294: a `/*` inside a string literal opened a block comment that ran to the
 # next close marker and deleted 485 lines of git_build.rs. The guard is that a
 # block is recognised only where one is WRITTEN — opening at line start.
-if [ "$(code_count "$FIXDIR/f.rs" -F -e 'TOKENAFTER')" -eq 1 ]; then
-  ok "rust: a '/*' inside a string literal does not open a block (the s294 guard holds)"
+if [ "$(code_count "$FIXDIR/f.go" -F -e 'TOKENAFTER')" -eq 1 ]; then
+  ok "go: a '/*' inside a string literal does not open a block (the s294 guard holds)"
 else
-  bad "rust: a string containing '/*' swallowed the code after it — the s294 stripper defect is back"
+  bad "go: a string containing '/*' swallowed the code after it — the s294 stripper defect is back"
 fi
 
 if [ "$(code_count "$FIXDIR/f.tsx" -F -e 'TOKENTSX')" -eq 1 ] && [ "$(code_count "$FIXDIR/f.tsx" -F -e 'TOKENPATH')" -eq 1 ]; then
@@ -668,27 +697,27 @@ echo "── §7 every pinned pattern is live CODE, and a comment cannot satisfy
 # code line into a comment in a throwaway copy and assert the count falls to
 # zero. If it does not, some arm above is still reading the file raw.
 PINNED=(
-  "$AUTH_RS|-F|enforce_panel_ip_allowlist"
-  "$AUTH_RS|-F|is_locked_down"
+  "$AUTH_RS|-F|rtAuthEnforcePanelIPAllowlist("
+  "$AUTH_RS|-F|SecurityHardeningIsLockedDown("
   "$AUTH_RS|-F|allowed_panel_ips"
-  "$OAUTH_RS|-F|enforce_panel_ip_allowlist"
-  "$OAUTH_RS|-F|is_locked_down"
-  "$PASSKEYS_RS|-F|enforce_panel_ip_allowlist"
-  "$PASSKEYS_RS|-F|is_locked_down"
-  "$HELPERS|-F|fn panel_ip_allowed"
-  "$HEALER|-F|record_suspicious_event_at"
-  "$HEALER|-F|event[\"timestamp\"]"
-  "$SET_RS|-F|recording_coverage"
+  "$OAUTH_RS|-F|rtAuthEnforcePanelIPAllowlist("
+  "$OAUTH_RS|-F|SecurityHardeningIsLockedDown("
+  "$PASSKEYS_RS|-F|rtAuthEnforcePanelIPAllowlist("
+  "$PASSKEYS_RS|-F|SecurityHardeningIsLockedDown("
+  "$HELPERS|-F|func panelIPAllowed"
+  "$HEALER|-F|SecurityHardeningRecordSuspiciousEventAt("
+  "$HEALER|-F|jsonGet(event, \"timestamp\")"
+  "$SET_RS|-F|rtSettingsRecordingCoverage"
   "$SET_TSX|-F|recording-coverage"
   "$SEC_RS|-F|sessions_revoked_at"
   "$SEC_RS|-F|agent_reached"
   "$SEC_RS|-F|shares_revoked"
   "$SEC_RS|-F|DELETE FROM settings WHERE key LIKE 'terminal_share_%'"
-  "$WS_RS|-F|decode::<Claims>"
-  "$WS_RS|-F|sessions_revoked_at.read()"
-  "$AGENT_SEC|-F|TERMINAL_PIDS"
-  "$TERM_SRC|-F|register_terminal(child_pid"
-  "$TERM_SRC|-F|forget_terminal(child_pid"
+  "$WS_RS|-F|decodeJWT("
+  "$WS_RS|-F|sessionsRevokedAt()"
+  "$AGENT_SEC|-F|TerminalPids"
+  "$TERM_SRC|-F|TerminalRegisterTerminal(pid,"
+  "$TERM_SRC|-F|TerminalForgetTerminal(pid)"
 )
 
 # Turn every CODE line matching the pattern into a comment, leaving the text.
@@ -700,7 +729,8 @@ PINNED=(
 # `mutated` is read as shell no matter what it holds. The path is flattened into
 # the basename because two of these subjects share one — the backend and the
 # agent each own a security.rs — and a shared scratch name would let one
-# subject's copy answer for the other's.
+# subject's copy answer for the other's. (In Go the two are rt_security.go and
+# agent/routes/security.go; the flattening is kept regardless.)
 scratch_name() { printf '%s' "$1" | tr '/' '_'; }
 
 comment_out_matches() {
@@ -807,12 +837,12 @@ insert_after() {  # <src> <anchor-regex> <line> <dst>
 
 # NC1 — §3's inline re-implementation detector. A route file that reads the
 # settings key itself, in code, must be reported.
-cat > "$FIXDIR/ctl_route.rs" <<'CTL'
-pub async fn fake_second_door() {
-    let list = settings_get(&state, "allowed_panel_ips").await;
+cat > "$FIXDIR/ctl_route.go" <<'CTL'
+func rtFakeSecondDoor(st *AppState, w http.ResponseWriter, r *http.Request) error {
+	list, _ := queryScalarOpt[string](r.Context(), st.DB, "SELECT value FROM settings WHERE key = 'allowed_panel_ips'")
 }
 CTL
-if [ -n "$(inline_allowlist_files "$FIXDIR/ctl_route.rs")" ]; then
+if [ -n "$(inline_allowlist_files "$FIXDIR/ctl_route.go")" ]; then
   ok "§3's duplicate-gate detector still fires on a real inline lookup in a route file"
 else
   bad "§3's duplicate-gate detector no longer sees a real inline lookup — the stripper is eating code and a second gate would pass unnoticed"
@@ -822,9 +852,9 @@ fi
 # 400 lines above the handler cannot become the insertion point; if it did, the
 # planted line would land outside the slice and the control would look broken
 # while the arm was fine.
-insert_after "$SEC_RS" '^pub async fn panic_button' \
-  '    let _ctl = json!({ "terminals_killed": true });' "$FIXDIR/ctl_panic.rs"
-CTL_PANIC=$(panic_body "$FIXDIR/ctl_panic.rs")
+insert_after "$SEC_RS" '^func rtSecurityPanicButton\\(' \
+  '	_ = map[string]any{"terminals_killed": true}' "$FIXDIR/ctl_panic.go"
+CTL_PANIC=$(panic_body "$FIXDIR/ctl_panic.go")
 if [ -n "$CTL_PANIC" ] && grep -qE '"terminals_killed": true' <<< "$CTL_PANIC"; then
   ok "the panic-response arm still fires when the hardcoded claim is really in code"
 else
@@ -832,10 +862,10 @@ else
 fi
 
 # NC3 — the agent's counter-reset arm.
-insert_after "$AGENT_SEC" '^async fn kill_terminals' \
-  '    let _ctl = ACTIVE_TERMINALS.swap(0, Ordering::SeqCst);' "$FIXDIR/ctl_kill.rs"
-CTL_KILL=$(kill_body "$FIXDIR/ctl_kill.rs")
-if [ -n "$CTL_KILL" ] && grep -qE 'ACTIVE_TERMINALS\.swap\(0' <<< "$CTL_KILL"; then
+insert_after "$AGENT_SEC" '^func securityKillTerminals\\(' \
+  '	_ = TerminalActiveTerminals.Swap(0)' "$FIXDIR/ctl_kill.go"
+CTL_KILL=$(kill_body "$FIXDIR/ctl_kill.go")
+if [ -n "$CTL_KILL" ] && grep -qE 'TerminalActiveTerminals\.Swap\(0' <<< "$CTL_KILL"; then
   ok "the counter-reset arm still fires when the reset is really in code"
 else
   bad "the counter-reset arm no longer fires on a real reset — an attacker's fresh quota would pass unnoticed"
