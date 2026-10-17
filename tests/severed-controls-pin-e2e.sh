@@ -26,11 +26,13 @@ G=/usr/bin/grep
 
 ORCH=panel/frontend/src/pages/BackupOrchestrator.tsx
 SERVERS=panel/frontend/src/pages/Servers.tsx
-ROUTES=panel/backend/src/routes/mod.rs
-BACKEND=panel/backend/src/routes/backup_orchestrator.rs
-MAIN=panel/backend/src/main.rs
+# The Go API registers each route beside its handler, so the route table is the
+# rt_*.go files themselves.
+BACKEND=panel/go/internal/api/rt_backup_orchestrator.go
+SERVERS_GO=panel/go/internal/api/rt_servers.go
+MAIN=panel/go/internal/api/core_state.go
 
-for f in "$ORCH" "$SERVERS" "$ROUTES" "$BACKEND" "$MAIN" README.md FEATURES.md; do
+for f in "$ORCH" "$SERVERS" "$BACKEND" "$SERVERS_GO" "$MAIN" README.md FEATURES.md; do
   [ -f "$f" ] || { bad "SETUP" "$f missing"; exit 1; }
 done
 
@@ -55,9 +57,9 @@ eq "A3 the DB-backup delete control calls its endpoint" \
 # A4: both ends. A caller pinned against a route that has been renamed is a pin
 # that passes while the product 404s.
 eq "A4 the three routes are still registered" \
-   "$($G -cE '"/api/backup-orchestrator/(db-backups/\{id\}(/restore)?|volume-backups/\{id\}/restore)"' "$ROUTES")" "3"
-eq "A4b the DELETE and the restore share the db-backups/{id} line" \
-   "$($G -c 'db-backups/{id}".*delete(backup_orchestrator::delete_db_backup)' "$ROUTES")" "1"
+   "$($G -cE '"(DELETE|POST) /api/backup-orchestrator/(db-backups/\{id\}(/restore)?|volume-backups/\{id\}/restore)"' "$BACKEND")" "3"
+eq "A4b the db-backups/{id} DELETE reaches the delete handler" \
+   "$($G -c 'r.Handle("DELETE /api/backup-orchestrator/db-backups/{id}", h(rtBackupOrchestratorDeleteDbBackup))' "$BACKEND")" "1"
 
 # A5: a restore overwrites a live database or volume. The drill beside it restores
 # into a scratch container, so these two must not be one press. Both tabs arm the
@@ -81,19 +83,19 @@ eq "A6-control the same pattern shape DOES match the db-backups delete" \
 # A7: the handlers stay ownership-scoped. Wiring a caller to a handler is what
 # makes its guards reachable for the first time (#534), so the guards are pinned
 # in the same suite as the callers.
-eq "A7 delete_db_backup is still owner-scoped" \
-   "$(sed -n '/pub async fn delete_db_backup(/,/^}/p' "$BACKEND" | $G -c 's\.user_id = \$1')" "1"
-eq "A7b restore_db_backup is still owner-scoped" \
-   "$(sed -n '/pub async fn restore_db_backup(/,/^}/p' "$BACKEND" | $G -c 's\.user_id = \$1')" "1"
-eq "A7c restore_volume_backup is still scoped to servers this operator runs" \
-   "$(sed -n '/pub async fn restore_volume_backup(/,/^}/p' "$BACKEND" | $G -c "u\.role = 'admin'")" "1"
+eq "A7 rtBackupOrchestratorDeleteDbBackup is still owner-scoped" \
+   "$(sed -n '/^func rtBackupOrchestratorDeleteDbBackup(/,/^}/p' "$BACKEND" | $G -c 's\.user_id = \$1')" "1"
+eq "A7b rtBackupOrchestratorRestoreDbBackup is still owner-scoped" \
+   "$(sed -n '/^func rtBackupOrchestratorRestoreDbBackup(/,/^}/p' "$BACKEND" | $G -c 's\.user_id = \$1')" "1"
+eq "A7c rtBackupOrchestratorRestoreVolumeBackup is still scoped to servers this operator runs" \
+   "$(sed -n '/^func rtBackupOrchestratorRestoreVolumeBackup(/,/^}/p' "$BACKEND" | $G -c "u\.role = 'admin'")" "1"
 
 echo "── B. Agent-token rotation is reachable ───────────────────────────────"
 
 eq "B1 the Servers page calls the token-rotation endpoint" \
    "$($G -c 'api\.post(`/servers/\${id}/rotate-token`)' "$SERVERS")" "1"
 eq "B2 the route is still registered" \
-   "$($G -c '"/api/servers/{id}/rotate-token"' "$ROUTES")" "1"
+   "$($G -c '"POST /api/servers/{id}/rotate-token", h(rtServersRotateToken)' "$SERVERS_GO")" "1"
 eq "B3 it sits behind its own confirm, not the TLS pin's" \
    "$($G -c 'setPendingTokenRotate({ id: s\.id, name: s\.name })' "$SERVERS")" "1"
 # B4: the two rotations are different controls with different consequences. If a
@@ -138,7 +140,7 @@ echo "── D. The background-services table cannot drift again ─────
 # #526: a warning is not a mechanism. docs-claims derives the COUNT and checks it
 # against README only, so FEATURES.md's own table drifted to 12 rows against 15
 # supervised services with nothing able to see it. This recomputes the row count.
-SUPERVISED=$($G -cE '^ *spawn_supervised\("' "$MAIN")
+SUPERVISED=$($G -cE '^\s*spawnSupervised\(shutdown, "' "$MAIN")
 TABLE_ROWS=$(awk '/^## Background Services/{f=1;next} f&&/^## /{exit} f&&/^\| `/{n++} END{print n+0}' FEATURES.md)
 [ "$SUPERVISED" -gt 10 ] && ok "D0 the derivation found $SUPERVISED supervised services" \
   || bad "D0 the derivation found $SUPERVISED supervised services" "implausibly low — the parse failed"
