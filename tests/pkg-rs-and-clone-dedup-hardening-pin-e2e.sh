@@ -41,7 +41,16 @@
 #       ACTUALLY ENFORCING would silently configure the firewall nobody is
 #       using. Fixed: check `firewall-cmd --state` first, matching setup.sh.
 #
-# Pure source analysis; no box, no network, no build.
+# REPOINTED TO THE GO PORT (panel/go): pkg.rs → internal/agent/services/pkg.go,
+# safe_cmd.rs → internal/agent/safecmd/safecmd.go, routes/nginx.rs →
+# internal/agent/routes/nginx.go, staging.rs → services/staging.go. F1's
+# kill_on_drop(true) is, in Go, a child built with safecmd.Exec on a ctx from
+# context.WithTimeout (exec.CommandContext SIGKILLs it at the deadline — see
+# TestPinTimeoutOrphanKillOnDropKillsTheChild). F2's output_with_timeout is
+# (*Unsandboxed).OutputWithTimeout; insert_unit_arg's argv behaviour is pinned
+# by the Go test TestUnitArgPlacementAndNames.
+#
+# Pure source analysis (plus one `go test`); no box, no network.
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -50,189 +59,152 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-# Strip comments and the test module. Only exits at a #[cfg(test)] line
-# immediately followed by `mod ` — a real test module, not a cfg-gated
-# function/const variant elsewhere in the file (project_dockpanel_lessons_p182).
-code() {
-  awk '
-    held == 1 {
-      if ($0 ~ /^mod /) { exit }
-      print heldline
-      held = 0
-    }
-    /^#\[cfg\(test\)\]$/ { held = 1; heldline = $0; next }
-    { print }
-  ' "$1" | grep -vE '^[[:space:]]*(///|//!|//|\*|/\*)'
-}
+# Strip comment lines (Go tests live in *_test.go, so no test module to cut).
+code() { grep -vE '^[[:space:]]*(//|\*|/\*)' "$1"; }
 has()   { [ -n "$(code "$1" | grep -F -- "$2")" ]; }
 hasre() { [ -n "$(code "$1" | grep -E -- "$2")" ]; }
 
-# One named function's body, comment-stripped. Anchored (^ ... \() — GNU
-# awk's \b silently matches nothing in default ERE mode. NOTE: this only
-# scopes precisely for TOP-LEVEL (non-impl-method) functions, whose closing
-# brace sits at column 0 — every pkg.rs function pinned below is top-level,
-# so this is exact there. safe_cmd.rs's UnsandboxedCommand methods are
-# INSIDE an impl block (their own closing brace is indented, not column 0),
-# so fnbody over-captures for them — deliberately NOT used for safe_cmd.rs
-# method bodies below; whole-file hasre()/has() is used there instead.
-fnbody()    { code "$1" | awk "/$2/,/^}/"; }
+# One Go function's body, comment-stripped, keyed on its LITERAL signature
+# prefix ("func Name(" or "func (u *T) Name("). Go methods are top-level, so
+# the column-0 `}` bounds them exactly — the Rust impl-block over-capture
+# caveat is gone.
+fnbody()    { code "$1" | awk -v fn="$2" 'index($0, fn) == 1 {f=1} f {print} f && /^}/ {exit}'; }
 bodyhas()   { [ -n "$(fnbody "$1" "$2" | grep -F -- "$3")" ]; }
 bodyhasre() { [ -n "$(fnbody "$1" "$2" | grep -E -- "$3")" ]; }
 
-PKG=panel/agent/src/services/pkg.rs
-SAFE_CMD=panel/agent/src/safe_cmd.rs
-NGINX_ROUTE=panel/agent/src/routes/nginx.rs
-STAGING=panel/agent/src/services/staging.rs
+GA=panel/go/internal/agent
+PKG=$GA/services/pkg.go
+SAFE_CMD=$GA/safecmd/safecmd.go
+NGINX_ROUTE=$GA/routes/nginx.go
+STAGING=$GA/services/staging.go
 INSTALL_AGENT_SH=scripts/install-agent.sh
 
 for f in "$PKG" "$SAFE_CMD" "$NGINX_ROUTE" "$STAGING" "$INSTALL_AGENT_SH"; do
   [ -f "$f" ] || { echo "missing source file: $f"; exit 1; }
 done
 
-echo "── 1. F1: the 4 safe_command(...) (sandboxed) sites in pkg.rs now kill_on_drop ──"
-if bodyhasre "$PKG" "^pub async fn installed_php_version" 'kill_on_drop\(true\)'; then
-  ok "installed_php_version() sets kill_on_drop(true)"
+echo "── 1. F1: the 4 sandboxed safecmd.Exec sites in pkg.go run on a deadline ctx (the Go kill_on_drop) ──"
+for fn in "func PkgInstalledPhpVersion(" "func PkgPhpStreams(" "func pkgRunOK(" "func pkgWhich("; do
+  if bodyhasre "$PKG" "$fn" 'ctx, cancel := context\.WithTimeout\(' && bodyhasre "$PKG" "$fn" 'safecmd\.Exec\(ctx, '; then
+    ok "${fn#func }) builds its child on a context.WithTimeout ctx"
+  else
+    bad "${fn#func }) runs its child without a deadline ctx — a timeout no longer kills it"
+  fi
+done
+# Whole-file count control: exactly 4 sandboxed safecmd.Exec/Command sites in
+# pkg.go and 4 context.WithTimeout — a site added without a deadline, or one
+# silently dropped, changes one of these counts.
+SB_COUNT=$(code "$PKG" | grep -Ec 'safecmd\.(Exec|Command)\(')
+WT_COUNT=$(code "$PKG" | grep -Fc 'context.WithTimeout(')
+if [ "$SB_COUNT" -eq 4 ] && [ "$WT_COUNT" -eq 4 ]; then
+  ok "pkg.go has exactly 4 sandboxed child sites and 4 context.WithTimeout deadlines"
 else
-  bad "installed_php_version() is missing kill_on_drop(true)"
-fi
-if bodyhasre "$PKG" "^pub async fn php_streams" 'kill_on_drop\(true\)'; then
-  ok "php_streams() sets kill_on_drop(true)"
-else
-  bad "php_streams() is missing kill_on_drop(true)"
-fi
-if bodyhasre "$PKG" "^async fn run_ok" 'kill_on_drop\(true\)'; then
-  ok "run_ok() sets kill_on_drop(true)"
-else
-  bad "run_ok() is missing kill_on_drop(true)"
-fi
-if bodyhasre "$PKG" "^async fn which" 'kill_on_drop\(true\)'; then
-  ok "which() sets kill_on_drop(true)"
-else
-  bad "which() is missing kill_on_drop(true)"
-fi
-# Whole-file count control: exactly 4 kill_on_drop(true) sites in pkg.rs —
-# a regression that ADDS one without pairing it correctly, or that silently
-# drops one, both change this count.
-KOD_COUNT=$(code "$PKG" | grep -Fc 'kill_on_drop(true)')
-if [ "$KOD_COUNT" -eq 4 ]; then
-  ok "pkg.rs has exactly 4 kill_on_drop(true) sites total"
-else
-  bad "pkg.rs has $KOD_COUNT kill_on_drop(true) sites, expected 4 — a site was added or removed"
+  bad "pkg.go has $SB_COUNT sandboxed child sites and $WT_COUNT WithTimeout deadlines, expected 4/4 — a site was added or removed"
 fi
 
 echo
-echo "── 2. F2: safe_cmd.rs gains output_with_timeout() + insert_unit_arg(), used everywhere ──"
-if hasre "$SAFE_CMD" 'pub async fn output_with_timeout'; then
-  ok "UnsandboxedCommand::output_with_timeout exists"
+echo "── 2. F2: safecmd.go has OutputWithTimeout() + insertUnitArg(), used everywhere ──"
+OWT='func (u *Unsandboxed) OutputWithTimeout('
+if has "$SAFE_CMD" "$OWT"; then
+  ok "(*Unsandboxed).OutputWithTimeout exists"
 else
-  bad "output_with_timeout is missing"
+  bad "OutputWithTimeout is missing"
 fi
-if hasre "$SAFE_CMD" 'fn insert_unit_arg\(argv: &mut Vec<std::ffi::OsString>\)'; then
-  ok "insert_unit_arg helper exists with the expected signature"
+# insert_unit_arg signature arm retired (obsolete in Go): the method's shape is compiler-checked at its one caller
+# insert_unit_arg scans-for-'--' arm retired: covered by TestUnitArgPlacementAndNames (panel/go/internal/agent/safecmd/safecmd_test.go)
+# insert_unit_arg inserts --unit= arm retired: covered by TestUnitArgPlacementAndNames (safecmd_test.go)
+if (cd panel/go && go test ./internal/agent/safecmd/ -count=1 -run '^TestUnitArgPlacementAndNames$' >/dev/null 2>&1); then
+  ok "insertUnitArg places --unit=<unique name> immediately before the -- separator, whatever the env prefix (Go test)"
 else
-  bad "insert_unit_arg is missing or its signature changed"
+  bad "TestUnitArgPlacementAndNames fails — the unit naming may have regressed to a fixed-index insert"
 fi
-if bodyhasre "$SAFE_CMD" "^fn insert_unit_arg\(" 'position\(\|a\| a == "--"\)'; then
-  ok "insert_unit_arg scans for the -- separator rather than assuming a fixed index"
+if bodyhas "$SAFE_CMD" "$OWT" 'binary, unit := u.insertUnitArg()'; then
+  ok "OutputWithTimeout actually calls insertUnitArg on its own argv"
 else
-  bad "insert_unit_arg no longer scans for the -- separator — may have regressed to a fixed-index insert"
+  bad "OutputWithTimeout no longer calls insertUnitArg — the unit-naming fix may be dead code"
 fi
-if bodyhasre "$SAFE_CMD" "^fn insert_unit_arg\(" '--unit='; then
-  ok "insert_unit_arg inserts a --unit= argument"
-else
-  bad "insert_unit_arg no longer inserts --unit="
-fi
-if hasre "$SAFE_CMD" 'insert_unit_arg\(&mut self\.argv\)'; then
-  ok "output_with_timeout actually calls insert_unit_arg on its own argv"
-else
-  bad "output_with_timeout no longer calls insert_unit_arg — the unit-naming fix may be dead code"
-fi
-if hasre "$SAFE_CMD" '"stop", "--no-block", &stop_unit'; then
+if bodyhas "$SAFE_CMD" "$OWT" '"systemctl", "stop", "--no-block", unit)'; then
   ok "the timeout branch runs systemctl stop --no-block on the named unit"
 else
   bad "the timeout branch no longer stops the named unit — the remote-unit-orphan bug may have regressed"
 fi
-# The stop must be fire-and-forget (tokio::spawn, not awaited inline) so
-# cleanup can never delay/mask the timeout error itself. Scoped to this
-# fix's own literal (a bare `tokio::spawn(async move {` search is too weak
-# — spawn_streaming()'s PRE-EXISTING, unrelated status-waiter task already
-# has one, so that pattern alone passes even against pre-fix code).
-if hasre "$SAFE_CMD" 'let stop_unit = unit\.clone\(\);'; then
-  ok "the systemctl stop runs in a detached task (fire-and-forget, does not block the timeout error)"
+# The stop must be fire-and-forget (a goroutine, not run inline) so cleanup
+# can never delay/mask the timeout error itself. Scoped to OutputWithTimeout's
+# own body — SpawnStreaming has unrelated goroutines.
+if [ -n "$(fnbody "$SAFE_CMD" "$OWT" | tr '\n\t' '  ' | grep -E 'go func\(\) \{[^}]*"systemctl", "stop", "--no-block", unit\)')" ]; then
+  ok "the systemctl stop runs in a detached goroutine (fire-and-forget, does not block the timeout error)"
 else
   bad "the systemctl stop no longer looks detached — may now block the caller on cleanup"
 fi
-# spawn_streaming() must be untouched — explicitly out of scope for this fix.
-SPAWN_STREAMING_KOD=$(code "$SAFE_CMD" | grep -c 'pub fn spawn_streaming')
+# SpawnStreaming must be untouched — explicitly out of scope for this fix.
+SPAWN_STREAMING_KOD=$(code "$SAFE_CMD" | grep -Fc 'func (u *Unsandboxed) SpawnStreaming(')
 if [ "$SPAWN_STREAMING_KOD" -eq 1 ]; then
-  ok "spawn_streaming() is still present, unduplicated (control: out-of-scope surface untouched)"
+  ok "SpawnStreaming() is still present, unduplicated (control: out-of-scope surface untouched)"
 else
-  bad "spawn_streaming() count is $SPAWN_STREAMING_KOD, expected 1 — check for accidental duplication/removal"
+  bad "SpawnStreaming() count is $SPAWN_STREAMING_KOD, expected 1 — check for accidental duplication/removal"
 fi
 
 echo
-echo "── 3. F2: every safe_command_unsandboxed(...) call site in pkg.rs routes through output_with_timeout ──"
-USC_COUNT=$(code "$PKG" | grep -Fc 'safe_command_unsandboxed(')
-OWT_COUNT=$(code "$PKG" | grep -Fc 'output_with_timeout(')
+echo "── 3. F2: every safecmd.NewUnsandboxed(...) call site in pkg.go routes through OutputWithTimeout ──"
+USC_COUNT=$(code "$PKG" | grep -Fc 'safecmd.NewUnsandboxed(')
+OWT_COUNT=$(code "$PKG" | grep -Fc 'OutputWithTimeout(')
 if [ "$USC_COUNT" -eq 6 ] && [ "$OWT_COUNT" -eq 6 ]; then
-  ok "6 safe_command_unsandboxed(...) call sites, 6 output_with_timeout(...) call sites — 1:1"
+  ok "6 safecmd.NewUnsandboxed(...) call sites, 6 OutputWithTimeout(...) call sites — 1:1"
 else
-  bad "safe_command_unsandboxed count=$USC_COUNT, output_with_timeout count=$OWT_COUNT (expected 6/6) — a call site may have been added, removed, or left on the old external-timeout pattern"
+  bad "NewUnsandboxed count=$USC_COUNT, OutputWithTimeout count=$OWT_COUNT (expected 6/6) — a call site may have been added, removed, or left on the old external-timeout pattern"
 fi
-# Control: no leftover instance of the OLD pattern (an external
-# tokio::time::timeout directly wrapping a safe_command_unsandboxed(...)
-# .output() call) — the exact shape this fix replaced everywhere.
-if hasre "$PKG" 'tokio::time::timeout\(\s*(INSTALL_TIMEOUT|Duration::from_secs\(30\)),\s*$'; then
-  bad "found a tokio::time::timeout(...) opener that may still directly wrap a raw .output() call — re-check it routes through output_with_timeout instead"
+# Control: no leftover instance of the OLD pattern — an Unsandboxed run via
+# plain .Output(ctx) under an external deadline, which kills only the local
+# waiter. (The 6/6 count above is this absence arm's positive anchor.)
+if hasre "$PKG" '\.Output\(ctx\)'; then
+  bad "found an Unsandboxed .Output(ctx) in pkg.go — an external timeout there kills only the waiter; route it through OutputWithTimeout"
 else
-  ok "no leftover external-timeout-wrapping-raw-output() pattern in pkg.rs"
+  ok "no leftover external-timeout-wrapping-raw-Output() pattern in pkg.go"
 fi
 for anchor in \
-  "^pub async fn enable_php_stream" \
-  "^async fn transact" \
-  "^pub async fn refresh_index" \
-  "^async fn escape_hatch_works" \
-  "^pub async fn add_repo"
+  "func PkgEnablePhpStream(" \
+  "func pkgTransact(" \
+  "func PkgRefreshIndex(" \
+  "func pkgEscapeHatchWorks(" \
+  "func PkgAddRepo("
 do
-  if bodyhasre "$PKG" "$anchor" 'output_with_timeout\('; then
-    ok "$anchor now uses output_with_timeout"
+  if bodyhasre "$PKG" "$anchor" 'OutputWithTimeout\('; then
+    ok "${anchor#func }) now uses OutputWithTimeout"
   else
-    bad "$anchor no longer calls output_with_timeout — may have regressed to the old pattern"
+    bad "${anchor#func }) no longer calls OutputWithTimeout — may have regressed to the old pattern"
   fi
 done
 
 echo
-echo "── 4. F3: nginx.rs::clone_site delegates to staging.rs::clone_files ──"
-if bodyhas "$NGINX_ROUTE" "^async fn clone_site" "services::staging::clone_files("; then
-  ok "clone_site calls services::staging::clone_files"
+echo "── 4. F3: nginx.go cloneSite delegates to staging.go StagingCloneFiles ──"
+CS='func (n nginxRoutes) cloneSite('
+if bodyhas "$NGINX_ROUTE" "$CS" "services.StagingCloneFiles(ctx, b.SourceDomain, b.TargetDomain)"; then
+  ok "cloneSite calls services.StagingCloneFiles"
 else
-  bad "clone_site no longer calls services::staging::clone_files — the dedup may have regressed"
+  bad "cloneSite no longer calls services.StagingCloneFiles — the dedup may have regressed"
 fi
-if bodyhasre "$NGINX_ROUTE" "^async fn clone_site" '"rsync"'; then
-  bad "clone_site still has its own inline rsync call — the duplicate implementation was not actually removed"
+if bodyhasre "$NGINX_ROUTE" "$CS" '"rsync"'; then
+  bad "cloneSite still has its own inline rsync call — the duplicate implementation was not actually removed"
 else
-  ok "clone_site no longer runs its own inline rsync (control: real dedup, not just an added delegate call)"
+  ok "cloneSite no longer runs its own inline rsync (control: real dedup, not just an added delegate call)"
 fi
-if bodyhasre "$NGINX_ROUTE" "^async fn clone_site" 'www-data:www-data'; then
-  bad "clone_site still has its own inline chown-to-www-data logic — the duplicate implementation was not actually removed"
+if bodyhasre "$NGINX_ROUTE" "$CS" 'www-data:www-data'; then
+  bad "cloneSite still has its own inline chown-to-www-data logic — the duplicate implementation was not actually removed"
 else
-  ok "clone_site no longer runs its own inline chown (control: chown logic now lives only in clone_files)"
+  ok "cloneSite no longer runs its own inline chown (control: chown logic now lives only in StagingCloneFiles)"
 fi
-# clone_files itself must be untouched — the delegation target, not the
-# thing being changed.
-if hasre "$STAGING" 'pub async fn clone_files\(source_domain: &str, target_domain: &str\)'; then
-  ok "staging.rs::clone_files signature is unchanged (control: delegation target untouched)"
+# StagingCloneFiles itself must be untouched — the delegation target.
+if hasre "$STAGING" '^func StagingCloneFiles\(ctx context\.Context, src, dst string\) \(string, error\)'; then
+  ok "staging.go StagingCloneFiles signature is unchanged (control: delegation target untouched)"
 else
-  bad "staging.rs::clone_files signature changed — re-check the delegation call still matches"
+  bad "staging.go StagingCloneFiles signature changed — re-check the delegation call still matches"
 fi
-# clone_site's own post-copy work (the one thing that should NOT have moved
-# into clone_files) must still be present.
-if bodyhas "$NGINX_ROUTE" "^async fn clone_site" '"du"'; then
-  ok "clone_site still computes size via du (control: route-specific tail preserved)"
+# cloneSite's own post-copy work must still be present.
+if bodyhas "$NGINX_ROUTE" "$CS" '"du", "-sb", targetDir'; then
+  ok "cloneSite still computes size via du (control: route-specific tail preserved)"
 else
-  bad "clone_site's own du -sb size computation is missing"
+  bad "cloneSite's own du -sb size computation is missing"
 fi
-
 echo
 echo "── 5. F4: install-agent.sh checks firewalld's ACTIVE STATE before ufw ──"
 if hasre "$INSTALL_AGENT_SH" 'firewall-cmd --state'; then

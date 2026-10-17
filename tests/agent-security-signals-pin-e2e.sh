@@ -26,7 +26,7 @@
 #     shell. Measured: JSON frame -> 1 event, raw frame -> 0, same command.
 #  3. A REFUSED command `break`s before the classifier, so the strongest thing the
 #     product can observe reached nothing but the agent's own journal.
-#  4. `list_ssh_keys` read /root/.ssh/authorized_keys with an in-process
+#  4. `list_ssh_keys` (now serverUtilsListSSHKeys) read /root/.ssh/authorized_keys with an in-process
 #     `read_to_string(...).unwrap_or_default()` while the unit's `ProtectHome=yes`
 #     binds an inaccessible dir over /root. It answered 200 with an EMPTY LIST on a
 #     box with three live root keys — a false all-clear, on every install, since the
@@ -58,12 +58,14 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-TERM_RS=panel/agent/src/routes/terminal.rs
-BACKUPS=panel/agent/src/services/backups.rs
-MAIN_RS=panel/agent/src/main.rs
-SEC_RS=panel/agent/src/routes/security.rs
-UTILS=panel/agent/src/routes/server_utils.rs
-HEALER=panel/backend/src/services/auto_healer.rs
+# The Go port (panel/go). Behaviour that a test can call directly is pinned by
+# Go tests now; the arms left here are the WIRING a unit test cannot see.
+TERM_RS=panel/go/internal/agent/routes/terminal.go
+BACKUPS=panel/go/internal/agent/services/backups.go
+MAIN_RS=panel/go/cmd/dockpanel-agent/main.go
+SEC_RS=panel/go/internal/agent/routes/security.go
+UTILS=panel/go/internal/agent/routes/server_utils.go
+HEALER=panel/go/internal/api/svc_auto_healer.go
 SETUP=scripts/setup.sh
 UPDATE=scripts/update.sh
 
@@ -84,7 +86,7 @@ code() {
 subj() { local t; t=$(code "$1"); [ -n "$t" ] || return 1; printf '%s' "$t"; }
 has()   { grep -qE -- "$2" <<< "$1"; }
 count() { grep -cE -- "$2" <<< "$1" || true; }
-flat()  { tr '\n' ' ' <<< "$1" | tr -s ' '; }
+flat()  { tr '\n\t' '  ' <<< "$1" | tr -s ' '; }  # Go indents with tabs
 # One function's body, bounded by its OWN closing brace in column 0.
 fn_body() { awk -v pat="$1" '$0 ~ pat {f=1} f {print} f && /^\}/ {exit}' <<< "$2"; }
 
@@ -100,41 +102,19 @@ echo "§A  a backup of the panel database is root-only"
 # s280 install-template delivery shape.
 if [ -z "$BACKUPS_S" ]; then
   bad "A1 SKIPPED: $BACKUPS did not yield source"
-elif has "$BACKUPS_S" 'pub fn secure_backup_tree' && has "$(subj "$MAIN_RS")" 'secure_backup_tree\(\)'; then
+elif has "$BACKUPS_S" '^func BackupsSecureBackupTree\(\)' && has "$(subj "$MAIN_RS")" 'services\.BackupsSecureBackupTree\(\)'; then
   ok "A1 the backup tree is re-secured at every agent start, so existing installs are repaired"
 else
   bad "A1 nothing repairs a backup tree that is already world-readable — new writes alone do not reach an existing install"
 fi
 
-# A2 — the modes it enforces. 0700 on the directory is the load-bearing half: at
-# that mode nothing under the tree is reachable by a non-root uid whatever the
-# individual files say.
-if [ -z "$BACKUPS_S" ]; then
-  bad "A2 SKIPPED: $BACKUPS did not yield source"
+# A2 retired: covered by TestAWorldReadableBackupTreeIsRepaired (panel/go/internal/agent/services/backups_test.go)
+# A3 retired: covered by TestSecureTreeDoesNotFollowASymlinkOutOfTheTree (panel/go/internal/agent/services/backups_test.go)
+if (cd panel/go && go test ./internal/agent/services/ -count=1 \
+      -run '^(TestAWorldReadableBackupTreeIsRepaired|TestSecureTreeDoesNotFollowASymlinkOutOfTheTree)$' >/dev/null 2>&1); then
+  ok "A2/A3 the Go tests pinning 0700/0600 and the symlink refusal pass"
 else
-  BODY=$(fn_body 'fn secure_tree_at' "$BACKUPS_S")
-  BODY_FLAT=$(flat "$BODY")
-  if [ -z "$BODY" ]; then
-    bad "A2 SKIPPED: could not bound secure_tree_at"
-  elif has "$BODY_FLAT" '0o700' && has "$BODY_FLAT" '0o600'; then
-    ok "A2 it enforces 0700 on directories and 0600 on files"
-  else
-    bad "A2 the enforced modes are not 0700/0600 — a dump readable by www-data is a root credential for the whole fleet"
-  fi
-fi
-
-# A3 — it must never chmod THROUGH a symlink, or a writer that dropped one in the
-# tree could aim a root-owned set_permissions at any path on the box.
-if [ -z "$BACKUPS_S" ]; then
-  bad "A3 SKIPPED: $BACKUPS did not yield source"
-else
-  BODY=$(fn_body 'fn secure_tree_at' "$BACKUPS_S")
-  N=$(count "$BODY" 'is_symlink\(\)')
-  if [ "$N" -ge 2 ]; then
-    ok "A3 the walk and the chmod both refuse a symlink ($N guards)"
-  else
-    bad "A3 only $N symlink guard(s) in secure_tree_at — a planted link would redirect a root chmod out of the tree"
-  fi
+  bad "A2/A3 the backup-tree Go tests fail — the modes or the symlink guard regressed"
 fi
 
 # A4 — EVERY writer, not just the one that was found first. Three produce these
@@ -183,7 +163,7 @@ umask_near_backup_block() {
   grep -qE '^\s*umask 077\s*$|umask 077; docker exec' <<< "$win"
 }
 A4=0
-has "$(subj "$SEC_RS")" 'mode\(0o600\)' || { bad "A4a the agent's own /security/db-backup still creates the dump with the default mode"; A4=1; }
+has "$(flat "$(fn_body '^func securityDbBackup[(]' "$(subj "$SEC_RS")")")" 'os\.OpenFile\(filename, [^)]*0o600\)' || { bad "A4a the agent's own /security/db-backup still creates the dump with the default mode"; A4=1; }
 has "$(flat "$HEALER_S")" 'umask 077; docker exec dockpanel-postgres pg_dump' || { bad "A4b the panel's auto-healer dump still lands 0644 (the > redirect creates 0666 \& ~umask)"; A4=1; }
 umask_near_backup_block "$SETUP"; case $? in
   0) ;;
@@ -200,47 +180,29 @@ esac
 echo "§B  input is judged the same whatever frame shape carried it"
 
 # B1 — THE ARM THAT MATTERS. There is ONE reconstruct-and-classify path and BOTH
-# input arms reach it. A unit test cannot assert this: it calls observe_input
-# directly and would stay green with an arm reverted to its own inline loop.
+# input arms reach it. A unit test cannot assert this: it calls
+# terminalObserveInput directly and would stay green with an arm reverted to its
+# own inline loop. In Go the one path is the `forward` closure, and both the
+# raw-text arm and the {"type":"input"} arm must call it.
 if [ -z "$TERM_S" ]; then
   bad "B1 SKIPPED: $TERM_RS did not yield source"
 else
-  N=$(count "$TERM_S" '= observe_input\(&?(data|text),')
-  if [ "$N" -eq 2 ]; then
-    ok "B1 both the JSON-frame arm and the raw-text arm go through the one observe_input path"
+  N=$(count "$TERM_S" '!forward\((text|data)\)')
+  FWD=$(awk '/forward := func\(data string\) bool \{/{f=1} f{print} f && /^\t\}$/{exit}' <<< "$TERM_S")
+  if [ "$N" -eq 2 ] && has "$FWD" 'terminalObserveInput\(data, '; then
+    ok "B1 both the JSON-frame arm and the raw-text arm go through the one terminalObserveInput path"
   else
-    bad "B1 $N of 2 input arms call observe_input — a frame shape is being classified differently again, which is the v2.87.0 defect"
+    bad "B1 $N of 2 input arms call forward (or forward no longer classifies) — a frame shape is being classified differently again, which is the v2.87.0 defect"
   fi
 fi
 
-# B2 — the SUSPICIOUS half is NOT gated on the terminal kind. A root shell is
-# where an observation is worth the most, and it is the shell an intruder holding
-# a stolen admin session opens (see TERMINAL_PIDS' own doc).
-if [ -z "$TERM_S" ]; then
-  bad "B2 SKIPPED: $TERM_RS did not yield source"
+# B2 retired: covered by TestTerminalARootShellIsObservedToo (panel/go/internal/agent/routes/terminal_test.go)
+# B3 retired: covered by TestTerminalTheBlockHalfIsStillSiteOnly (panel/go/internal/agent/routes/terminal_test.go)
+if (cd panel/go && go test ./internal/agent/routes/ -count=1 \
+      -run '^(TestTerminalARootShellIsObservedToo|TestTerminalTheBlockHalfIsStillSiteOnly|TestTerminalFrameShapeDoesNotChangeWhatIsObserved|TestTerminalARefusedCommandIsReported)$' >/dev/null 2>&1); then
+  ok "B2/B3 the Go tests pinning the ungated suspicious half and the site-only block half pass"
 else
-  OBS=$(fn_body 'fn observe_input' "$TERM_S")
-  OBS_FLAT=$(flat "$OBS")
-  if [ -z "$OBS" ]; then
-    bad "B2 SKIPPED: could not bound observe_input"
-  elif has "$OBS_FLAT" 'if command_filter::is_suspicious_command\(&line\)' \
-    && ! has "$OBS_FLAT" 'is_site_terminal && command_filter::is_suspicious_command'; then
-    ok "B2 the suspicious check runs on a server shell too, not only on a site shell"
-  else
-    bad "B2 the suspicious check is gated on the terminal kind — a root shell would emit no intrusion signal"
-  fi
-fi
-
-# B3 — and the BLOCK half is still site-only, in the same condition. Widening it
-# would take `cd ..` from an administrator's server shell, which is a real
-# regression in the opposite direction (pinned from the other side in
-# client-role-and-server-ownership-pin-e2e.sh §D).
-if [ -z "$TERM_S" ]; then
-  bad "B3 SKIPPED: $TERM_RS did not yield source"
-elif has "$TERM_S" 'is_site_terminal && !command_filter::is_safe_terminal_command'; then
-  ok "B3 the block half is still site-only, gated in the same condition as the call"
-else
-  bad "B3 the block gate and the block call have drifted apart"
+  bad "B2/B3 the terminal observation Go tests fail"
 fi
 
 echo "§C  a refusal is reported, and does NOT arm the auto-lockdown"
@@ -250,7 +212,7 @@ echo "§C  a refusal is reported, and does NOT arm the auto-lockdown"
 # consumer outside the agent's own journal.
 if [ -z "$TERM_S" ]; then
   bad "C1 SKIPPED: $TERM_RS did not yield source"
-elif has "$TERM_S" 'write_suspicious_event\("terminal\.blocked_command"'; then
+elif has "$TERM_S" 'terminalWriteSuspiciousEvent\("terminal\.blocked_command"'; then
   ok "C1 a refused command is written to the panel's intrusion channel, not only to the journal"
 else
   bad "C1 a REFUSED command is still reported to nobody — the strongest observation the product can make is silent"
@@ -262,7 +224,7 @@ fi
 if [ -z "$TERM_S" ]; then
   bad "C2 SKIPPED: $TERM_RS did not yield source"
 else
-  N=$(count "$TERM_S" 'write_suspicious_event\("terminal\.(blocked|suspicious)_command"')
+  N=$(count "$TERM_S" 'terminalWriteSuspiciousEvent\("terminal\.(blocked|suspicious)_command"')
   if [ "$N" -eq 2 ]; then
     ok "C2 a refusal and an allowed-but-suspicious line are distinguishable event types"
   else
@@ -280,12 +242,11 @@ fi
 if [ -z "$HEALER_S" ]; then
   bad "C3 SKIPPED: $HEALER did not yield source"
 else
-  ING=$(fn_body 'async fn security_ingest_suspicious_events' "$HEALER_S")
+  ING=$(fn_body '^func autoHealerSecurityIngestSuspiciousEvents[(]' "$HEALER_S")
   ING_FLAT=$(flat "$ING")
   if [ -z "$ING" ]; then
-    bad "C3 SKIPPED: could not bound security_ingest_suspicious_events"
-  elif has "$ING_FLAT" 'counts_toward_lockdown = event_type != "terminal\.blocked_command"' \
-    && has "$ING_FLAT" 'if counts_toward_lockdown'; then
+    bad "C3 SKIPPED: could not bound autoHealerSecurityIngestSuspiciousEvents"
+  elif has "$ING_FLAT" 'if eventType != "terminal\.blocked_command" \{ locked = SecurityHardeningRecordSuspiciousEventAt\('; then
     ok "C3 a refusal is audited but does NOT count toward auto-lockdown — a blunt blocklist cannot lock the panel out"
   else
     bad "C3 refusals feed the auto-lockdown counter — 5 accidental '..' refusals in 10 minutes would block every non-admin for 24h"
@@ -298,8 +259,8 @@ fi
 if [ -z "$HEALER_S" ]; then
   bad "C4 SKIPPED: $HEALER did not yield source"
 else
-  ING=$(fn_body 'async fn security_ingest_suspicious_events' "$HEALER_S")
-  if has "$(flat "$ING")" 'security_hardening::audit_log\('; then
+  ING=$(fn_body '^func autoHealerSecurityIngestSuspiciousEvents[(]' "$HEALER_S")
+  if has "$(flat "$ING")" '\} SecurityHardeningAuditLog\(ctx, db, eventType'; then
     ok "C4 every ingested event still reaches the audit log the panel renders"
   else
     bad "C4 the ingest no longer audits — a refusal would be silent again, by a different route"
@@ -308,44 +269,29 @@ fi
 
 echo "§D  the root shell's environment and privilege drop survive to execv"
 
-# D1 — no `putenv` in the fork child. It STORES THE POINTER; every variable was a
-# CString bound inside the block that set it, so Rust freed it at that block's
-# closing brace while environ kept pointing at the freed chunk — and execv runs
-# after those braces. Measured: 17 of 17 asciicast recordings on the demo box open
-# `root@host:/root#` where a live HOME=/root renders `root@host:~#`. HOME was dead
-# in every root terminal this panel has ever served.
-if [ -z "$TERM_S" ]; then
-  bad "D1 SKIPPED: $TERM_RS did not yield source"
-else
-  N_PUT=$(count "$TERM_S" 'libc::putenv')
-  N_SET=$(count "$TERM_S" 'libc::setenv')
-  if [ "$N_PUT" -eq 0 ] && [ "$N_SET" -ge 4 ]; then
-    ok "D1 the child sets its environment with setenv (which COPIES); no putenv survives ($N_SET setenv)"
-  else
-    bad "D1 $N_PUT putenv call(s) remain — putenv stores the pointer, and every one of these CStrings is freed before execv"
-  fi
-fi
+# D1 retired (obsolete in Go): the defect was putenv storing a pointer to a
+# CString freed before execv. Go has no fork-child code at all — the child's
+# environment is cmd.Env, a []string copied by the runtime into the exec — so
+# there is no pointer to dangle. (HOME=/root is set in terminalOpenPtyShell.)
 
 # D2 — the privilege drop is CHECKED. A failed setuid (EAGAIN at RLIMIT_NPROC is
 # the reachable one, since www-data also runs every PHP-FPM worker) used to fall
 # through to execv and hand the SITE'S OWNER a root shell in their own webroot.
+# In Go the drop is SysProcAttr.Credential, which the runtime applies in the
+# child and ABORTS the exec on failure — so the property is that the site path
+# sets the credential on the SAME attrs that start the PTY.
 if [ -z "$TERM_S" ]; then
   bad "D2 SKIPPED: $TERM_RS did not yield source"
 else
-  BODY=$(fn_body 'fn open_pty_shell' "$TERM_S")
+  BODY=$(fn_body '^func terminalOpenPtyShell[(]' "$TERM_S")
   BODY_FLAT=$(flat "$BODY")
   if [ -z "$BODY" ]; then
-    bad "D2 SKIPPED: could not bound open_pty_shell"
-  # ⚠ MATCHED AS ONE CONSTRUCT, not as three tokens. The first draft asserted the
-  # three comparisons were PRESENT, and a mutation survived it: prefixing the
-  # condition with `false &&` leaves every one of those substrings intact while
-  # making the guard unreachable, so the arm printed green over the exact defect
-  # it exists to catch (#321 — a token that a rewrite keeps is a spelling test).
-  # The `if` must OPEN on setgid and the body must exit.
-  elif has "$BODY_FLAT" 'if libc::setgid\(gid\) != 0 \|\| libc::initgroups\(username, gid\) != 0 \|\| libc::setuid\(uid\) != 0 \{[^}]*_exit\(1\)'; then
-    ok "D2 all three privilege-drop syscalls gate an _exit — a failed drop cannot reach execv"
+    bad "D2 SKIPPED: could not bound terminalOpenPtyShell"
+  elif has "$BODY_FLAT" 'if site \{ .*attrs\.Credential = &syscall\.Credential\{Uid: uid, Gid: gid, Groups: groups\}' \
+    && [ "$(count "$BODY" 'pty\.StartWithAttrs\(cmd, size, attrs\)')" -eq 2 ]; then
+    ok "D2 the site shell's uid/gid/groups drop is applied by the runtime on the attrs that start the PTY — a failed drop aborts the exec"
   else
-    bad "D2 a privilege-drop syscall's result is discarded or no longer gates the exit — a failed drop execs a ROOT shell for the site's owner"
+    bad "D2 the privilege drop is no longer on the attrs the PTY starts with — a site terminal could exec a ROOT shell for the site's owner"
   fi
 fi
 
@@ -354,9 +300,11 @@ fi
 if [ -z "$TERM_S" ]; then
   bad "D3 SKIPPED: $TERM_RS did not yield source"
 else
-  BODY_FLAT=$(flat "$(fn_body 'fn open_pty_shell' "$TERM_S")")
-  if has "$BODY_FLAT" 'libc::getuid\(\) != uid \|\| libc::geteuid\(\) != uid'; then
-    ok "D3 the child asks the kernel who it actually is before exec'ing a shell"
+  BODY_FLAT=$(flat "$(fn_body '^func terminalOpenPtyShell[(]' "$TERM_S")")
+  CREDS_FLAT=$(flat "$(fn_body '^func terminalCredsAre[(]' "$TERM_S")")
+  if has "$BODY_FLAT" 'if !terminalCredsAre\(cmd\.Process\.Pid, uid, gid\) \{[^}]*cmd\.Process\.Kill\(\)[^}]*return nil, nil' \
+    && has "$CREDS_FLAT" '/proc/%d/status' && has "$CREDS_FLAT" 'want\("Uid:", \[\]int\{1, 2\}, uid\)'; then
+    ok "D3 the agent asks the kernel who the child actually is (real+effective uid) before handing over the shell"
   else
     bad "D3 nothing confirms the drop actually happened"
   fi
@@ -367,37 +315,27 @@ echo "§E  \"no SSH keys\" means the agent looked"
 # E1 — the read no longer swallows its error. This is the false all-clear: the
 # panel's only view of who can SSH in as root answered 200 with an empty list on
 # a box with three live keys, on every install, because ProtectHome=yes hides
-# /root from the agent and the error became an empty string.
+# /root from the agent and the error became an empty string. Keyed on the
+# OPERATION: every SSH handler reads through the checked helper and returns on
+# its error, and none of them touches the file in-process.
 if [ -z "$UTILS_S" ]; then
   bad "E1 SKIPPED: $UTILS did not yield source"
 else
-  BODY=$(fn_body 'async fn list_ssh_keys' "$UTILS_S")
+  BODY=$(fn_body '^func serverUtilsListSSHKeys[(]' "$UTILS_S")
   BODY_FLAT=$(flat "$BODY")
-  # ⚠ KEYED ON THE PROPERTY, NOT ON `unwrap_or_default`. The first draft of this
-  # arm forbade that token inside the function and went RED on correct code:
-  # `remove_ssh_key` carries one for an unrelated base64 decode, and
-  # `list_ssh_keys` legitimately defaults the OPTION (absent file = no keys) once
-  # the `?` has already propagated the READ error. The property is that the read
-  # goes through the checked helper and its failure propagates — an absent file
-  # and an unreadable one must be different answers.
-  # Scoped to the three SSH handlers, and keyed on the OPERATION rather than on a
-  # spelling. Two earlier drafts were wrong in opposite directions: matching a
-  # bare `read_to_string(path)` went red on `get_whitelist` (a different handler,
-  # a different file), and matching the literal path went VACUOUS at v2.87.0,
-  # where the old code bound `let path = "/root/.ssh/authorized_keys"` first and
-  # so spelled neither. Counting in-process fs calls inside the handlers is what
-  # actually distinguishes the two trees: 6 at v2.87.0, 0 here.
   SSH_FNS=$(printf '%s\n%s\n%s\n' \
-    "$(fn_body 'async fn list_ssh_keys' "$UTILS_S")" \
-    "$(fn_body 'async fn add_ssh_key' "$UTILS_S")" \
-    "$(fn_body 'async fn remove_ssh_key' "$UTILS_S")")
-  N_RAW=$(count "$SSH_FNS" 'tokio::fs::')
+    "$BODY" \
+    "$(fn_body '^func serverUtilsAddSSHKey[(]' "$UTILS_S")" \
+    "$(fn_body '^func serverUtilsRemoveSSHKey[(]' "$UTILS_S")")
+  N_RAW=$(count "$SSH_FNS" 'os\.(ReadFile|WriteFile|Open|OpenFile|Create)\(')
+  # occurrences, not lines: flat() makes the three bodies one line.
+  N_CHK=$(grep -oE 'serverUtilsReadAuthorizedKeys\(r\.Context\(\)\) if err != nil \{ writeErr\(' <<< "$(flat "$SSH_FNS")" | wc -l | tr -d ' ')
   if [ -z "$BODY" ]; then
-    bad "E1 SKIPPED: could not bound list_ssh_keys"
-  elif has "$BODY_FLAT" 'read_authorized_keys\(\) \.await \.map_err\(' && [ "$N_RAW" -eq 0 ]; then
-    ok "E1 an unreadable authorized_keys propagates as an error; only an ABSENT one is an empty list"
+    bad "E1 SKIPPED: could not bound serverUtilsListSSHKeys"
+  elif [ "$N_CHK" -eq 3 ] && [ "$N_RAW" -eq 0 ]; then
+    ok "E1 an unreadable authorized_keys propagates as an error in all 3 handlers; only an ABSENT one is an empty list"
   else
-    bad "E1 list_ssh_keys still turns a failed read into 'root has no keys' ($N_RAW raw in-process reads) — a false all-clear on root access"
+    bad "E1 an SSH handler still turns a failed read into 'root has no keys' ($N_CHK/3 checked reads, $N_RAW raw in-process fs calls) — a false all-clear on root access"
   fi
 fi
 
@@ -405,40 +343,34 @@ fi
 # into a permanent 500. ⚠ ReadWritePaths= and BindPaths= do NOT override
 # ProtectHome=yes — both were measured in a transient unit and both still hide the
 # file — so an unsandboxed command is the fix that works without loosening the
-# sandbox `agent_unit.rs` exists to protect.
+# sandbox `agent_unit.go` exists to protect.
 if [ -z "$UTILS_S" ]; then
   bad "E2 SKIPPED: $UTILS did not yield source"
 else
-  RD=$(fn_body 'async fn read_authorized_keys' "$UTILS_S")
-  WR=$(fn_body 'async fn write_authorized_keys' "$UTILS_S")
-  if has "$(flat "$RD")" 'safe_command_unsandboxed' && has "$(flat "$WR")" 'safe_command_unsandboxed'; then
+  RD=$(fn_body '^func serverUtilsReadAuthorizedKeys[(]' "$UTILS_S")
+  WR=$(fn_body '^func serverUtilsWriteAuthorizedKeys[(]' "$UTILS_S")
+  if has "$(flat "$RD")" 'safecmd\.NewUnsandboxed\("cat"\)' && has "$(flat "$WR")" 'safecmd\.NewUnsandboxed\("install"\)' \
+    && ! has "$RD" 'os\.(ReadFile|Open)\('; then
     ok "E2 both the read and the write run outside the agent's ProtectHome sandbox"
   else
     bad "E2 an in-process fs call still touches /root/.ssh — ProtectHome=yes makes it answer ENOENT for a file that exists"
   fi
 fi
 
-# E3 — remove_ssh_key must NOT treat an unreadable file as empty. THE ORDER OF THE
+# E3 — remove must NOT treat an unreadable file as empty. THE ORDER OF THE
 # TWO FIXES MATTERS: on a failed read the old code filtered every line out of an
-# empty string and wrote back "\n", i.e. it DELETED EVERY ROOT SSH KEY. Today that
-# is inert only because the write fails under the same sandbox, so repairing the
-# sandbox alone would have converted a dead feature into a destructive one.
+# empty string and wrote back "\n", i.e. it DELETED EVERY ROOT SSH KEY. Neither
+# the read error nor the absent case (nil) may fall through to the write.
 if [ -z "$UTILS_S" ]; then
   bad "E3 SKIPPED: $UTILS did not yield source"
 else
-  BODY=$(fn_body 'async fn remove_ssh_key' "$UTILS_S")
-  BODY_FLAT=$(flat "$BODY")
-  # Same re-keying as E1, and here the property is sharper still: this function
-  # REWRITES the file, so an empty default is not merely a wrong answer, it is a
-  # destructive one. Neither the read error nor the absent case may fall through
-  # to a write — hence `map_err(...)?` AND `ok_or_else(...)?`.
-  if [ -z "$BODY" ]; then
-    bad "E3 SKIPPED: could not bound remove_ssh_key"
-  elif has "$BODY_FLAT" 'read_authorized_keys\(\) \.await \.map_err\(' \
-    && has "$BODY_FLAT" '\.ok_or_else\('; then
+  BODY_FLAT=$(flat "$(fn_body '^func serverUtilsRemoveSSHKey[(]' "$UTILS_S")")
+  if [ -z "$BODY_FLAT" ]; then
+    bad "E3 SKIPPED: could not bound serverUtilsRemoveSSHKey"
+  elif has "$BODY_FLAT" 'cur, err := serverUtilsReadAuthorizedKeys\(r\.Context\(\)\) if err != nil \{ [^}]*return \} if cur == nil \{ [^}]*return \} newContent := '; then
     ok "E3 a remove on an unreadable or absent key file refuses instead of truncating it to nothing"
   else
-    bad "E3 remove_ssh_key can still reach its write with an empty buffer — that WIPES every root SSH key on the box"
+    bad "E3 serverUtilsRemoveSSHKey can still reach its write with an empty buffer — that WIPES every root SSH key on the box"
   fi
 fi
 
@@ -448,8 +380,8 @@ fi
 if [ -z "$UTILS_S" ]; then
   bad "E4 SKIPPED: $UTILS did not yield source"
 else
-  WR_FLAT=$(flat "$(fn_body 'async fn write_authorized_keys' "$UTILS_S")")
-  if has "$WR_FLAT" '"-m", "600"' && has "$WR_FLAT" 'mode\(0o600\)'; then
+  WR_FLAT=$(flat "$(fn_body '^func serverUtilsWriteAuthorizedKeys[(]' "$UTILS_S")")
+  if has "$WR_FLAT" '"-m", "600"' && has "$WR_FLAT" 'os\.OpenFile\(staging, [^)]*0o600\)'; then
     ok "E4 the installed key file is 0600, and so is the staging copy it is built in"
   else
     bad "E4 the key file or its staging copy is not 0600 — sshd ignores a loose authorized_keys"

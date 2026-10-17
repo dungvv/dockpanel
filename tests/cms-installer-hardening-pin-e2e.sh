@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Regression pins for this session's dockpanel-fanout run over
-# panel/agent/src/services/cms.rs + routes/cms.rs — a genuine LOC-ranked
+# Regression pins for this session's dockpanel-fanout run over the agent's
+# services/cms.rs + routes/cms.rs (now the Go port,
+# panel/go/internal/agent/{services,routes}/cms.go) — a genuine LOC-ranked
 # rotation pick (never previously a PRIMARY finder/skeptic target), landed
 # on after 32 higher-priority candidates were disqualified by the
 # two-direction pre-selection check. 1 topic (finder/skeptic + completeness
@@ -91,7 +92,14 @@
 #     (completeness critic off-menu find): the SAME finding already
 #     deferred in the prior session's ledger, not new — not re-fixed here.
 #
-# Pure source analysis; no box, no network, no build.
+# REPOINTED TO GO. kill_on_drop(true) + tokio::time::timeout is, in Go, a
+# child built with safecmd.Command/Exec on a ctx from context.WithTimeout
+# (exec.CommandContext SIGKILLs it at the deadline — proven by
+# TestPinTimeoutOrphanKillOnDropKillsTheChild in internal/agent/safecmd). The
+# .env quoting rules (F3/F4) and the db_host allow-list (F7) are pure
+# functions, pinned by Go tests run here; the rest stays source-level wiring.
+#
+# Pure source analysis (plus `go test`); no box, no network.
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -100,239 +108,169 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-# Strip comments and the test module. NOT the naive "sed-quit-at-first-
-# #[cfg(test)]" shape — see project_dockpanel_lessons_p182 (s456): only exit
-# at a #[cfg(test)] line immediately followed by `mod `, a real test module,
-# not a cfg-gated function/const variant elsewhere in the file.
-code() {
-  awk '
-    held == 1 {
-      if ($0 ~ /^mod /) { exit }
-      print heldline
-      held = 0
-    }
-    /^#\[cfg\(test\)\]$/ { held = 1; heldline = $0; next }
-    { print }
-  ' "$1" | grep -vE '^[[:space:]]*(///|//!|//|\*|/\*)'
-}
+# Strip comment lines (Go tests live in *_test.go — no in-file test module).
+code() { grep -vE '^[[:space:]]*(//|\*|/\*)' "$1"; }
 has()   { [ -n "$(code "$1" | grep -F -- "$2")" ]; }
 hasre() { [ -n "$(code "$1" | grep -E -- "$2")" ]; }
 
-# One named function's body, comment-stripped. Function-name patterns MUST be
-# anchored (^ ... \() — GNU awk's \b silently matches nothing in default ERE
-# mode (project_dockpanel_lessons_p182, s456).
-fnbody()    { code "$1" | awk "/$2/,/^}/"; }
+# One Go function's body, keyed on its LITERAL signature prefix
+# ("func Name(" / "func (u *T) Name("), bounded by its column-0 `}`.
+fnbody()    { code "$1" | awk -v fn="$2" 'index($0, fn) == 1 {f=1} f {print} f && /^}/ {exit}'; }
 bodyhas()   { [ -n "$(fnbody "$1" "$2" | grep -F -- "$3")" ]; }
 bodyhasre() { [ -n "$(fnbody "$1" "$2" | grep -E -- "$3")" ]; }
-countin()   { fnbody "$1" "$2" | grep -Fc -- "$3"; }
 
-CMS=panel/agent/src/services/cms.rs
-CMS_ROUTE=panel/agent/src/routes/cms.rs
-PKG=panel/agent/src/services/pkg.rs
-SAFE_CMD=panel/agent/src/safe_cmd.rs
+GA=panel/go/internal/agent
+CMS=$GA/services/cms.go
+CMS_ROUTE=$GA/routes/cms.go
+PKG=$GA/services/pkg.go
+SAFE_CMD=$GA/safecmd/safecmd.go
 
 for f in "$CMS" "$CMS_ROUTE" "$PKG" "$SAFE_CMD"; do
   [ -f "$f" ] || { echo "missing source file: $f"; exit 1; }
 done
 
-echo "── 1. F1: run_cmd/run_cmd_in take a timeout and kill_on_drop the child ──"
-if bodyhasre "$CMS" "^async fn run_cmd\(" 'kill_on_drop\(true\)'; then
-  ok "run_cmd sets kill_on_drop(true)"
+echo "── 1. F1: cmsRunCmd/cmsRunCmdIn take a timeout and kill the child at it ──"
+RCI="func cmsRunCmdIn("
+if bodyhas "$CMS" "$RCI" 'cmd := safecmd.Command(ctx, program, args...)'; then
+  ok "cmsRunCmdIn builds its child with safecmd.Command(ctx, …) (exec.CommandContext — the Go kill_on_drop)"
 else
-  bad "run_cmd is missing kill_on_drop(true)"
+  bad "cmsRunCmdIn no longer builds its child on the ctx — a timeout would not kill it"
 fi
-if bodyhasre "$CMS" "^async fn run_cmd\(" 'tokio::time::timeout'; then
-  ok "run_cmd wraps its spawn in tokio::time::timeout"
+if bodyhas "$CMS" "$RCI" 'ctx, cancel := context.WithTimeout(context.Background(), timeout)'; then
+  ok "cmsRunCmdIn derives that ctx from context.WithTimeout(…, timeout)"
 else
-  bad "run_cmd has no timeout wrapper"
+  bad "cmsRunCmdIn has no timeout deadline"
 fi
-if bodyhasre "$CMS" "^async fn run_cmd_in\(" 'kill_on_drop\(true\)'; then
-  ok "run_cmd_in sets kill_on_drop(true)"
+if [ "$(fnbody "$CMS" "func cmsRunCmd(" | grep -cE 'safecmd\.|exec\.')" -eq 0 ] \
+   && bodyhas "$CMS" "func cmsRunCmd(" 'return cmsRunCmdIn("", program, args, timeout)'; then
+  ok "cmsRunCmd delegates to cmsRunCmdIn with its timeout (no second, unguarded spawn)"
 else
-  bad "run_cmd_in is missing kill_on_drop(true)"
+  bad "cmsRunCmd spawns on its own or drops the timeout — the guard in cmsRunCmdIn no longer covers it"
 fi
-if bodyhasre "$CMS" "^async fn run_cmd_in\(" 'tokio::time::timeout'; then
-  ok "run_cmd_in wraps its spawn in tokio::time::timeout"
+if hasre "$CMS" '^func cmsRunCmd(In)?\([^)]*timeout time\.Duration\)'; then
+  ok "both helpers REQUIRE a timeout argument (the compiler now rejects a call site without one)"
 else
-  bad "run_cmd_in has no timeout wrapper"
+  bad "a run helper no longer takes a timeout argument"
 fi
-# Every call site actually passes a timeout argument (regression against a
-# future call site added without one). Anchored on [[:space:]] rather than
-# \s — this grep's \s does not reliably combine with an alternation group
-# (empirically confirmed while writing this pin: \s silently failed to
-# match "let _ = run_cmd_in(" once the (_in)? alternation was added,
-# [[:space:]] did not). Excludes the 2 function definitions (their lines
-# start "async fn run_cmd", not "run_cmd(" / "let x = run_cmd(").
-CALL_COUNT=$(code "$CMS" | grep -cE '^[[:space:]]*(let [a-z_]+ = )?run_cmd(_in)?\(')
-TIMEOUT_ARG_COUNT=$(code "$CMS" | grep -vE '^const ' | grep -cE '(COMPOSER|CLI_INSTALL|DOWNLOAD|QUICK)_TIMEOUT')
-if [ "$CALL_COUNT" -eq 12 ] && [ "$TIMEOUT_ARG_COUNT" -ge 12 ]; then
-  ok "all $CALL_COUNT run_cmd(_in) call sites pass a *_TIMEOUT constant ($TIMEOUT_ARG_COUNT non-const-def references)"
+# Every call site passes one of the four named timeouts. Counted, so a site
+# added or removed shows up. The Go port folds the four `composer
+# create-project` calls into cmsCreateProject (ONE cmsRunCmd call), so the
+# Rust-era 12 call sites are 9 here plus 4 cmsCreateProject callers. The
+# call's timeout may sit on a continuation line, so references are counted
+# over the file (const definitions and CmsEnsureComposer's two WithTimeout
+# deadlines excluded).
+CALL_COUNT=$(code "$CMS" | grep -E 'cmsRunCmd(In)?\(' | grep -vE '^func |return cmsRunCmdIn\("", program, args, timeout\)' | grep -c .)
+CP_COUNT=$(code "$CMS" | grep -cE 'cmsCreateProject\("[a-z0-9-]+/[a-z0-9-]+", siteDir\)')
+TIMEOUT_ARG_COUNT=$(code "$CMS" | grep -vE '^[[:space:]]*cms(Composer|CliInstall|Download|Quick)Timeout[[:space:]]*=|context\.WithTimeout\(' | grep -oE 'cms(Composer|CliInstall|Download|Quick)Timeout' | wc -l | tr -d ' ')
+if [ "$CALL_COUNT" -eq 9 ] && [ "$CP_COUNT" -eq 4 ] && [ "$TIMEOUT_ARG_COUNT" -ge "$CALL_COUNT" ]; then
+  ok "all $CALL_COUNT cmsRunCmd(In) call sites (+ $CP_COUNT cmsCreateProject callers) pass a cms*Timeout constant ($TIMEOUT_ARG_COUNT references)"
 else
-  bad "call-site/timeout-arg count mismatch (calls=$CALL_COUNT, expected 12; timeout-refs=$TIMEOUT_ARG_COUNT) — a call site may be missing its timeout, or one was added/removed"
-fi
-
-echo
-echo "── 2. F1: ensure_composer()'s and install_joomla()'s direct spawns are also guarded ──"
-if bodyhasre "$CMS" "^pub async fn ensure_composer" 'kill_on_drop\(true\)'; then
-  ok "ensure_composer sets kill_on_drop(true) on its curl call(s)"
-else
-  bad "ensure_composer is missing kill_on_drop(true)"
-fi
-if bodyhasre "$CMS" "^pub async fn ensure_composer" 'tokio::time::timeout'; then
-  ok "ensure_composer wraps its curl call(s) in tokio::time::timeout"
-else
-  bad "ensure_composer has no timeout wrapper"
+  bad "call-site/timeout-arg count mismatch (calls=$CALL_COUNT, expected 9; create-project callers=$CP_COUNT, expected 4; timeout-refs=$TIMEOUT_ARG_COUNT) — a call site may be missing its timeout, or one was added/removed"
 fi
 
 echo
-echo "── 3. F2: safe_cmd.rs's UnsandboxedCommand sets kill_on_drop centrally ──"
-if bodyhasre "$SAFE_CMD" "^    pub async fn output\(&mut self\)" 'cmd\.kill_on_drop\(true\)'; then
-  ok "UnsandboxedCommand::output() sets kill_on_drop(true) on the inner systemd-run Command"
+echo "── 2. F1: CmsEnsureComposer()'s direct curl spawns are also guarded ──"
+EC="func CmsEnsureComposer("
+if bodyhas "$CMS" "$EC" 'safecmd.Exec(ctx, "curl"' && bodyhas "$CMS" "$EC" 'safecmd.Exec(sctx, "curl"'; then
+  ok "CmsEnsureComposer runs both curl calls on a ctx (phar + sha256 sidecar)"
 else
-  bad "UnsandboxedCommand::output() is missing kill_on_drop(true) — pkg.rs::enable_php_stream (and ~48 other call sites) regress"
+  bad "CmsEnsureComposer runs a curl without a ctx"
 fi
-if bodyhasre "$SAFE_CMD" "^    pub fn spawn_streaming\(&mut self\)" 'cmd\.kill_on_drop\(true\)'; then
-  ok "UnsandboxedCommand::spawn_streaming() sets kill_on_drop(true) too"
+if [ "$(fnbody "$CMS" "$EC" | grep -cE '[a-z]+, [a-z]+ := context\.WithTimeout\(context\.Background\(\), cms(Download|Quick)Timeout\)')" -ge 2 ]; then
+  ok "CmsEnsureComposer gives both curl calls a context.WithTimeout deadline"
 else
-  bad "UnsandboxedCommand::spawn_streaming() is missing kill_on_drop(true)"
-fi
-# s459 update: pkg.rs legitimately gained 4 kill_on_drop(true) sites this
-# session (see pkg-rs-and-clone-dedup-hardening-pin-e2e.sh) — but all 4 are
-# chained onto the SANDBOXED safe_command() builder, for an unrelated bug
-# class (a plain-timeout-without-kill_on_drop gap this pin never covered).
-# What THIS control actually guards is narrower and still holds: no
-# safe_command_unsandboxed(...) call site chains kill_on_drop directly
-# (which would mean the centralized safe_cmd.rs fix for the systemd-run-
-# backed path was bypassed — impossible by construction today, since
-# UnsandboxedCommand exposes no such method, but worth pinning as
-# documentation of the invariant regardless).
-KOD_ON_UNSANDBOXED=$(code "$PKG" | grep -E 'safe_command_unsandboxed' -A2 | grep -c 'kill_on_drop')
-if [ "$KOD_ON_UNSANDBOXED" -eq 0 ]; then
-  ok "no safe_command_unsandboxed(...) call site in pkg.rs chains kill_on_drop directly (control: the systemd-run fix is still centralized in safe_cmd.rs, not duplicated here)"
-else
-  bad "a safe_command_unsandboxed(...) call site in pkg.rs appears to chain kill_on_drop directly — the centralized safe_cmd.rs fix may have been bypassed"
-fi
-if bodyhasre "$PKG" "^pub async fn enable_php_stream" 'safe_command_unsandboxed'; then
-  ok "enable_php_stream still spawns via safe_command_unsandboxed (control: it's the same call path the safe_cmd.rs fix protects)"
-else
-  bad "enable_php_stream no longer calls safe_command_unsandboxed — re-check whether this pin's premise still holds"
-fi
-
-# Literal (grep -F, not regex) substrings of the actual Rust source text —
-# built via single-quoted bash strings so no shell/regex escaping games are
-# needed. BACKSLASH is the raw 4-char sequence \\\\ (the source text of the
-# string literal "\\\\", i.e. "replace two backslashes with one escaped
-# pair"). DQUOTE is the raw 4-char sequence \\\" (source text of "\\\"").
-# DOLLAR is the raw 3-char sequence \\$ (source text of "\\$").
-BACKSLASH_ESC='\\\\'
-DQUOTE_ESC='\\\"'
-DOLLAR_ESC='\\$'
-
-echo
-echo "── 4. F3: Laravel .env quoting round-trips '#', space, quotes, backslash, \$ ──"
-if bodyhas "$CMS" "^fn quote_laravel_env_value" "$BACKSLASH_ESC"; then
-  ok "quote_laravel_env_value escapes backslash"
-else
-  bad "quote_laravel_env_value does not escape backslash"
-fi
-if bodyhas "$CMS" "^fn quote_laravel_env_value" "$DQUOTE_ESC"; then
-  ok "quote_laravel_env_value escapes the double-quote"
-else
-  bad "quote_laravel_env_value does not escape the double-quote"
-fi
-if bodyhas "$CMS" "^fn quote_laravel_env_value" "$DOLLAR_ESC"; then
-  ok "quote_laravel_env_value escapes \$ (prevents phpdotenv variable interpolation)"
-else
-  bad "quote_laravel_env_value does not escape \$ — an unescaped \$var in a password would be interpolated by phpdotenv"
-fi
-if bodyhas "$CMS" "^fn replace_env_line" "quote_laravel_env_value(value)"; then
-  ok "replace_env_line quotes UNCONDITIONALLY now (not only when the value contains a space)"
-else
-  bad "replace_env_line no longer routes through quote_laravel_env_value — the '#'-truncation bug may have regressed"
+  bad "CmsEnsureComposer has no timeout deadline on one or both curl calls"
 fi
 
 echo
-echo "── 5. F4: CodeIgniter .env quoting escapes \\\\/\" but deliberately NOT \$ ──"
-if bodyhas "$CMS" "^fn quote_ci4_env_value" "$BACKSLASH_ESC"; then
-  ok "quote_ci4_env_value escapes backslash"
+echo "── 3. F2: safecmd's Unsandboxed runner builds systemd-run on the caller's ctx centrally ──"
+if bodyhas "$SAFE_CMD" "func (u *Unsandboxed) command(" 'exec.CommandContext(ctx, "systemd-run"' \
+   && bodyhas "$SAFE_CMD" "func (u *Unsandboxed) Output(" 'Run(ctx, u.command(ctx, c))'; then
+  ok "(*Unsandboxed).Output builds the systemd-run waiter with exec.CommandContext — one central place"
 else
-  bad "quote_ci4_env_value does not escape backslash"
+  bad "(*Unsandboxed).Output no longer builds systemd-run on the ctx — PkgEnablePhpStream (and every other Unsandboxed call site) regresses"
 fi
-if bodyhas "$CMS" "^fn quote_ci4_env_value" "$DQUOTE_ESC"; then
-  ok "quote_ci4_env_value escapes the double-quote"
+if bodyhas "$SAFE_CMD" "func (u *Unsandboxed) SpawnStreaming(" 'cmd := u.command(ctx, c)'; then
+  ok "(*Unsandboxed).SpawnStreaming goes through the same ctx-bound builder"
 else
-  bad "quote_ci4_env_value does not escape the double-quote"
+  bad "(*Unsandboxed).SpawnStreaming no longer uses the ctx-bound builder"
 fi
-if bodyhas "$CMS" "^fn quote_ci4_env_value" "$DOLLAR_ESC"; then
-  bad "quote_ci4_env_value now escapes \$ — CI4's sanitizeValue() has no \\\$ escape and would desync its unquoting regex (this is CORRECT for phpdotenv, WRONG for CI4 — do not unify the two functions)"
+# KOD_ON_UNSANDBOXED control retired (obsolete in Go): Unsandboxed exposes no
+# per-call kill toggle at all, so "a call site bypasses the central fix by
+# chaining its own" cannot be written.
+if bodyhas "$PKG" "func PkgEnablePhpStream(" 'safecmd.NewUnsandboxed(inst.Bin())'; then
+  ok "PkgEnablePhpStream still spawns via safecmd.NewUnsandboxed (control: it's the same call path the central fix protects)"
 else
-  ok "quote_ci4_env_value correctly leaves \$ un-escaped (CI4-specific: it has no \\\$ escape unlike phpdotenv)"
+  bad "PkgEnablePhpStream no longer calls safecmd.NewUnsandboxed — re-check whether this pin's premise still holds"
 fi
-if bodyhas "$CMS" "^fn set_ci_env" "quote_ci4_env_value(value)"; then
-  ok "set_ci_env quotes UNCONDITIONALLY now (previously quoted nothing, ever)"
+
+echo
+echo "── 4/5. F3/F4: Laravel and CodeIgniter .env quoting (different escape sets, both unconditional) ──"
+# quote_laravel_env_value escapes \ / " / $ arms retired: covered by TestPinCmsInstallerHardeningEnvQuoting (panel/go/internal/agent/services/pin_cms_installer_hardening_test.go)
+# replace_env_line quotes unconditionally arm retired: covered by TestPinCmsInstallerHardeningEnvQuoting + TestCmsEnvWritersAndChecksumExtraction (services/cms_test.go)
+# quote_ci4_env_value escapes \ / " and NOT $ arms retired: covered by TestPinCmsInstallerHardeningEnvQuoting
+# set_ci_env quotes unconditionally arm retired: covered by TestPinCmsInstallerHardeningEnvQuoting + TestCmsEnvWritersAndChecksumExtraction
+if (cd panel/go && go test ./internal/agent/services/ -count=1 \
+      -run '^(TestPinCmsInstallerHardeningEnvQuoting|TestCmsEnvWritersAndChecksumExtraction)$' >/dev/null 2>&1); then
+  ok "phpdotenv quoting escapes \\ \" \$; CI4 quoting escapes \\ \" but leaves \$ bare; both writers quote every value (Go tests)"
 else
-  bad "set_ci_env no longer routes through quote_ci4_env_value — the space-crash bug may have regressed"
+  bad "the .env quoting Go tests fail — the '#'-truncation, \$-interpolation or CI4 space-crash bug may be back"
 fi
 # Regression control: the app.baseURL call site used to pre-wrap its own
-# value in single quotes BEFORE set_ci_env existed to quote unconditionally
-# — if that literal single-quote wrapping is still present, set_ci_env would
-# now double-quote it (producing a broken "'https://...'" value).
-if hasre "$CMS" "app\.baseURL.*'https"; then
-  bad "app.baseURL's call site still pre-wraps in single quotes — now DOUBLE-quoted by set_ci_env, producing a broken value"
+# value in single quotes BEFORE set_ci_env quoted unconditionally — if that
+# wrapping came back, the value would be DOUBLE-quoted. Positive anchor first.
+if ! has "$CMS" '{"app.baseURL", "https://" + domain}'; then
+  bad "app.baseURL's call site is gone or reshaped — this control can no longer see it; re-scope"
+elif hasre "$CMS" "app\.baseURL.*'https"; then
+  bad "app.baseURL's call site still pre-wraps in single quotes — now DOUBLE-quoted by cmsSetCiEnv, producing a broken value"
 else
   ok "app.baseURL's call site no longer pre-wraps in single quotes (control: no double-quoting regression)"
 fi
 
 echo
-echo "── 6. F5: ensure_composer() verifies composer.phar's sha256 before chmod +x ──"
-if bodyhas "$CMS" "^pub async fn ensure_composer" ".sha256"; then
-  ok "ensure_composer fetches the .sha256 sidecar"
+echo "── 6. F5: CmsEnsureComposer() verifies composer.phar's sha256 before chmod +x ──"
+if bodyhas "$CMS" "$EC" 'url+".sha256"'; then
+  ok "CmsEnsureComposer fetches the .sha256 sidecar"
 else
-  bad "ensure_composer no longer fetches a checksum sidecar"
+  bad "CmsEnsureComposer no longer fetches a checksum sidecar"
 fi
-if bodyhasre "$CMS" "^pub async fn ensure_composer" 'Sha256::digest'; then
-  ok "ensure_composer computes the downloaded phar's own sha256"
+if bodyhas "$CMS" "$EC" 'actual, err := cmsSha256File(cmsComposer)' && bodyhas "$CMS" "func cmsSha256File(" 'sha256.Sum256(b)'; then
+  ok "CmsEnsureComposer computes the downloaded phar's own sha256"
 else
-  bad "ensure_composer no longer computes the phar's sha256"
+  bad "CmsEnsureComposer no longer computes the phar's sha256"
 fi
-if bodyhasre "$CMS" "^pub async fn ensure_composer" 'if actual != expected'; then
-  ok "ensure_composer compares actual vs. expected before proceeding"
+if bodyhas "$CMS" "$EC" 'if actual != expected {'; then
+  ok "CmsEnsureComposer compares actual vs. expected before proceeding"
 else
-  bad "ensure_composer no longer compares the computed hash against the fetched one"
+  bad "CmsEnsureComposer no longer compares the computed hash against the fetched one"
 fi
-# Fail-closed control: a mismatch must not still chmod +x the phar.
-MISMATCH_TO_CHMOD=$(fnbody "$CMS" "^pub async fn ensure_composer" | awk '/if actual != expected/,/^    }/' | grep -c 'chmod')
-if [ "$MISMATCH_TO_CHMOD" -eq 0 ]; then
-  ok "the mismatch branch does not chmod +x the phar (fails closed)"
+# Fail-closed control: the mismatch branch removes the phar, returns, and
+# never reaches chmod +x.
+MISMATCH_BLOCK=$(fnbody "$CMS" "$EC" | awk '/if actual != expected \{/{f=1} f{print} f && /^\t\}/{exit}')
+if [ -n "$MISMATCH_BLOCK" ] && [ "$(grep -c 'chmod' <<< "$MISMATCH_BLOCK")" -eq 0 ] \
+   && grep -c 'os.Remove(cmsComposer)' <<< "$MISMATCH_BLOCK" >/dev/null && grep -c 'return ' <<< "$MISMATCH_BLOCK" >/dev/null; then
+  ok "the mismatch branch removes the phar and returns without chmod +x (fails closed)"
 else
-  bad "the mismatch branch appears to still chmod +x the phar — would not fail closed"
+  bad "the mismatch branch appears to still chmod +x the phar (or no longer removes it) — would not fail closed"
 fi
 
 echo
-echo "── 7. F6: install_joomla() verifies the release zip's sha256 before unzip ──"
-if bodyhas "$CMS" "^pub async fn install_joomla" "api.github.com"; then
-  ok "install_joomla resolves the release via GitHub's JSON API (not the old -sI redirect trick)"
+echo "── 7. F6: CmsInstallJoomla() verifies the release zip's sha256 before unzip ──"
+IJ="func CmsInstallJoomla("
+if bodyhas "$CMS" "$IJ" "https://api.github.com/repos/joomla/joomla-cms/releases/latest"; then
+  ok "CmsInstallJoomla resolves the release via GitHub's JSON API (not the old -sI redirect trick)"
 else
-  bad "install_joomla no longer uses the GitHub Releases API"
+  bad "CmsInstallJoomla no longer uses the GitHub Releases API"
 fi
-if bodyhas "$CMS" "^pub async fn install_joomla" "extract_release_sha256("; then
-  ok "install_joomla extracts the published checksum via extract_release_sha256"
+if bodyhas "$CMS" "$IJ" "cmsExtractReleaseSha256(body, zipFilename)"; then
+  ok "CmsInstallJoomla extracts the published checksum for the exact zip it downloads"
 else
-  bad "install_joomla no longer extracts a checksum from the release notes"
+  bad "CmsInstallJoomla no longer extracts a checksum from the release notes"
 fi
-if bodyhasre "$CMS" "^fn extract_release_sha256" 'body\.find\(filename\)'; then
-  ok "extract_release_sha256 ties extraction to the EXACT filename being downloaded (not a generic 'ZIP Archive' label match, which could cross-match the Update-Packages table)"
-else
-  bad "extract_release_sha256 no longer anchors on the exact filename — could cross-match the wrong table row"
-fi
-# unzip must run AFTER the hash check, not before — order matters for a
-# fail-closed guarantee. Assert the checksum-mismatch return precedes unzip
-# in the function body's line order.
-JOOMLA_BODY_FILE=$(mktemp)
-fnbody "$CMS" "^pub async fn install_joomla" > "$JOOMLA_BODY_FILE"
-MISMATCH_LINE=$(grep -n 'checksum mismatch' "$JOOMLA_BODY_FILE" | head -1 | cut -d: -f1)
-UNZIP_LINE=$(grep -n '"unzip"' "$JOOMLA_BODY_FILE" | head -1 | cut -d: -f1)
-rm -f "$JOOMLA_BODY_FILE"
+# extract_release_sha256 exact-filename arm retired: covered by TestCmsEnvWritersAndChecksumExtraction (panel/go/internal/agent/services/cms_test.go — the hash must sit on the filename's own line)
+JOOMLA_BODY=$(fnbody "$CMS" "$IJ")
+MISMATCH_LINE=$(grep -n 'checksum mismatch' <<< "$JOOMLA_BODY" | head -1 | cut -d: -f1)
+UNZIP_LINE=$(grep -n 'cmsRunCmd("unzip"' <<< "$JOOMLA_BODY" | head -1 | cut -d: -f1)
 if [ -n "$MISMATCH_LINE" ] && [ -n "$UNZIP_LINE" ] && [ "$MISMATCH_LINE" -lt "$UNZIP_LINE" ]; then
   ok "the checksum-mismatch check appears BEFORE unzip in source order (fails closed)"
 else
@@ -340,26 +278,26 @@ else
 fi
 
 echo
-echo "── 8. F7: routes/cms.rs — db_pass rejects '#' '/' '?', db_host gets new validation ──"
-if bodyhasre "$CMS_ROUTE" "^async fn install\(" "db_pass\.contains\(\['\\\\n', '\\\\r', '\\\\0', '#', '/', '\?'\]\)"; then
-  ok "db_pass validation now rejects '#' '/' '?' in addition to newline/CR/null"
+echo "── 8. F7: routes/cms.go — db_pass rejects '#' '/' '?', db_host gets validation ──"
+CI="func cmsInstall("
+if bodyhas "$CMS_ROUTE" "$CI" 'strings.ContainsAny(*b.DbPass, "\n\r\x00#/?")'; then
+  ok "db_pass validation rejects '#' '/' '?' in addition to newline/CR/null"
 else
-  bad "db_pass validation no longer rejects '#' '/' '?' — install_drupal's db_url could break or silently misparse again"
+  bad "db_pass validation no longer rejects '#' '/' '?' — CmsInstallDrupal's db_url could break or silently misparse again"
 fi
-if hasre "$CMS_ROUTE" '^    fn is_valid_db_host'; then
-  ok "a dedicated is_valid_db_host validator now exists"
+# 'a dedicated is_valid_db_host validator exists' retired: covered by TestPinCmsInstallerHardeningDbHost (panel/go/internal/agent/routes/pin_cms_installer_hardening_test.go)
+if (cd panel/go && go test ./internal/agent/routes/ -count=1 -run '^TestPinCmsInstallerHardeningDbHost$' >/dev/null 2>&1); then
+  ok "cmsIsValidDbHost allow-lists hostname/IP[:port] and refuses '#' '/' '?' '@' space (Go test)"
 else
-  bad "is_valid_db_host is missing"
+  bad "cmsIsValidDbHost accepts a host that would truncate or misparse drush's db_url"
 fi
-if bodyhas "$CMS_ROUTE" "^async fn install\(" "is_valid_db_host(db_host)"; then
-  ok "db_host is actually run through is_valid_db_host() in the route body (not just referenced elsewhere, e.g. the per-CMS db_host.as_deref() extraction, which existed before this fix too)"
+if bodyhas "$CMS_ROUTE" "$CI" 'if b.DbHost != nil && !cmsIsValidDbHost(*b.DbHost) {'; then
+  ok "db_host is actually run through cmsIsValidDbHost() in the route body"
 else
-  bad "db_host is not validated via is_valid_db_host() — it may still be referenced elsewhere (e.g. extraction) without ever being checked"
+  bad "db_host is not validated via cmsIsValidDbHost() in cmsInstall"
 fi
-# Positive control: db_user's existing alnum+_- charset check must be
-# untouched — this pin should not have widened or narrowed an unrelated
-# field while touching db_pass/db_host.
-if bodyhasre "$CMS_ROUTE" "^async fn install\(" "is_valid_db_identifier\(db_user\)"; then
+# Positive control: db_user's existing charset check is untouched.
+if bodyhas "$CMS_ROUTE" "$CI" 'if b.DbUser != nil && !cmsIsValidDbIdentifier(*b.DbUser) {'; then
   ok "db_user's existing validation is untouched (control)"
 else
   bad "db_user's validation appears to have changed — unintended side effect"

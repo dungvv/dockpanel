@@ -55,7 +55,7 @@
 # leaving a comment at the old position kept the arm green — and it printed
 # "creates the directories (line 465) before installing the unit (line 563)",
 # quoting the comment's line number as evidence for an ordering that no longer
-# held. Same for the heal in agent_unit.rs and the swap in agent-self-update.sh.
+# held. Same for the heal in agent_unit.go (then agent_unit.rs) and the swap in agent-self-update.sh.
 #
 # So: the strippers now sit ABOVE section 1, they understand the comment syntax
 # of each subject language rather than assuming `#`, and they BLANK comment lines
@@ -83,7 +83,7 @@ bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 # NEGATIVE arm (match ⇒ bad) silently green, which is the direction that ships.
 comment_marker_for() {
   case "$1" in
-    *.rs|*.mjs|*.js|*.ts|*.tsx)                echo '//' ;;
+    *.go|*.rs|*.mjs|*.js|*.ts|*.tsx)           echo '//' ;;
     *.json)                                    echo ''   ;;  # JSON has no comments
     *)                                         echo '#'  ;;  # .sh, .service, .gitignore, .toml
   esac
@@ -106,7 +106,12 @@ code_lines() {
     # A trailing `//` is stripped, but only when the text before it has BALANCED
     # double quotes — otherwise `let u = "https://host"` would lose its tail.
     # Backslash escapes are skipped so `\"` does not flip the parity.
+    #
+    # A Go compiler directive (`//go:embed`, `//go:build`) is spelled like a
+    # comment but IS code: it is what makes the binary carry the unit. Kept at
+    # column 0 only, which is the only place the toolchain honours it.
     awk '
+      /^\/\/go:[a-z]/                             { print; next }
       /^[[:space:]]*\/\*/ &&  /\*\/[[:space:]]*$/ { print ""; next }
       /^[[:space:]]*\/\*/                         { inblk = 1; print ""; next }
       inblk { if ($0 ~ /\*\/[[:space:]]*$/) inblk = 0; print ""; next }
@@ -148,7 +153,7 @@ has_code()   { local f="$1"; shift; [ "$(code_count "$f" "$@")" -gt 0 ]; }
 # True file line numbers, because code_lines blanks rather than deletes.
 code_lineno() { local f="$1"; shift; code_lines "$f" | grep -n "$@" 2>/dev/null | head -1 | cut -d: -f1 || true; }
 
-UNIT=panel/agent/dockpanel-agent.service
+UNIT=panel/go/internal/agent/services/dockpanel-agent.service
 SETUP=scripts/setup.sh
 UPDATE=scripts/update.sh
 
@@ -286,10 +291,10 @@ echo "── 5. the THIRD installer, which these pins could not see (s271) ─�
 # that covers two of three copies reads as coverage.
 INSTALL_AGENT=scripts/install-agent.sh
 SELF_UPDATE=scripts/agent-self-update.sh
-AGENT_UNIT_RS=panel/agent/src/services/agent_unit.rs
-AGENT_MAIN=panel/agent/src/main.rs
+AGENT_UNIT_GO=panel/go/internal/agent/services/agent_unit.go
+AGENT_MAIN=panel/go/cmd/dockpanel-agent/main.go
 
-for f in "$INSTALL_AGENT" "$SELF_UPDATE" "$AGENT_UNIT_RS" "$AGENT_MAIN"; do
+for f in "$INSTALL_AGENT" "$SELF_UPDATE" "$AGENT_UNIT_GO" "$AGENT_MAIN"; do
   [ -f "$f" ] || { echo "missing file: $f"; exit 1; }
 done
 
@@ -323,13 +328,13 @@ else
   bad "$INSTALL_AGENT no longer asks the binary for the unit — it is writing one from somewhere"
 fi
 
-# The flag is a contract between three files. If main.rs stops answering to the
+# The flag is a contract between three files. If main.go stops answering to the
 # exact string the installers send, install-agent.sh refuses every install and
 # the self-update silently stops refreshing the unit.
 if has_code "$AGENT_MAIN" -F -e '"--print-unit"'; then
   ok "the agent answers to the same flag the installers invoke"
 else
-  bad "main.rs no longer handles \"--print-unit\" — the installers ask for a unit nothing emits"
+  bad "main.go no longer handles \"--print-unit\" — the installers ask for a unit nothing emits"
 fi
 
 # 5c. And REFUSES rather than falling back. A fallback here is what the whole
@@ -404,35 +409,40 @@ echo "── 6. the unit reaches boxes that ALREADY exist (lesson #97a) ──"
 # the one thing that reaches the fleet. Anchored on the declaration's colon —
 # `has 'const RSPAMD_MILTER'` stayed green when the constant was renamed
 # RSPAMD_MILTER_X (s270), and a substring pin is worth nothing.
-if has_code "$AGENT_UNIT_RS" -E -e 'AGENT_UNIT: &str = include_str!'; then
+if has_code "$AGENT_UNIT_GO" -E -e '^var AgentUnit string'; then
   ok "the agent compiles the unit in from the same file the installers copy"
 else
   bad "the agent no longer embeds the unit — install-agent.sh has nothing to ask for"
 fi
 
-if has_code "$AGENT_UNIT_RS" -F -e 'include_str!("../../dockpanel-agent.service")'; then
+# go:embed can only name a file in the package's own directory, so "THAT unit"
+# means: the directive names the unit, the unit this suite reads lives beside
+# agent_unit.go, and it is the directory the installers copy from (AGENT_SRC).
+if has_code "$AGENT_UNIT_GO" -E -e '^//go:embed dockpanel-agent\.service$' \
+   && [ "$(dirname "$AGENT_UNIT_GO")/dockpanel-agent.service" = "$UNIT" ] \
+   && has_code "$UPDATE" -F -e 'AGENT_SRC="$REPO_DIR/panel/go/internal/agent/services"'; then
   ok "it embeds THAT unit, not a copy kept beside it"
 else
-  bad "the embedded unit no longer points at panel/agent/dockpanel-agent.service — a fourth mirror"
+  bad "the embedded unit is no longer $UNIT, the file the installers deploy — a fourth mirror"
 fi
 
-if has_code "$AGENT_MAIN" -E -e 'agent_unit::heal_agent_unit\(\)'; then
+if has_code "$AGENT_MAIN" -E -e 'services\.AgentUnitHeal\(\)'; then
   ok "the heal is spawned at agent startup"
 else
-  bad "heal_agent_unit is never called — an existing fleet member never receives the unit"
+  bad "AgentUnitHeal is never called — an existing fleet member never receives the unit"
 fi
 
 # A heal that writes the unit but leaves the directories missing turns a silent
 # security gap into a dead agent. Pin the ordering as a property of the source.
-HEAL_MK=$(code_lineno "$AGENT_UNIT_RS" -F -e 'create_dir_all')
-HEAL_WR=$(code_lineno "$AGENT_UNIT_RS" -F -e 'fs::write(UNIT_PATH')
+HEAL_MK=$(code_lineno "$AGENT_UNIT_GO" -F -e 'os.MkdirAll(dir')
+HEAL_WR=$(code_lineno "$AGENT_UNIT_GO" -F -e 'os.WriteFile(agentUnitPath')
 if [ -n "$HEAL_MK" ] && [ -n "$HEAL_WR" ] && [ "$HEAL_MK" -lt "$HEAL_WR" ]; then
   ok "the heal creates the directories (line $HEAL_MK) before writing the unit (line $HEAL_WR)"
 else
   bad "the heal writes the unit before creating its directories — the next start fails the namespace mount (mkdir=${HEAL_MK:-none} write=${HEAL_WR:-none})"
 fi
 
-if has_code "$AGENT_UNIT_RS" -F -e 'LoadError'; then
+if has_code "$AGENT_UNIT_GO" -F -e 'LoadError'; then
   ok "the heal asks systemd whether it accepted the unit, rather than assuming"
 else
   bad "the heal does not check LoadError — a rejected unit would be left in place"
@@ -735,6 +745,12 @@ FIX
 
 printf '{ "name": "x", "note": "TOKENWORD" }\n' > "$FIXDIR/f.json"
 
+cat > "$FIXDIR/f.go" <<'FIX'
+// TOKENWORD in a line comment
+//go:embed TOKENEMBED
+var x = TOKENWORD // TOKENWORD trailing
+FIX
+
 if [ "$(code_count "$FIXDIR/f.sh" -F -e 'TOKENWORD')" -eq 1 ]; then
   ok "shell: a full-line '#' comment carrying the token is blanked (1 code hit, not 2)"
 else
@@ -768,6 +784,12 @@ else
   bad "rust: a string containing '/*' swallowed the code after it — the s294 stripper defect is back"
 fi
 
+if [ "$(code_count "$FIXDIR/f.go" -F -e 'TOKENWORD')" -eq 1 ] && [ "$(code_count "$FIXDIR/f.go" -F -e 'TOKENEMBED')" -eq 1 ]; then
+  ok "go: '//' comments blanked, but a column-0 //go:embed directive is kept as the code it is"
+else
+  bad "go: expected 1 code hit each for TOKENWORD and TOKENEMBED — the //go: directive handling is broken"
+fi
+
 if [ "$(code_count "$FIXDIR/f.json" -F -e 'TOKENWORD')" -eq 1 ]; then
   ok "json: nothing is stripped, because JSON has no comment syntax"
 else
@@ -777,7 +799,7 @@ fi
 # The three ordering arms read line numbers out of this stream. Deleting rather
 # than blanking would renumber every subject and change what they measure.
 LINEDRIFT=""
-for f in "$UNIT" "$SETUP" "$UPDATE" "$INSTALL_AGENT" "$SELF_UPDATE" "$AGENT_UNIT_RS" "$AGENT_MAIN" "$STAGER" scripts/deploy-demo.sh .gitignore; do
+for f in "$UNIT" "$SETUP" "$UPDATE" "$INSTALL_AGENT" "$SELF_UPDATE" "$AGENT_UNIT_GO" "$AGENT_MAIN" "$STAGER" scripts/deploy-demo.sh .gitignore; do
   a=$(wc -l < "$f"); b=$(code_lines "$f" | wc -l)
   [ "$a" != "$b" ] && LINEDRIFT="$LINEDRIFT $f($a≠$b)"
 done
@@ -830,12 +852,12 @@ PINNED=(
   "$SELF_UPDATE|-F|\"\$UNIT_BACKUP\""
   "$AGENT_MAIN|-F|\"--print-unit\""
   "$AGENT_MAIN|-E|unknown option"
-  "$AGENT_MAIN|-E|agent_unit::heal_agent_unit\\(\\)"
-  "$AGENT_UNIT_RS|-E|AGENT_UNIT: &str = include_str!"
-  "$AGENT_UNIT_RS|-F|include_str!(\"../../dockpanel-agent.service\")"
-  "$AGENT_UNIT_RS|-F|LoadError"
-  "$AGENT_UNIT_RS|-F|create_dir_all"
-  "$AGENT_UNIT_RS|-F|fs::write(UNIT_PATH"
+  "$AGENT_MAIN|-E|services\\.AgentUnitHeal\\(\\)"
+  "$AGENT_UNIT_GO|-E|^var AgentUnit string"
+  "$AGENT_UNIT_GO|-E|^//go:embed dockpanel-agent\\.service\$"
+  "$AGENT_UNIT_GO|-F|LoadError"
+  "$AGENT_UNIT_GO|-F|os.MkdirAll(dir"
+  "$AGENT_UNIT_GO|-F|os.WriteFile(agentUnitPath"
   "$UNIT|-F|EnvironmentFile=-/etc/dockpanel/agent.env"
   "$UNIT|-E|^ReadWritePaths="
   "$UNIT|-E|^ProtectSystem=strict"
@@ -931,7 +953,7 @@ SELF=tests/sandbox-paths-pin-e2e.sh
 # Assembled at runtime from a variable, so this line does not contain the shape
 # it searches for and the scan cannot match itself (#366 — the bracket idiom's
 # purpose, reached here without a path exemption).
-SUBJ_VARS='UNIT|SETUP|UPDATE|INSTALL_AGENT|SELF_UPDATE|AGENT_UNIT_RS|AGENT_MAIN|STAGER'
+SUBJ_VARS='UNIT|SETUP|UPDATE|INSTALL_AGENT|SELF_UPDATE|AGENT_UNIT_GO|AGENT_MAIN|STAGER'
 RAW_ARMS=$(code_lines "$SELF" | grep -nE "grep[^|;]*\"\\\$($SUBJ_VARS)\"" || true)
 if [ -z "$RAW_ARMS" ]; then
   ok "no arm greps a subject file directly; every read goes through code_lines"

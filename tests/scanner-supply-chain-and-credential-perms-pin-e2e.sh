@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# Regression pins for the s457 dockpanel-fanout run over
-# panel/agent/src/services/image_scanner.rs + routes/image_scan.rs (workflow
+# Regression pins for the s457 dockpanel-fanout run over the agent's
+# services/image_scanner.rs + routes/image_scan.rs (workflow
 # wf_6a5a4e25-9ee; 2 topics finder/skeptic + completeness/setup critics).
+# Repointed to the Go port: panel/go/internal/agent/services/{image_scanner,
+# sbom_scanner,cms,wordpress}.go. In Go the kill_on_drop(true) of S3 is a
+# child built with safecmd.Exec/Command on a ctx from context.WithTimeout —
+# exec.CommandContext SIGKILLs it at the deadline (proven by
+# TestPinTimeoutOrphanKillOnDropKillsTheChild in internal/agent/safecmd).
 #
 #   S1  services/image_scanner.rs::install_grype fetched Anchore's install.sh
 #       from the mutable `main` ref and let it resolve "latest" at install
@@ -66,21 +71,9 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-# Strip comments and the test module. NOT the naive "sed-quit-at-first-
-# #[cfg(test)]" shape — see project_dockpanel_lessons_p182 (s456): only exit
-# at a #[cfg(test)] line immediately followed by `mod `, a real test module,
-# not a cfg-gated function/const variant elsewhere in the file.
-code() {
-  awk '
-    held == 1 {
-      if ($0 ~ /^mod /) { exit }
-      print heldline
-      held = 0
-    }
-    /^#\[cfg\(test\)\]$/ { held = 1; heldline = $0; next }
-    { print }
-  ' "$1" | grep -vE '^[[:space:]]*(///|//!|//|\*|/\*)'
-}
+# Strip comment lines. (Go keeps its tests in *_test.go, so there is no
+# in-file test module to cut — the Rust-era cfg(test) handling is gone.)
+code() { grep -vE '^[[:space:]]*(//|\*|/\*)' "$1"; }
 has()   { [ -n "$(code "$1" | grep -F -- "$2")" ]; }
 hasre() { [ -n "$(code "$1" | grep -E -- "$2")" ]; }
 
@@ -94,135 +87,143 @@ bodyhas()   { [ -n "$(fnbody "$1" "$2" | grep -F -- "$3")" ]; }
 bodyhasre() { [ -n "$(fnbody "$1" "$2" | grep -E -- "$3")" ]; }
 countin()   { fnbody "$1" "$2" | grep -Fc -- "$3"; }
 
-IMAGE_SCANNER=panel/agent/src/services/image_scanner.rs
-SBOM_SCANNER=panel/agent/src/services/sbom_scanner.rs
-CMS=panel/agent/src/services/cms.rs
-WORDPRESS=panel/agent/src/services/wordpress.rs
+GS=panel/go/internal/agent/services
+IMAGE_SCANNER=$GS/image_scanner.go
+SBOM_SCANNER=$GS/sbom_scanner.go
+CMS=$GS/cms.go
+WORDPRESS=$GS/wordpress.go
 
 for f in "$IMAGE_SCANNER" "$SBOM_SCANNER" "$CMS" "$WORDPRESS"; do
   [ -f "$f" ] || { echo "missing source file: $f"; exit 1; }
 done
 
-echo "── 1. S1: image_scanner.rs::install_grype — pinned to a tag, not main ──"
-if hasre "$IMAGE_SCANNER" '^const GRYPE_VERSION: &str = "v[0-9]'; then
-  ok "GRYPE_VERSION is a pinned version-tag constant"
+echo "── 1. S1: image_scanner.go ImageScannerInstallGrype — pinned to a tag, not main ──"
+if hasre "$IMAGE_SCANNER" '^const imageScannerGrypeVersion = "v[0-9]'; then
+  ok "imageScannerGrypeVersion is a pinned version-tag constant"
 else
-  bad "no pinned GRYPE_VERSION constant found"
+  bad "no pinned imageScannerGrypeVersion constant found"
 fi
-if bodyhas "$IMAGE_SCANNER" "^pub async fn install_grype" '/main/install.sh'; then
+if bodyhas "$IMAGE_SCANNER" "^func ImageScannerInstallGrype\\(" '/main/install.sh'; then
   bad "install_grype still fetches install.sh from the mutable main ref"
 else
   ok "install_grype no longer fetches install.sh from /main/"
 fi
-if bodyhasre "$IMAGE_SCANNER" "^pub async fn install_grype" 'grype/\{GRYPE_VERSION\}/install\.sh'; then
+if bodyhasre "$IMAGE_SCANNER" "^func ImageScannerInstallGrype\\(" 'anchore/grype/%s/install\.sh \| sh -s -- -b %s %s",' \
+   && bodyhasre "$IMAGE_SCANNER" "^func ImageScannerInstallGrype\\(" '^[[:space:]]*imageScannerGrypeVersion, imageScannerGrypeDir, imageScannerGrypeVersion\)'; then
   ok "install_grype fetches install.sh from the pinned GRYPE_VERSION tag ref"
 else
   bad "install_grype's install.sh fetch is not pinned to GRYPE_VERSION's ref"
 fi
-if bodyhasre "$IMAGE_SCANNER" "^pub async fn install_grype" '\-b \{GRYPE_DIR\} \{GRYPE_VERSION\}'; then
+if bodyhasre "$IMAGE_SCANNER" "^func ImageScannerInstallGrype\\(" 'imageScannerGrypeDir, imageScannerGrypeVersion\)$'; then
   ok "install_grype passes GRYPE_VERSION as install.sh's TAG argument"
 else
   bad "install_grype no longer pins the installed release via install.sh's TAG arg"
 fi
 
 echo
-echo "── 2. S3 (grype half): kill_on_drop on all 3 spawns in image_scanner.rs ──"
-if [ "$(countin "$IMAGE_SCANNER" "^pub async fn install_grype" "kill_on_drop(true)")" -ge 2 ]; then
-  ok "install_grype sets kill_on_drop(true) on both its spawns (installer + db-update priming)"
+echo "── 2. S3 (grype half): all 3 spawns in image_scanner.go are built on a deadline ctx (the Go kill_on_drop) ──"
+if bodyhas "$IMAGE_SCANNER" "^func ImageScannerInstallGrype\\(" 'ictx, cancel := context.WithTimeout(ctx, ' \
+   && bodyhas "$IMAGE_SCANNER" "^func ImageScannerInstallGrype\\(" 'safecmd.Exec(ictx, "sh", "-c", cmd)' \
+   && bodyhas "$IMAGE_SCANNER" "^func ImageScannerInstallGrype\\(" 'dctx, dcancel := context.WithTimeout(ctx, ' \
+   && bodyhas "$IMAGE_SCANNER" "^func ImageScannerInstallGrype\\(" 'safecmd.Command(dctx, imageScannerGrypeBin, "db", "update")'; then
+  ok "ImageScannerInstallGrype builds both its spawns (installer + db-update priming) on a deadline ctx"
 else
-  bad "install_grype is missing kill_on_drop(true) on one or both of its spawns"
+  bad "ImageScannerInstallGrype runs one or both of its spawns without a deadline ctx — a timed-out install can orphan"
 fi
-if bodyhas "$IMAGE_SCANNER" "^pub async fn scan_image" "kill_on_drop(true)"; then
-  ok "scan_image sets kill_on_drop(true) on the grype invocation"
+if bodyhas "$IMAGE_SCANNER" "^func ImageScannerScanImage\\(" 'sctx, cancel := context.WithTimeout(ctx, ' \
+   && bodyhas "$IMAGE_SCANNER" "^func ImageScannerScanImage\\(" 'safecmd.Command(sctx, imageScannerGrypeBin, image,'; then
+  ok "ImageScannerScanImage builds the grype invocation on a deadline ctx"
 else
-  bad "scan_image is missing kill_on_drop(true) — a timed-out scan can orphan"
+  bad "ImageScannerScanImage runs grype without a deadline ctx — a timed-out scan can orphan"
 fi
 
 echo
-echo "── 3. S2: sbom_scanner.rs::install_syft — pinned to a tag, not main ──"
-if hasre "$SBOM_SCANNER" '^const SYFT_VERSION: &str = "v[0-9]'; then
-  ok "SYFT_VERSION is a pinned version-tag constant"
+echo "── 3. S2: sbom_scanner.go SbomScannerInstallSyft — pinned to a tag, not main ──"
+if hasre "$SBOM_SCANNER" '^const sbomScannerSyftVersion = "v[0-9]'; then
+  ok "sbomScannerSyftVersion is a pinned version-tag constant"
 else
-  bad "no pinned SYFT_VERSION constant found"
+  bad "no pinned sbomScannerSyftVersion constant found"
 fi
-if bodyhas "$SBOM_SCANNER" "^pub async fn install_syft" '/main/install.sh'; then
+if bodyhas "$SBOM_SCANNER" "^func SbomScannerInstallSyft\\(" '/main/install.sh'; then
   bad "install_syft still fetches install.sh from the mutable main ref"
 else
   ok "install_syft no longer fetches install.sh from /main/"
 fi
-if bodyhasre "$SBOM_SCANNER" "^pub async fn install_syft" 'syft/\{SYFT_VERSION\}/install\.sh'; then
+if bodyhasre "$SBOM_SCANNER" "^func SbomScannerInstallSyft\\(" 'anchore/syft/%s/install\.sh \| sh -s -- -b %s %s",' \
+   && bodyhasre "$SBOM_SCANNER" "^func SbomScannerInstallSyft\\(" '^[[:space:]]*sbomScannerSyftVersion, sbomScannerSyftDir, sbomScannerSyftVersion\)'; then
   ok "install_syft fetches install.sh from the pinned SYFT_VERSION tag ref"
 else
   bad "install_syft's install.sh fetch is not pinned to SYFT_VERSION's ref"
 fi
-if bodyhasre "$SBOM_SCANNER" "^pub async fn install_syft" '\-b \{SYFT_DIR\} \{SYFT_VERSION\}'; then
+if bodyhasre "$SBOM_SCANNER" "^func SbomScannerInstallSyft\\(" 'sbomScannerSyftDir, sbomScannerSyftVersion\)$'; then
   ok "install_syft passes SYFT_VERSION as install.sh's TAG argument"
 else
   bad "install_syft no longer pins the installed release via install.sh's TAG arg"
 fi
 
 echo
-echo "── 4. S3 (syft half): kill_on_drop on both spawns in sbom_scanner.rs ──"
-if bodyhas "$SBOM_SCANNER" "^pub async fn install_syft" "kill_on_drop(true)"; then
-  ok "install_syft sets kill_on_drop(true) on its spawn"
+echo "── 4. S3 (syft half): both spawns in sbom_scanner.go are built on a deadline ctx ──"
+if bodyhas "$SBOM_SCANNER" "^func SbomScannerInstallSyft\\(" 'ictx, cancel := context.WithTimeout(ctx, ' \
+   && bodyhas "$SBOM_SCANNER" "^func SbomScannerInstallSyft\\(" 'safecmd.Exec(ictx, "sh", "-c", cmd)'; then
+  ok "SbomScannerInstallSyft builds its spawn on a deadline ctx"
 else
-  bad "install_syft is missing kill_on_drop(true)"
+  bad "SbomScannerInstallSyft runs its installer without a deadline ctx"
 fi
-if bodyhas "$SBOM_SCANNER" "^pub async fn generate_sbom" "kill_on_drop(true)"; then
-  ok "generate_sbom sets kill_on_drop(true) on the syft invocation"
+if bodyhas "$SBOM_SCANNER" "^func SbomScannerGenerateSbom\\(" 'sctx, cancel := context.WithTimeout(ctx, ' \
+   && bodyhas "$SBOM_SCANNER" "^func SbomScannerGenerateSbom\\(" 'safecmd.Exec(sctx, sbomScannerSyftBin, image,'; then
+  ok "SbomScannerGenerateSbom builds the syft invocation on a deadline ctx"
 else
-  bad "generate_sbom is missing kill_on_drop(true) — a timed-out SBOM run can orphan"
+  bad "SbomScannerGenerateSbom runs syft without a deadline ctx — a timed-out SBOM run can orphan"
 fi
 
 echo
-echo "── 5. S4: cms.rs — a shared credential-file permission helper, wired into the 4 CMS installers that hold DB creds ──"
-if bodyhasre "$CMS" "^async fn secure_credential_file" 'chmod.*640'; then
-  ok "secure_credential_file chmods its target to 640"
+echo "── 5. S4: cms.go — a shared credential-file permission helper, wired into the 4 CMS installers that hold DB creds ──"
+if bodyhasre "$CMS" "^func cmsSecureCredentialFile\\(" '"chmod", "640", path\)'; then
+  ok "cmsSecureCredentialFile chmods its target to 640"
 else
-  bad "secure_credential_file no longer chmods to 640 — the helper's own body changed shape"
+  bad "cmsSecureCredentialFile no longer chmods to 640 — the helper's own body changed shape"
 fi
-for pair in "install_laravel:env_file" "install_codeigniter:env_file"; do
+for pair in "CmsInstallLaravel:envFile" "CmsInstallCodeigniter:envFile"; do
   fn="${pair%%:*}"; var="${pair##*:}"
-  if bodyhasre "$CMS" "^pub async fn $fn" "secure_credential_file\(&$var\)"; then
+  if bodyhasre "$CMS" "^func $fn\\(" "cmsSecureCredentialFile\\($var\\)"; then
     ok "$fn now secures its .env file's permissions"
   else
-    bad "$fn no longer calls secure_credential_file on its .env file"
+    bad "$fn no longer calls cmsSecureCredentialFile on its .env file"
   fi
 done
-if bodyhas "$CMS" "^pub async fn install_drupal" "secure_credential_file" && \
-   bodyhas "$CMS" "^pub async fn install_drupal" "settings.php"; then
-  ok "install_drupal secures drush's generated settings.php"
+if bodyhas "$CMS" "^func CmsInstallDrupal\\(" 'cmsSecureCredentialFile(siteDir + "/web/sites/default/settings.php")'; then
+  ok "CmsInstallDrupal secures drush's generated settings.php"
 else
-  bad "install_drupal no longer secures settings.php's permissions"
+  bad "CmsInstallDrupal no longer secures settings.php's permissions"
 fi
-if bodyhas "$CMS" "^pub async fn install_joomla" "secure_credential_file" && \
-   bodyhas "$CMS" "^pub async fn install_joomla" "configuration.php"; then
-  ok "install_joomla secures the generated configuration.php"
+if bodyhas "$CMS" "^func CmsInstallJoomla\\(" 'cmsSecureCredentialFile(publicDir + "/configuration.php")'; then
+  ok "CmsInstallJoomla secures the generated configuration.php"
 else
-  bad "install_joomla no longer secures configuration.php's permissions"
+  bad "CmsInstallJoomla no longer secures configuration.php's permissions"
 fi
 # Positive control: Symfony's install() takes no db_pass at all (confirmed by
 # its own signature) — it must NOT be wired, or a future blanket copy-paste
 # would be chmod'ing a file that was never proven to hold credentials here.
-if bodyhas "$CMS" "^pub async fn install_symfony" "secure_credential_file"; then
-  bad "install_symfony now calls secure_credential_file — re-check whether Symfony's .env gained DB creds in this function (if so, this control is stale, not a regression)"
+if ! bodyhas "$CMS" "^func CmsInstallSymfony\\(" "func CmsInstallSymfony(domain, title string)"; then
+  bad "CmsInstallSymfony's signature changed (or it is gone) — this control can no longer see it; re-check whether it now takes DB creds"
+elif bodyhas "$CMS" "^func CmsInstallSymfony\\(" "cmsSecureCredentialFile"; then
+  bad "CmsInstallSymfony now calls cmsSecureCredentialFile — re-check whether Symfony's .env gained DB creds in this function (if so, this control is stale, not a regression)"
 else
-  ok "install_symfony correctly left unwired (control: its own signature takes no db_pass)"
+  ok "CmsInstallSymfony correctly left unwired (control: its own signature takes no db_pass)"
 fi
 
 echo
-echo "── 6. S4: wordpress.rs::install — tightens wp-config.php after wp-cli writes it ──"
-if bodyhas "$WORDPRESS" "^pub async fn install\(" "chmod" && \
-   bodyhas "$WORDPRESS" "^pub async fn install\(" "640" && \
-   bodyhas "$WORDPRESS" "^pub async fn install\(" "wp-config.php"; then
-  ok "install() chmods wp-config.php to 640"
+echo "── 6. S4: wordpress.go WordpressInstall — tightens wp-config.php after wp-cli writes it ──"
+if bodyhas "$WORDPRESS" "^func WordpressInstall\\(" '"chmod", "640", path+"/wp-config.php")'; then
+  ok "WordpressInstall chmods wp-config.php to 640"
 else
-  bad "install() no longer tightens wp-config.php's permissions"
+  bad "WordpressInstall no longer tightens wp-config.php's permissions"
 fi
-if bodyhas "$WORDPRESS" "^pub async fn install\(" "www-data:www-data"; then
-  ok "install() still chowns the site to www-data:www-data (positive control — the chown wasn't replaced, only supplemented)"
+if bodyhas "$WORDPRESS" "^func WordpressInstall\\(" "wordpressChownSite(path)" \
+   && bodyhas "$WORDPRESS" "^func wordpressChownSite\\(" '"chown", "-R", "www-data:www-data", path'; then
+  ok "WordpressInstall still chowns the site to www-data:www-data (positive control — the chown wasn't replaced, only supplemented)"
 else
-  bad "install() no longer chowns the site at all — unrelated regression"
+  bad "WordpressInstall no longer chowns the site at all — unrelated regression"
 fi
 
 echo
