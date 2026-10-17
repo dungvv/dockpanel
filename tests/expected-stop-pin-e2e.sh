@@ -6,14 +6,14 @@
 #
 #   §A  the severity the engine FIRES and the severity the product DECLARES are
 #       the same string. This is the arm that would have caught the original
-#       defect: `alert_runbook_defaults.rs` has always listed container_down
+#       defect: the runbook defaults (svc_alert_runbook_defaults.go) have always listed container_down
 #       under "Info" and the runbook attached to every one of those
 #       notifications says "we don't page on it", while the engine raised it at
 #       "critical" — which is the exact string the incident branch gates on. The
 #       arm derives BOTH sides and compares them, so it fails whichever one drifts.
 #   §B  the suppression sits at the CHECK, never in the fire funnel. The
 #       `alert_state` row is stamped 'firing' immediately above the fire and the
-#       branch is guarded by `!= Some("firing")`, so a funnel-level skip would
+#       branch is guarded by `!alertEngineFiringState(...)`, so a funnel-level skip would
 #       stamp a row claiming a page that never went out and then suppress every
 #       future container_down for that name — the tombstone this engine's own
 #       comment records as having run for four months.
@@ -24,7 +24,7 @@
 #       case for something stopped because it was misbehaving) never reaches
 #       that arm, would keep its expectation for ever, and would be silenced
 #       when it finally died.
-#   §D  the clear cannot touch the auto-sleep clock. `wake_container` writes
+#   §D  the clear cannot touch the auto-sleep clock. rtDockerAppsWakeContainer writes
 #       is_sleeping/last_woken_at/last_activity_at together, and that statement
 #       is the obvious one to copy — but the engine runs every 120s against every
 #       running container, so copying it would bump `last_activity_at` for ever
@@ -32,14 +32,15 @@
 #   §E  every deliberate stop path records, and every start path clears —
 #       including the STACK path, where one click stops N containers.
 #   §F  the caller's container id is CANONICALISED before it is used as a key.
-#       `is_valid_container_id` accepts any 1-64 hex string and Docker resolves a
+#       isValidContainerID accepts any 1-64 hex string and Docker resolves a
 #       prefix, so the short id `docker ps` prints stops the container fine and
 #       would otherwise write a row the engine can never match.
 #   §G  the suppression predicate is membership and nothing broader (narrowing).
 #   §H  the migration carries the server term in its UNIQUE and does NOT backfill.
 #   §I  the SPA stops calling the panel's own deliberate action a crash.
 #
-# Pure source analysis: no box, no network, no build.
+# Pure source analysis: no box, no network, no build. Subjects are the Go API
+# (panel/go/internal/api) — the shipped backend since the Go port.
 #
 # NO PIPES INTO `grep -q` — under `set -o pipefail` grep -q closes the pipe on
 # its first match and the arm goes red on correct code. Every arm uses a
@@ -52,14 +53,15 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-ENGINE=panel/backend/src/services/alert_engine.rs
-HEALER=panel/backend/src/services/auto_healer.rs
-APPS=panel/backend/src/routes/docker_apps.rs
-STACKS=panel/backend/src/routes/stacks.rs
-GIT=panel/backend/src/routes/git_deploys.rs
-SVC=panel/backend/src/services/expected_stops.rs
-DEFAULTS=panel/backend/src/services/alert_runbook_defaults.rs
-MIG=panel/backend/migrations/20260822000000_container_expected_stops.sql
+GOAPI=panel/go/internal/api
+ENGINE=$GOAPI/svc_alert_engine.go
+HEALER=$GOAPI/svc_auto_healer.go
+APPS=$GOAPI/rt_docker_apps.go
+STACKS=$GOAPI/rt_stacks.go
+GIT=$GOAPI/rt_git_deploys.go
+SVC=$GOAPI/svc_expected_stops.go
+DEFAULTS=$GOAPI/svc_alert_runbook_defaults.go
+MIG=$GOAPI/migrations/20260822000000_container_expected_stops.sql
 SPA=panel/frontend/src/pages/Apps.tsx
 
 for f in "$ENGINE" "$HEALER" "$APPS" "$STACKS" "$GIT" "$SVC" "$DEFAULTS" "$MIG" "$SPA"; do
@@ -81,23 +83,25 @@ code() {
 }
 subj() { local t; t=$(code "$1"); [ -n "$t" ] || return 1; printf '%s' "$t"; }
 
-# SQL comments are `--`, which the Rust stripper does not touch.
+# SQL comments are `--`, which the Go stripper does not touch.
 sqlsubj() { sed -E 's/^[[:space:]]*--.*$//' "$1"; }
 
-# The body of one top-level fn, bounded by the NEXT top-level fn.
+# The body of one top-level func (or method), bounded by the NEXT top-level
+# func. The signature line itself is skipped, so a top-level statement sits at
+# brace depth 0.
 fnbody() {
   awk -v name="$2" '
-    /^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn / {
-      if ($0 ~ "(pub |pub\\(crate\\) )?(async )?fn " name "\\(") { inside=1; next }
+    /^func / {
+      if (index($0, "func " name "(") || $0 ~ ("^func \\([^)]*\\) " name "\\(")) { inside=1; next }
       inside=0
     }
     inside { print }
   ' <<< "$1"
 }
 
-# Whitespace-squeezed, so rustfmt reflowing a call across lines cannot retire an
+# Whitespace-squeezed (spaces AND tabs — gofmt indents with tabs), so reflowing a call across lines cannot retire an
 # arm (lesson #585/#638 — it has happened twice).
-flat() { tr -d ' \n' <<< "$1"; }
+flat() { tr -d ' \t\n' <<< "$1"; }
 
 # Brace depth immediately BEFORE the first occurrence of fixed-string $2 in
 # body $1 (relative to where $1 itself starts — this file's fnbody() already
@@ -120,27 +124,33 @@ depth_before() {
 echo "== §A  the severity FIRED and the severity DECLARED are the same string =="
 
 if EG=$(subj "$ENGINE"); then
-  CH=$(fnbody "$EG" check_container_health)
+  CH=$(fnbody "$EG" alertEngineCheckContainerHealth)
   CHF=$(flat "$CH")
 
   if [ -n "$CH" ]; then
-    ok "A0-control check_container_health extracted, $(wc -l <<< "$CH") lines"
+    ok "A0-control alertEngineCheckContainerHealth extracted, $(wc -l <<< "$CH") lines"
   else
-    bad "A0-control check_container_health extracted"
+    bad "A0-control alertEngineCheckContainerHealth extracted"
   fi
 
   # DERIVED on both sides. The declared value is read out of the defaults table
   # rather than spelled here, so this arm goes red if EITHER side moves.
-  DECLARED=$(perl -0777 -ne '
-    while (/alert_type:\s*"container_down"\s*,\s*severity:\s*"([a-z]+)"/gs) { print "$1\n" }
-    while (/severity:\s*"([a-z]+)"\s*,\s*alert_type:\s*"container_down"/gs) { print "$1\n" }
-  ' "$DEFAULTS" | head -1)
-  FIRED=$(perl -0777 -ne 'while (/"container_down",name,"([a-z]+)",/gs) { print "$1\n" }' <<< "$CHF" | head -1)
+  # Go table rows are positional {AlertType, Severity, RunbookMd}; the struct
+  # field order is asserted too, so a reorder cannot make this read the wrong
+  # column.
+  DECLARED=""
+  if perl -0777 -ne 'exit(/struct\s*\{\s*AlertType\s+string\s+Severity\s+string/s ? 0 : 1)' "$DEFAULTS"; then
+    DECLARED=$(perl -0777 -ne '
+      while (/\{\s*"container_down"\s*,\s*"([a-z]+)"/gs) { print "$1\n" }
+      while (/AlertType:\s*"container_down"\s*,\s*Severity:\s*"([a-z]+)"/gs) { print "$1\n" }
+    ' "$DEFAULTS" | head -1)
+  fi
+  FIRED=$(perl -0777 -ne 'while (/FireAlertWithRetry\([^;]*?"container_down",name,"([a-z]+)",/gs) { print "$1\n" }' <<< "$CHF" | head -1)
 
   if [ -n "$DECLARED" ]; then
-    ok "A1-control the declared severity was parsed out of alert_runbook_defaults: '$DECLARED'"
+    ok "A1-control the declared severity was parsed out of svc_alert_runbook_defaults.go: '$DECLARED'"
   else
-    bad "A1-control the declared severity was parsed out of alert_runbook_defaults — parsed nothing"
+    bad "A1-control the declared severity was parsed out of svc_alert_runbook_defaults.go — parsed nothing"
   fi
   if [ -n "$FIRED" ]; then
     ok "A2-control the fired severity was parsed out of the engine: '$FIRED'"
@@ -163,10 +173,10 @@ if EG=$(subj "$ENGINE"); then
   echo
   echo "== §B  the suppression is at the CHECK, never in the fire funnel =="
 
-  FWR=$(fnbody "$EG" fire_alert_with_retry)
-  if grep -qF 'try_fire_alert(' <<< "$FWR"; then
+  FWR=$(fnbody "$EG" alertEngineFireAlertWithRetry)
+  if grep -qF 'NotificationsTryFireAlert(' <<< "$FWR"; then
     ok "B1-control the fire funnel was extracted and is non-empty"
-    if grep -qF 'expected' <<< "$FWR"; then
+    if grep -qiE 'expected_?stop' <<< "$FWR"; then
       bad "B2 the expectation is NOT consulted at the fire — it is, and every alert_state stamp beside a fire then claims a page that never went out"
     else
       ok "B2 the expectation is not consulted at the fire"
@@ -183,7 +193,7 @@ if EG=$(subj "$ENGINE"); then
   # and passed over its own mutation: deleting the skip left the CLEAR guard as
   # the last match, which is also above the stamp (#626, an arm that inspects the
   # wrong token cannot fail). Found by the mutation run, not by review.
-  NSKIP=$(grep -oF 'ifexpected_stopped.contains(name){continue;}' <<< "$CHF" | wc -l)
+  NSKIP=$(grep -oF 'ifexpectedStopped[name]{continue}' <<< "$CHF" | wc -l)
   if [ "$NSKIP" -eq 1 ]; then
     ok "B3a the exited arm carries exactly one unconditional skip"
   else
@@ -191,7 +201,7 @@ if EG=$(subj "$ENGINE"); then
   fi
   # The skip's line = the first predicate use AFTER the ladder opens, so this
   # cannot silently fall back onto the clear guard above it.
-  SKIPLINE=$(awk '/state == "exited" \|\| state == "dead"/{seen=1} seen && /expected_stopped\.contains\(name\)/{print NR; exit}' <<< "$CH")
+  SKIPLINE=$(awk '/state == "exited" \|\| state == "dead"/{seen=1} seen && /expectedStopped\[name\]/{print NR; exit}' <<< "$CH")
   STAMP=$(grep -n "INSERT INTO alert_state" <<< "$CH" | head -1 | cut -d: -f1)
   if [ -n "$SKIPLINE" ] && [ -n "$STAMP" ] && [ "$SKIPLINE" -lt "$STAMP" ]; then
     ok "B3b the skip precedes the alert_state stamp (skip $SKIPLINE < stamp $STAMP)"
@@ -202,7 +212,7 @@ if EG=$(subj "$ENGINE"); then
   echo
   echo "== §C  cleared from OBSERVATION, above the ladder, not gated on health =="
 
-  CLEAR=$(grep -n 'clear_if_older_than' <<< "$CH" | head -1 | cut -d: -f1)
+  CLEAR=$(grep -n 'ExpectedStopsClearIfOlderThan(' <<< "$CH" | head -1 | cut -d: -f1)
   LADDER=$(grep -n 'state == "exited" || state == "dead"' <<< "$CH" | head -1 | cut -d: -f1)
   if [ -n "$CLEAR" ] && [ -n "$LADDER" ] && [ "$CLEAR" -lt "$LADDER" ]; then
     ok "C1 the clear runs ABOVE the state ladder (clear $CLEAR < ladder $LADDER)"
@@ -212,13 +222,13 @@ if EG=$(subj "$ENGINE"); then
 
   # Keyed on liveness, not on health. `running` alone would miss restarting /
   # paused / created, and `running && healthy` would miss the unhealthy comeback.
-  if grep -qF 'state!="exited"&&state!="dead"&&expected_stopped.contains(name)' <<< "$CHF"; then
+  if grep -qF 'ifstate!="exited"&&state!="dead"&&expectedStopped[name]{ExpectedStopsClearIfOlderThan(' <<< "$CHF"; then
     ok "C2 the clear is keyed on not-exited/not-dead, not on running-and-healthy"
   else
     bad "C2 the clear is keyed on not-exited/not-dead, not on running-and-healthy"
   fi
 
-  NCLEAR=$(grep -oF 'clear_if_older_than' <<< "$CHF" | wc -l)
+  NCLEAR=$(grep -oF 'ExpectedStopsClearIfOlderThan(' <<< "$CHF" | wc -l)
   if [ "$NCLEAR" -eq 1 ]; then
     ok "C3 exactly one clear site in the health check"
   else
@@ -232,7 +242,7 @@ echo
 echo "== §D  the clear cannot move the auto-sleep clock =="
 
 if SV=$(subj "$SVC"); then
-  CLEARFN=$(fnbody "$SV" clear_if_older_than)
+  CLEARFN=$(fnbody "$SV" ExpectedStopsClearIfOlderThan)
   if grep -qF 'DELETE FROM container_expected_stops' <<< "$CLEARFN"; then
     ok "D1-control the clear statement was extracted"
     BUMPS=""
@@ -265,17 +275,17 @@ echo
 echo "== §E  every deliberate stop records, every start clears =="
 
 if AP=$(subj "$APPS"); then
-  for fn in stop_app sleep_container; do
+  for fn in rtDockerAppsStopApp rtDockerAppsSleepContainer; do
     B=$(flat "$(fnbody "$AP" "$fn")")
-    if grep -qF 'expected_stops::record(' <<< "$B"; then
+    if grep -qF 'ExpectedStopsRecord(' <<< "$B"; then
       ok "E1 $fn records the expectation"
     else
       bad "E1 $fn records the expectation"
     fi
   done
-  for fn in start_app restart_app wake_container; do
+  for fn in rtDockerAppsStartApp rtDockerAppsRestartApp rtDockerAppsWakeContainer; do
     B=$(flat "$(fnbody "$AP" "$fn")")
-    if grep -qF 'expected_stops::clear(' <<< "$B"; then
+    if grep -qF 'ExpectedStopsClear(' <<< "$B"; then
       ok "E2 $fn clears the expectation"
     else
       bad "E2 $fn clears the expectation"
@@ -283,22 +293,22 @@ if AP=$(subj "$APPS"); then
   done
 
   # An expectation recorded before the stop succeeded would mark a RUNNING
-  # container. Assert the record sits after the agent call in stop_app.
-  SB=$(fnbody "$AP" stop_app)
-  POST=$(grep -n 'agent_error("Container stop"' <<< "$SB" | head -1 | cut -d: -f1)
-  REC=$(grep -n 'expected_stops::record' <<< "$SB" | head -1 | cut -d: -f1)
+  # container. Assert the record sits after the agent call in rtDockerAppsStopApp.
+  SB=$(fnbody "$AP" rtDockerAppsStopApp)
+  POST=$(grep -n 'agentError("Container stop"' <<< "$SB" | head -1 | cut -d: -f1)
+  REC=$(grep -n 'ExpectedStopsRecord(' <<< "$SB" | head -1 | cut -d: -f1)
   if [ -n "$POST" ] && [ -n "$REC" ] && [ "$POST" -lt "$REC" ]; then
-    ok "E3 stop_app records only after the stop succeeded (post $POST < record $REC)"
+    ok "E3 rtDockerAppsStopApp records only after the stop succeeded (post $POST < record $REC)"
   else
-    bad "E3 stop_app records only after the stop succeeded (post '$POST', record '$REC')"
+    bad "E3 rtDockerAppsStopApp records only after the stop succeeded (post '$POST', record '$REC')"
   fi
 else
   bad "E $APPS is readable"
 fi
 
 if ST=$(subj "$STACKS"); then
-  SA=$(flat "$(fnbody "$ST" stack_action)")
-  if grep -qF 'expected_stops::record(' <<< "$SA" && grep -qF 'expected_stops::clear(' <<< "$SA"; then
+  SA=$(flat "$(fnbody "$ST" rtStacksAction)")
+  if grep -qF 'ExpectedStopsRecord(' <<< "$SA" && grep -qF 'ExpectedStopsClear(' <<< "$SA"; then
     ok "E4 the stack path both records and clears — one click stops N containers"
   else
     bad "E4 the stack path both records and clears — one click stops N containers"
@@ -316,34 +326,53 @@ fi
 # returns (success or failure), or a refused/failed recreate leaves a
 # container that never actually stopped marked expected-stopped forever.
 # [[project_dockpanel_tech_debt_p185]] carry G.
+#
+# Go port: update_app (rtDockerAppsUpdateApp) still wraps its agent call
+# inline; update_env / update_image now hand their agent call as a closure to
+# the shared rtDockerAppsRecreate, which owns record → call → clear. So the
+# ordering is asserted once on the helper (E8-helper) and each of those two
+# handlers is asserted to route its agent call THROUGH the helper's closure.
 if AP=$(subj "$APPS"); then
-  declare -A RECREATE_CALL_ANCHOR=(
-    [update_app]='post_long(&agent_path, None, 900)'
-    [update_env]='put_long(&format!("/apps/{cid}/env")'
-    [update_image]='&format!("/apps/{cid}/change-image")'
-  )
   E8_OK=0
-  for fn in update_app update_env update_image; do
+  UB=$(fnbody "$AP" rtDockerAppsUpdateApp)
+  RECPOS=$(grep -n 'ExpectedStopsRecord(' <<< "$UB" | head -1 | cut -d: -f1)
+  CALLPOS=$(grep -nF 'agent.PostLong(ctx, "/apps/"+cid+"/update"' <<< "$UB" | head -1 | cut -d: -f1)
+  CLEARPOS=$(grep -n 'ExpectedStopsClear(' <<< "$UB" | head -1 | cut -d: -f1)
+  if [ -n "$RECPOS" ] && [ -n "$CALLPOS" ] && [ -n "$CLEARPOS" ] \
+     && [ "$RECPOS" -lt "$CALLPOS" ] && [ "$CALLPOS" -lt "$CLEARPOS" ]; then
+    ok "E8 rtDockerAppsUpdateApp records before the recreate call and clears after it (record $RECPOS < call $CALLPOS < clear $CLEARPOS)"
+    E8_OK=$((E8_OK + 1))
+  else
+    bad "E8 rtDockerAppsUpdateApp ordering wrong (record '$RECPOS', call '$CALLPOS', clear '$CLEARPOS') — recording after the call would mark a still-running container; clearing before it would un-suppress the healer mid-recreate"
+  fi
+
+  HB=$(fnbody "$AP" rtDockerAppsRecreate)
+  HREC=$(grep -n 'ExpectedStopsRecord(' <<< "$HB" | head -1 | cut -d: -f1)
+  HCALL=$(grep -nE 'result, err := call\(ctx\)' <<< "$HB" | head -1 | cut -d: -f1)
+  HCLR=$(grep -n 'ExpectedStopsClear(' <<< "$HB" | head -1 | cut -d: -f1)
+  HERR=$(grep -n 'if err != nil' <<< "$HB" | head -1 | cut -d: -f1)
+  if [ -n "$HREC" ] && [ -n "$HCALL" ] && [ -n "$HCLR" ] && [ -n "$HERR" ] \
+     && [ "$HREC" -lt "$HCALL" ] && [ "$HCALL" -lt "$HCLR" ] && [ "$HCLR" -lt "$HERR" ]; then
+    ok "E8-helper rtDockerAppsRecreate records before the call and clears after it, ahead of the error check (record $HREC < call $HCALL < clear $HCLR < err $HERR)"
+  else
+    bad "E8-helper rtDockerAppsRecreate ordering wrong (record '$HREC', call '$HCALL', clear '$HCLR', err-check '$HERR') — a clear gated on success leaves a failed recreate's container expected-stopped forever"
+  fi
+
+  declare -A RECREATE_CALL_ANCHOR=(
+    [rtDockerAppsUpdateEnv]='agent.PutLong(ctx, "/apps/"+cid+"/env"'
+    [rtDockerAppsUpdateImage]='agent.PostLong(ctx, "/apps/"+cid+"/change-image"'
+  )
+  for fn in rtDockerAppsUpdateEnv rtDockerAppsUpdateImage; do
     RB=$(fnbody "$AP" "$fn")
-    RBF=$(flat "$RB")
-    if ! grep -qF 'expected_stops::record(' <<< "$RBF"; then
-      bad "E8 $fn records the expectation"
-      continue
-    fi
-    if ! grep -qF 'expected_stops::clear(' <<< "$RBF"; then
-      bad "E8 $fn clears the expectation"
-      continue
-    fi
     ANCHOR="${RECREATE_CALL_ANCHOR[$fn]}"
-    RECPOS=$(grep -n 'expected_stops::record' <<< "$RB" | head -1 | cut -d: -f1)
+    VIA=$(grep -n 'rtDockerAppsRecreate(' <<< "$RB" | head -1 | cut -d: -f1)
     CALLPOS=$(grep -nF "$ANCHOR" <<< "$RB" | head -1 | cut -d: -f1)
-    CLEARPOS=$(grep -n 'expected_stops::clear' <<< "$RB" | head -1 | cut -d: -f1)
-    if [ -n "$RECPOS" ] && [ -n "$CALLPOS" ] && [ -n "$CLEARPOS" ] \
-       && [ "$RECPOS" -lt "$CALLPOS" ] && [ "$CALLPOS" -lt "$CLEARPOS" ]; then
-      ok "E8 $fn records before the recreate call and clears after it (record $RECPOS < call $CALLPOS < clear $CLEARPOS)"
+    if [ -n "$VIA" ] && [ -n "$CALLPOS" ] && [ "$((VIA + 1))" -eq "$CALLPOS" ] \
+       && [ "$(grep -cE 'agent\.(Put|Post)Long\(' <<< "$RB")" -eq 1 ]; then
+      ok "E8 $fn runs its only recreate call inside rtDockerAppsRecreate's closure (helper $VIA, call $CALLPOS)"
       E8_OK=$((E8_OK + 1))
     else
-      bad "E8 $fn ordering wrong (record '$RECPOS', call '$CALLPOS' via anchor '$ANCHOR', clear '$CLEARPOS') — recording after the call would mark a still-running container; clearing before it would un-suppress the healer mid-recreate"
+      bad "E8 $fn does not route its recreate call through rtDockerAppsRecreate (helper '$VIA', call '$CALLPOS' via anchor '$ANCHOR') — the call runs outside the record/clear window"
     fi
   done
   if [ "$E8_OK" -eq 3 ]; then
@@ -356,7 +385,7 @@ else
 fi
 
 # ⛔ THE LIST ABOVE IS A LITERAL, AND A LITERAL CANNOT SEE A DOOR IT DOES NOT
-# NAME. `git_deploys::stop` shipped 2026-03-18, this table arrived 2026-08-22,
+# NAME. `rtGitDeploysStop` shipped 2026-03-18, this table arrived 2026-08-22,
 # and E1-E5 were green for the whole gap because a fifth door is unrepresentable
 # in an assertion that enumerates four.
 #
@@ -372,37 +401,37 @@ fi
 # literal), and only ONE of the three modules persists a status column at all —
 # so any repo-wide grep would report a confident, false, all-clear.
 if GD=$(subj "$GIT"); then
-  GB=$(fnbody "$GD" "stop")
+  GB=$(fnbody "$GD" rtGitDeploysStop)
   # FLOOR the subject: an fnbody whose pattern stops matching yields an EMPTY
   # string, under which every `grep -q` below fails OPEN in the wrong direction.
   if [ "$(wc -l <<< "$GB")" -lt 8 ]; then
-    bad "E7 git_deploys::stop body resolved ($(wc -l <<< "$GB") lines — subject lost)"
+    bad "E7 rtGitDeploysStop body resolved ($(wc -l <<< "$GB") lines — subject lost)"
   else
     GBF=$(flat "$GB")
-    if grep -qF 'expected_stops::record(' <<< "$GBF"; then
-      ok "E7 git_deploys::stop records the expectation"
+    if grep -qF 'ExpectedStopsRecord(' <<< "$GBF"; then
+      ok "E7 rtGitDeploysStop records the expectation"
     else
-      bad "E7 git_deploys::stop records the expectation"
+      bad "E7 rtGitDeploysStop records the expectation"
     fi
 
     # Same ordering assertion as E3, for the same reason: recorded before the
     # agent call succeeds would mark a container that is still running.
-    POSTG=$(grep -n 'agent_error("Stop container"' <<< "$GB" | head -1 | cut -d: -f1)
-    RECG=$(grep -n 'expected_stops::record' <<< "$GB" | head -1 | cut -d: -f1)
+    POSTG=$(grep -n 'agentError("Stop container"' <<< "$GB" | head -1 | cut -d: -f1)
+    RECG=$(grep -n 'ExpectedStopsRecord(' <<< "$GB" | head -1 | cut -d: -f1)
     if [ -n "$POSTG" ] && [ -n "$RECG" ] && [ "$POSTG" -lt "$RECG" ]; then
-      ok "E7b git_deploys::stop records only after the stop succeeded (post $POSTG < record $RECG)"
+      ok "E7b rtGitDeploysStop records only after the stop succeeded (post $POSTG < record $RECG)"
     else
-      bad "E7b git_deploys::stop records only after the stop succeeded (post '$POSTG', record '$RECG')"
+      bad "E7b rtGitDeploysStop records only after the stop succeeded (post '$POSTG', record '$RECG')"
     fi
   fi
 
-  GS=$(fnbody "$GD" "start")
+  GS=$(fnbody "$GD" rtGitDeploysStart)
   if [ "$(wc -l <<< "$GS")" -lt 8 ]; then
-    bad "E7c git_deploys::start body resolved ($(wc -l <<< "$GS") lines — subject lost)"
-  elif grep -qF 'expected_stops::clear(' <<< "$(flat "$GS")"; then
-    ok "E7c git_deploys::start clears the expectation"
+    bad "E7c rtGitDeploysStart body resolved ($(wc -l <<< "$GS") lines — subject lost)"
+  elif grep -qF 'ExpectedStopsClear(' <<< "$(flat "$GS")"; then
+    ok "E7c rtGitDeploysStart clears the expectation"
   else
-    bad "E7c git_deploys::start clears the expectation"
+    bad "E7c rtGitDeploysStart clears the expectation"
   fi
 
   # The KEY is the whole fix. The stored name is bare; the healer matches the
@@ -411,13 +440,15 @@ if GD=$(subj "$GIT"); then
   #
   # ⛔ SCOPED TO THE HELPER'S OWN BODY, and this arm was FILE-scoped when first
   # written: dropping the prefix left it GREEN, because
-  # `format!("dockpanel-git-{name}-pr-{branch_slug}")` 2000 lines away CONTAINS
+  # the PR-preview name builder ("dockpanel-git-" + name + "-pr-" + slug) far away CONTAINS
   # the literal once whitespace is squeezed. Twelve occurrences of the prefix
   # live in this file. A whole-file `has` here is unfalsifiable.
-  KB=$(fnbody "$GD" "expected_stop_key")
-  if [ "$(wc -l <<< "$KB")" -lt 2 ]; then
-    bad "E7d expected_stop_key body resolved ($(wc -l <<< "$KB") lines — subject lost)"
-  elif grep -qF 'format!("dockpanel-git-{name}")' <<< "$(flat "$KB")"; then
+  # Go: the helper is a one-line func, so its body IS its signature line —
+  # scoped to that one line (fnbody skips the signature line).
+  KB=$(grep -E '^func rtGitDeploysExpectedStopKey\(' <<< "$GD")
+  if [ "$(grep -c . <<< "$KB")" -ne 1 ]; then
+    bad "E7d rtGitDeploysExpectedStopKey resolved ($(grep -c . <<< "$KB") definitions — subject lost)"
+  elif grep -qF 'func rtGitDeploysExpectedStopKey(name string) string { return "dockpanel-git-" + name }' <<< "$KB"; then
     ok "E7d the recorded key carries the agent's dockpanel-git- prefix"
   else
     bad "E7d the recorded key carries the agent's dockpanel-git- prefix"
@@ -426,10 +457,10 @@ if GD=$(subj "$GIT"); then
   # ...and that `stop()` actually routes its key through that helper, rather
   # than spelling a bare name inline. E7d alone would pass with the helper
   # correct and unused — the #732 shape this whole session exists to not repeat.
-  if grep -qF 'expected_stop_key(&config.name)' <<< "$(flat "$GB")"; then
-    ok "E7e git_deploys::stop derives its key through expected_stop_key"
+  if grep -qF 'containerName:=rtGitDeploysExpectedStopKey(config.Name)ExpectedStopsRecord(ctx,st.DB,config.ServerID,containerName,' <<< "$(flat "$GB")"; then
+    ok "E7e rtGitDeploysStop derives its key through rtGitDeploysExpectedStopKey"
   else
-    bad "E7e git_deploys::stop derives its key through expected_stop_key"
+    bad "E7e rtGitDeploysStop derives its key through rtGitDeploysExpectedStopKey"
   fi
 else
   bad "E7 $GIT is readable"
@@ -437,14 +468,14 @@ fi
 
 if HL=$(subj "$HEALER"); then
   HF=$(flat "$HL")
-  if grep -qF 'expected_stops::record(' <<< "$HF"; then
+  if grep -qF 'ExpectedStopsRecord(ctx,db,*c.ServerID,c.ContainerName,ExpectedStopsReasonAutoSleep,' <<< "$HF"; then
     ok "E5 the auto-sleep leg records the expectation"
   else
     bad "E5 the auto-sleep leg records the expectation"
   fi
   # The restart leg must READ it, or the panel restarts the operator's own Stop
   # within 120s — silently, now that the spurious alert is gone.
-  if grep -qF 'expected_stopped.contains(name)' <<< "$HF"; then
+  if grep -qF 'if_,expected:=expectedStopped[name];expected{continue}' <<< "$HF"; then
     ok "E6 the auto-heal restart leg skips a container stopped on purpose"
   else
     bad "E6 the auto-heal restart leg skips a container stopped on purpose"
@@ -457,8 +488,8 @@ echo
 echo "== §F  the caller's container id is canonicalised before it becomes a key =="
 
 if AP=$(subj "$APPS"); then
-  RC=$(flat "$(fnbody "$AP" resolve_container_name)")
-  if grep -qF '[only]=>Some(' <<< "$RC"; then
+  RC=$(flat "$(fnbody "$AP" rtDockerAppsResolveContainerName)")
+  if grep -qF 'iflen(hits)==1{return&hits[0]}returnnil}' <<< "$RC"; then
     ok "F1 an ambiguous id prefix resolves to nothing rather than to the first hit"
   else
     bad "F1 an ambiguous id prefix resolves to nothing rather than to the first hit"
@@ -467,13 +498,13 @@ if AP=$(subj "$APPS"); then
   # No writer may key on the raw path parameter. Extracted paren-balanced so a
   # reflowed call cannot hide from the arm.
   RAWKEY=$(perl -0777 -ne '
-    while (/expected_stops::(?:record|clear)\s*(\((?:[^()]++|(?1))*\))/gs) {
+    while (/ExpectedStops(?:Record|Clear)\s*(\((?:[^()]++|(?1))*\))/gs) {
       my $c = $1; $c =~ s/\s+//g;
-      print "$c\n" if $c =~ /&container_id/;
+      print "$c\n" if $c =~ /,cid[,)]/;
     }
   ' <<< "$AP" | wc -l)
   NCALLS=$(perl -0777 -ne '
-    while (/expected_stops::(?:record|clear)\s*(\((?:[^()]++|(?1))*\))/gs) { print "x\n" }
+    while (/ExpectedStops(?:Record|Clear)\s*(\((?:[^()]++|(?1))*\))/gs) { print "x\n" }
   ' <<< "$AP" | wc -l)
   if [ "$NCALLS" -ge 5 ]; then
     ok "F2-control found $NCALLS record/clear call sites to inspect"
@@ -491,7 +522,7 @@ echo
 echo "== §G  the suppression is membership and nothing broader =="
 
 if EG=$(subj "$ENGINE"); then
-  NPRED=$(grep -oF 'expected_stopped.contains(' <<< "$(flat "$EG")" | wc -l)
+  NPRED=$(grep -oF 'expectedStopped[' <<< "$(flat "$EG")" | wc -l)
   if [ "$NPRED" -eq 2 ]; then
     ok "G1 exactly two uses of the predicate — one clear guard, one skip"
   else
@@ -563,17 +594,17 @@ echo "== §J  a REMOVED container's expectation dies with it =="
 # The top-level fn names of a subject, in order.
 fnnames() {
   awk '
-    match($0, /^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn [A-Za-z0-9_]+\(/) {
-      s = substr($0, RSTART, RLENGTH); sub(/.*fn /, "", s); sub(/\(.*/, "", s); print s
+    match($0, /^func (\([^)]*\) )?[A-Za-z0-9_]+\(/) {
+      s = substr($0, RSTART, RLENGTH); sub(/^func (\([^)]*\) )?/, "", s); sub(/\(.*/, "", s); print s
     }
   ' <<< "$1"
 }
 
 if SV=$(subj "$SVC"); then
-  ABS=$(fnbody "$SV" clear_absent)
+  ABS=$(fnbody "$SV" ExpectedStopsClearAbsent)
   ABSF=$(flat "$ABS")
-  if [ "${#ABS}" -ge 200 ] && grep -qF 'DELETEFROMcontainer_expected_stops' <<< "$ABSF"; then
-    ok "J1-control clear_absent extracted (${#ABS} chars) and deletes from the table"
+  if [ "${#ABS}" -ge 150 ] && grep -qF 'DELETEFROMcontainer_expected_stops' <<< "$ABSF"; then
+    ok "J1-control ExpectedStopsClearAbsent extracted (${#ABS} chars) and deletes from the table"
 
     # ⛔ THE INVERSION GUARD, and it is the whole reason this arm exists.
     # `container_name <> ALL('{}')` is TRUE for every row, so a sweep handed an
@@ -582,13 +613,13 @@ if SV=$(subj "$SVC"); then
     # stopped, which is the exact defect v2.144.0 shipped this table to remove.
     # An empty listing is the one observation that cannot tell "nothing is here"
     # from "I can see nothing".
-    if grep -qF 'ifobserved.is_empty(){return;}' <<< "$ABSF"; then
+    if grep -qF 'iflen(observed)==0{return}' <<< "$ABSF"; then
       ok "J2 the sweep refuses an EMPTY observation"
     else
       bad "J2 the sweep refuses an EMPTY observation — an empty listing would clear the whole host"
     fi
 
-    # Same race `clear_if_older_than` carries: one snapshot, walked with awaited
+    # Same race ExpectedStopsClearIfOlderThan carries: one snapshot, walked with awaited
     # calls, so a stop recorded inside that window is NEWER than the evidence.
     if grep -qF 'stopped_at<$' <<< "$ABSF"; then
       ok "J3 the sweep will not discard an expectation newer than its own evidence"
@@ -608,30 +639,35 @@ if SV=$(subj "$SVC"); then
       bad "J4 the sweep writes none of the auto-sleep columns — found:$BUMPS"
     fi
   else
-    for a in J1-control J2 J3 J4; do bad "$a clear_absent extracted from $SVC"; done
+    for a in J1-control J2 J3 J4; do bad "$a ExpectedStopsClearAbsent extracted from $SVC"; done
   fi
 else
   for a in J1-control J2 J3 J4; do bad "$a $SVC is readable"; done
 fi
 
 if EG=$(subj "$ENGINE"); then
-  CH2=$(fnbody "$EG" check_container_health)
+  CH2=$(fnbody "$EG" alertEngineCheckContainerHealth)
   CH2F=$(flat "$CH2")
-  NABS=$(grep -oF 'expected_stops::clear_absent(' <<< "$CH2F" | wc -l)
+  NABS=$(grep -oF 'ExpectedStopsClearAbsent(ctx,db,serverID,observedNames,observedAt)' <<< "$CH2F" | wc -l)
   if [ "$NABS" -eq 1 ]; then
     ok "J5 the engine runs the absence sweep exactly once"
   else
     bad "J5 the engine runs the absence sweep exactly once — found $NABS"
   fi
 
-  # ONE observation, read by both sweeps. A second binding of `observed` would
+  # ONE observation, read by both sweeps. A second binding of the listing would
   # let the expectation sweep be fed a filtered subset while the arm above still
   # counted one call — and every name missing from that subset would be deleted.
-  NOBS=$(grep -oF 'letobserved:' <<< "$CH2F" | wc -l)
-  if [ "$NOBS" -eq 1 ]; then
+  # Go keeps the listing as a set (observed, read by the alert_state sweep) and
+  # a slice (observedNames, handed to ExpectedStopsClearAbsent), both bound once
+  # and filled in ONE loop over the agent's array — so the slice is the set.
+  NOBS=$(grep -oF 'observedNames:=' <<< "$CH2F" | wc -l)
+  NAPP=$(grep -oE 'observedNames=' <<< "$CH2F" | wc -l)
+  FILL=$(grep -cF 'observed[n]=trueobservedNames=append(observedNames,n)' <<< "$CH2F")
+  if [ "$NOBS" -eq 1 ] && [ "$NAPP" -eq 1 ] && [ "$FILL" -eq 1 ]; then
     ok "J6 the host's listing is bound once and both sweeps read that one binding"
   else
-    bad "J6 the host's listing is bound once and both sweeps read that one binding — found $NOBS"
+    bad "J6 the host's listing is bound once and both sweeps read that one binding — bindings $NOBS, reassignments $NAPP, joint fill $FILL"
   fi
 else
   for a in J5 J6; do bad "$a $ENGINE is readable"; done
@@ -647,7 +683,7 @@ if ST=$(subj "$STACKS"); then
       *'"action":"remove"'*)
         SDOORS=$((SDOORS+1))
         case "$B" in
-          *'expected_stops::clear('*) SCLEARS=$((SCLEARS+1)) ;;
+          *'ExpectedStopsClear('*|*'rtStacksClearRemoved('*) SCLEARS=$((SCLEARS+1)) ;;
           *) SMISSING="$SMISSING $fn" ;;
         esac
         ;;
@@ -664,6 +700,14 @@ if ST=$(subj "$STACKS"); then
   else
     bad "J7-control found $SDOORS stack removal doors — too few, the extractor is not matching"
   fi
+  # Go: the doors share rtStacksClearRemoved, so J8 is only as good as that
+  # helper actually clearing every container the agent reports removed.
+  CRB=$(flat "$(fnbody "$ST" rtStacksClearRemoved)")
+  if grep -qF 's=="removed"{ifname,ok:=jsonStr(jsonGet(r,"name"));ok{ExpectedStopsClear(ctx,db,serverID,name)' <<< "$CRB"; then
+    ok "J8b rtStacksClearRemoved clears the expectation of every container reported removed"
+  else
+    bad "J8b rtStacksClearRemoved clears the expectation of every container reported removed"
+  fi
 else
   for a in J7-control J8; do bad "$a $STACKS is readable"; done
 fi
@@ -674,10 +718,10 @@ if AP=$(subj "$APPS"); then
     [ -n "$fn" ] || continue
     B=$(flat "$(fnbody "$AP" "$fn")")
     case "$B" in
-      *'format!("/apps/{}",container_id)'*)
+      *'.Delete(ctx,"/apps/"+cid)'*)
         ADOORS=$((ADOORS+1))
         case "$B" in
-          *'expected_stops::clear('*) ACLEARS=$((ACLEARS+1)) ;;
+          *'ExpectedStopsClear('*) ACLEARS=$((ACLEARS+1)) ;;
           *) AMISSING="$AMISSING $fn" ;;
         esac
         ;;
@@ -699,14 +743,14 @@ if AP=$(subj "$APPS"); then
   # exists — the agent's removal response carries the freed domain, never the
   # name — and the row must not be cleared until the removal has succeeded, or a
   # refusal would un-suppress a container that is still deliberately stopped.
-  RB=$(fnbody "$AP" remove_app)
-  RES=$(grep -n 'resolve_container_name' <<< "$RB" | head -1 | cut -d: -f1)
-  DEL=$(grep -n '.delete(&agent_path)' <<< "$RB" | head -1 | cut -d: -f1)
-  CLR=$(grep -n 'expected_stops::clear(' <<< "$RB" | head -1 | cut -d: -f1)
+  RB=$(fnbody "$AP" rtDockerAppsRemoveApp)
+  RES=$(grep -n 'rtDockerAppsResolveContainerName(' <<< "$RB" | head -1 | cut -d: -f1)
+  DEL=$(grep -nF '.Delete(ctx, "/apps/"+cid)' <<< "$RB" | head -1 | cut -d: -f1)
+  CLR=$(grep -n 'ExpectedStopsClear(' <<< "$RB" | head -1 | cut -d: -f1)
   if [ -n "$RES" ] && [ -n "$DEL" ] && [ -n "$CLR" ] && [ "$RES" -lt "$DEL" ] && [ "$DEL" -lt "$CLR" ]; then
-    ok "J11 remove_app resolves BEFORE the removal and clears AFTER it (resolve $RES < delete $DEL < clear $CLR)"
+    ok "J11 rtDockerAppsRemoveApp resolves BEFORE the removal and clears AFTER it (resolve $RES < delete $DEL < clear $CLR)"
   else
-    bad "J11 remove_app resolves BEFORE the removal and clears AFTER it (resolve '$RES', delete '$DEL', clear '$CLR')"
+    bad "J11 rtDockerAppsRemoveApp resolves BEFORE the removal and clears AFTER it (resolve '$RES', delete '$DEL', clear '$CLR')"
   fi
 else
   for a in J9-control J10 J11; do bad "$a $APPS is readable"; done
@@ -726,96 +770,80 @@ echo "== §K  container_sleep_config survives the SAME recreate this file's own 
 # and no UI indication — the live bug tracked in tech_debt p4 since s238.
 
 if AP=$(subj "$APPS"); then
-  RK=$(fnbody "$AP" rekey_sleep_config)
+  RK=$(fnbody "$AP" rtDockerAppsRekeySleepConfig)
   RKF=$(flat "$RK")
 
   if [ -n "$RK" ]; then
-    ok "K0-control rekey_sleep_config extracted, $(wc -l <<< "$RK") lines"
+    ok "K0-control rtDockerAppsRekeySleepConfig extracted, $(wc -l <<< "$RK") lines"
   else
-    bad "K0-control could not extract rekey_sleep_config — every arm below is vacuous"
+    bad "K0-control could not extract rtDockerAppsRekeySleepConfig — every arm below is vacuous"
   fi
 
   # K1 — the UPDATE sets container_id from the NEW value and matches on the OLD
   # one, in that placeholder order ($1=new, $2=old). Checked as one flattened
-  # string so rustfmt reflowing the query across lines cannot retire this arm.
+  # string so reflowing the query across lines cannot retire this arm.
   if grep -qF 'UPDATEcontainer_sleep_configSETcontainer_id=$1WHEREcontainer_id=$2' <<< "$RKF"; then
-    ok "K1 rekey_sleep_config's UPDATE sets container_id from \$1 (new) and matches \$2 (old)"
+    ok "K1 rtDockerAppsRekeySleepConfig's UPDATE sets container_id from \$1 (new) and matches \$2 (old)"
   else
-    bad "K1 rekey_sleep_config's UPDATE does not match the expected SET \$1 / WHERE \$2 shape — re-read it, the bind order may have been swapped"
+    bad "K1 rtDockerAppsRekeySleepConfig's UPDATE does not match the expected SET \$1 / WHERE \$2 shape — re-read it, the bind order may have been swapped"
   fi
 
-  # K2 — the bind CALLS agree with K1's placeholder order: new_container_id
-  # bound first (-> $1), old_container_id bound second (-> $2). A swap here
-  # would compile, run, and silently re-key every row to the OLD id instead of
-  # the new one — the exact inverse of the fix.
-  if grep -qF '.bind(new_container_id).bind(old_container_id)' <<< "$RKF"; then
-    ok "K2 bind order is new_container_id then old_container_id, matching \$1/\$2"
+  # K2 — the bind ARGS agree with K1's placeholder order: newID first (-> $1),
+  # oldID second (-> $2), and the signature names them (oldID, newID) so the
+  # callers' (cid, newID) lands the right way round. A swap would compile, run,
+  # and silently re-key every row to the OLD id — the exact inverse of the fix.
+  if grep -qF 'container_id=$2",newID,oldID)' <<< "$RKF" \
+     && grep -qE '^func rtDockerAppsRekeySleepConfig\(ctx context\.Context, db \*pgxpool\.Pool, oldID, newID string\)' <<< "$AP"; then
+    ok "K2 bind order is newID then oldID, matching \$1/\$2, under an (oldID, newID) signature"
   else
-    bad "K2 bind order does not match .bind(new_container_id).bind(old_container_id) — \$1/\$2 would receive the wrong values even if K1 is green"
+    bad "K2 bind order / signature does not match execSQL(..., newID, oldID) under (oldID, newID) — \$1/\$2 would receive the wrong values even if K1 is green"
   fi
 
-  # K3 — every recreate call site actually invokes the re-key, reading the
-  # NEW id from the agent's own response rather than assuming one. Discovered
-  # by membership (which handlers call the three recreate agent routes), not
-  # by a fixed count — matching this file's own J-block methodology.
-  RECREATE_FNS="update_app update_image update_env"
-  CALLED=""
-  LIVE=""
-  for f in $RECREATE_FNS; do
+  # K3 — every recreate path actually invokes the re-key, reading the NEW id
+  # from the agent's own response rather than assuming one. Go: update_app does
+  # it inline; update_env/update_image do it via rtDockerAppsRecreate, so the
+  # helper must re-key AND each of those handlers must go through the helper.
+  #
+  # K4 — LIVENESS by absolute brace depth (fnbody skips the signature line, so a
+  # top-level statement is depth 0). Text presence cannot tell a real call from
+  # the identical text inside a dead branch; an extra wrapper shifts the depth.
+  # Baselines: update_app's re-key sits in `go func() {` → `} else {` (if at 2,
+  # call at 3); the helper's at top level (if at 0, call at 1); the two
+  # handlers call the helper at top level (0).
+  REKEY_IF='if newID, ok := jsonStr(jsonGet(result, "container_id")); ok {'
+  CALLED=""; LIVE=""
+  UB=$(fnbody "$AP" rtDockerAppsUpdateApp)
+  if grep -qF 'ifnewID,ok:=jsonStr(jsonGet(result,"container_id"));ok{rtDockerAppsRekeySleepConfig(ctx,db,cid,newID)}' <<< "$(flat "$UB")"; then
+    CALLED="$CALLED rtDockerAppsUpdateApp"
+    [ "$(depth_before "$UB" "$REKEY_IF")" = 2 ] && [ "$(depth_before "$UB" 'rtDockerAppsRekeySleepConfig(')" = 3 ] && LIVE="$LIVE rtDockerAppsUpdateApp"
+  fi
+  HB=$(fnbody "$AP" rtDockerAppsRecreate)
+  HELPER_OK=0
+  if grep -qF 'ifnewID,ok:=jsonStr(jsonGet(result,"container_id"));ok{rtDockerAppsRekeySleepConfig(ctx,st.DB,cid,newID)}' <<< "$(flat "$HB")"; then
+    HELPER_OK=1
+    [ "$(depth_before "$HB" "$REKEY_IF")" = 0 ] && [ "$(depth_before "$HB" 'rtDockerAppsRekeySleepConfig(')" = 1 ] && HELPER_OK=2
+  fi
+  for f in rtDockerAppsUpdateEnv rtDockerAppsUpdateImage; do
     b=$(fnbody "$AP" "$f")
-    bf=$(flat "$b")
-    if grep -qF 'rekey_sleep_config(' <<< "$bf" && grep -qF 'result.get("container_id")' <<< "$bf"; then
+    if [ "$HELPER_OK" -ge 1 ] && grep -qF 'result,err:=rtDockerAppsRecreate(ctx,st,agent,serverID,cid,' <<< "$(flat "$b")"; then
       CALLED="$CALLED $f"
-
-      # K4 (per-handler) — LIVENESS. Text presence (above) cannot tell a real
-      # call from the identical text sitting inside a dead branch — both
-      # contain the same text in the same relative order.
-      #
-      # ⚠ A first draft of this arm compared the call's depth against its OWN
-      # guarding if-let's depth (call == if-let + 1) — verified BY MUTATION to
-      # be insufficient: wrapping the if-let AND the call TOGETHER in an outer
-      # `if false { ... }` shifts both depths by the same +1, so the relative
-      # difference between them never changes and the mutation stays green.
-      # Fixed by anchoring the if-let itself against its own known-correct
-      # ABSOLUTE depth — a per-function baseline, since this file's fnbody()
-      # includes the (often multi-line) signature's own closing `{` in the
-      # extraction. Neither the if-let nor the call can be wrapped in
-      # anything extra now, and the call can't be pulled out of the if-let
-      # that guards it while the if-let itself stays put.
-      #
-      # s447: update_image/update_env moved from depth 1 to depth 2 (call:
-      # 2 to 3) — [[project_dockpanel_tech_debt_p185]] §A wrapped both
-      # bodies in `tokio::spawn(async move { ... })` so a dropped browser
-      # connection can no longer cancel the recreate mid-flight, adding one
-      # brace level to everything inside, this if-let included. update_app
-      # was already inside a tokio::spawn + match arm before that fix and is
-      # unchanged at depth 4/5.
-      case "$f" in
-        update_app)   BASE_DEPTH=4 ;;
-        update_image) BASE_DEPTH=2 ;;
-        update_env)   BASE_DEPTH=2 ;;
-      esac
-      D_IF=$(depth_before "$b" 'if let Some(new_id) = result.get("container_id")')
-      D_CALL=$(depth_before "$b" 'rekey_sleep_config(')
-      if [ "$D_IF" = "$BASE_DEPTH" ] && [ "$D_CALL" = "$((BASE_DEPTH + 1))" ]; then
-        LIVE="$LIVE $f"
-      fi
+      [ "$HELPER_OK" -eq 2 ] && [ "$(depth_before "$b" 'rtDockerAppsRecreate(')" = 0 ] && LIVE="$LIVE $f"
     fi
   done
   CALLED=$(echo $CALLED)
   N_CALLED=$(wc -w <<< "$CALLED")
   if [ "$N_CALLED" -eq 3 ]; then
-    ok "K3 all 3 recreate handlers (update_app, update_image, update_env) call rekey_sleep_config with the agent's returned container_id"
+    ok "K3 all 3 recreate handlers (update_app, update_image, update_env) re-key the sleep config with the agent's returned container_id"
   else
-    bad "K3 only $N_CALLED/3 recreate handlers call rekey_sleep_config (found:${CALLED:- none}) — a container recreated through the missing handler(s) still orphans its sleep config"
+    bad "K3 only $N_CALLED/3 recreate handlers re-key the sleep config (found:${CALLED:- none}; helper re-keys: $HELPER_OK) — a container recreated through the missing handler(s) still orphans its sleep config"
   fi
 
   LIVE=$(echo $LIVE)
   N_LIVE=$(wc -w <<< "$LIVE")
   if [ "$N_LIVE" -eq 3 ]; then
-    ok "K4 all 3 rekey_sleep_config calls sit exactly one brace deeper than the if-let that guards them — live, not wrapped in extra dead code"
+    ok "K4 all 3 re-key paths sit at their baseline brace depth — live, not wrapped in extra dead code"
   else
-    bad "K4 only $N_LIVE/3 rekey_sleep_config calls sit exactly one brace deeper than their guarding if-let (found:${LIVE:- none}) — one or more may be wrapped in an extra dead/conditional branch while text-only K3 still reports it present"
+    bad "K4 only $N_LIVE/3 re-key paths sit at their baseline brace depth (found:${LIVE:- none}) — one or more may be wrapped in an extra dead/conditional branch while text-only K3 still reports it present"
   fi
 else
   for a in K0-control K1 K2 K3 K4; do bad "$a $APPS is readable"; done
@@ -824,3 +852,4 @@ fi
 echo
 printf 'expected-stop: \033[32m%d passed\033[0m, \033[31m%d failed\033[0m\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
+

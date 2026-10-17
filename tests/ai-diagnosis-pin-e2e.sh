@@ -16,9 +16,9 @@
 #
 # Pure source analysis: no box, no network, no build, no LLM API calls. The
 # redaction regexes' actual matching behavior is covered by
-# `cargo test ai_diagnosis` (6 unit tests) in panel/backend/src/services/
-# ai_diagnosis.rs — this suite pins the WIRING around them, not the regexes
-# themselves.
+# `go test ./internal/api -run TestAiDiagnosis` (8 unit tests) in
+# panel/go/internal/api/svc_ai_diagnosis_test.go — this suite pins the WIRING
+# around them, not the regexes themselves.
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -27,16 +27,15 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-BE=panel/backend/src
+BE=panel/go/internal/api
 FE=panel/frontend/src
-SETTINGS_RS=$BE/routes/settings.rs
-AI_RS=$BE/services/ai_diagnosis.rs
-GIT_DEPLOYS_RS=$BE/routes/git_deploys.rs
-MOD_RS=$BE/routes/mod.rs
+SETTINGS_RS=$BE/rt_settings.go
+AI_RS=$BE/svc_ai_diagnosis.go
+GIT_DEPLOYS_RS=$BE/rt_git_deploys.go
 GIT_DEPLOYS_TSX=$FE/pages/GitDeploys.tsx
 SETTINGS_TSX=$FE/pages/Settings.tsx
 
-for f in "$SETTINGS_RS" "$AI_RS" "$GIT_DEPLOYS_RS" "$MOD_RS" "$GIT_DEPLOYS_TSX" "$SETTINGS_TSX"; do
+for f in "$SETTINGS_RS" "$AI_RS" "$GIT_DEPLOYS_RS" "$GIT_DEPLOYS_TSX" "$SETTINGS_TSX"; do
   [ -f "$f" ] || { echo "missing file: $f"; exit 1; }
 done
 
@@ -61,77 +60,81 @@ GD_FLAT=$(tr -d ' \t\n' < "$GIT_DEPLOYS_RS")
 # ── §1 — off by default, and configured the same way every other setting is ──
 echo "── §1 the four settings exist, writable, and the key is encrypted ──"
 for k in ai_diagnosis_enabled ai_diagnosis_provider ai_diagnosis_model ai_diagnosis_api_key; do
-  n=$(sed -n '/pub const ALLOWED_KEYS/,/^\];/p' "$SETTINGS_RS" | grep -cF "\"$k\"" || true)
-  if [ "$n" -gt 0 ]; then ok "$k is in ALLOWED_KEYS"; else bad "$k missing from ALLOWED_KEYS — not settable from the panel"; fi
+  n=$(sed -n '/^var rtSettingsAllowedKeys = \[\]string{/,/^}/p' "$SETTINGS_RS" | grep -cF "\"$k\"" || true)
+  if [ "$n" -gt 0 ]; then ok "$k is in rtSettingsAllowedKeys"; else bad "$k missing from rtSettingsAllowedKeys — not settable from the panel"; fi
 done
-must_contain "$SETTINGS_FLAT" 'pub(crate)constSENSITIVE_KEYS:&[&str]=&["smtp_password","pdns_api_key","ai_diagnosis_api_key"];' \
-  "ai_diagnosis_api_key is encrypted at rest via the same SENSITIVE_KEYS list as pdns_api_key"
+must_contain "$SETTINGS_FLAT" 'varrtSettingsSensitiveKeys=[]string{"smtp_password","pdns_api_key","ai_diagnosis_api_key"}' \
+  "ai_diagnosis_api_key is encrypted at rest via the same rtSettingsSensitiveKeys list as pdns_api_key"
 
 # A regression this suite exists to catch: `list()` used to hardcode five
 # exact key-name comparisons for GET-response masking, independently of
 # SENSITIVE_KEYS. A key added to SENSITIVE_KEYS alone would then round-trip
 # as raw ciphertext instead of "********" — and a future save could resubmit
 # that ciphertext as if it were a real key, corrupting the stored credential.
-must_contain "$SETTINGS_FLAT" 'fnis_sensitive_key(key:&str)->bool{SENSITIVE_KEYS.contains(&key)||key.ends_with("_client_secret")}' \
-  "list()/update()/import_config() share one is_sensitive_key predicate, not a hand-copied mask list"
-n_hardcoded=$(grep -cE 'r\.key == "smtp_password" \|\| r\.key == "pdns_api_key"' "$SETTINGS_RS" || true)
-if [ "$n_hardcoded" -eq 0 ]; then
+must_contain "$SETTINGS_FLAT" 'funcrtSettingsIsSensitiveKey(keystring)bool{returnslices.Contains(rtSettingsSensitiveKeys,key)||strings.HasSuffix(key,"_client_secret")}' \
+  "list()/update()/import_config() share one rtSettingsIsSensitiveKey predicate, not a hand-copied mask list"
+n_hardcoded=$(grep -cE '\.Key == "smtp_password" \|\| [a-z]+\.Key == "pdns_api_key"' "$SETTINGS_RS" || true)
+n_shared=$(grep -cE 'rtSettingsIsSensitiveKey\(row\.Key\)' "$SETTINGS_RS" || true)
+if [ "$n_hardcoded" -eq 0 ] && [ "$n_shared" -ge 1 ]; then
   ok "the old 5-name hardcoded mask list in list() is gone"
 else
   bad "list() still hand-lists sensitive key names — a key added to SENSITIVE_KEYS alone will leak ciphertext on GET"
 fi
 
-REENCRYPT_RS=$BE/services/credential_reencrypt.rs
+REENCRYPT_RS=$BE/svc_credential_reencrypt.go
 must_contain "$(tr -d ' \t\n' < "$REENCRYPT_RS")" "'ai_diagnosis_api_key'" \
-  "SENSITIVE_SETTINGS_SQL (credential_reencrypt.rs) covers ai_diagnosis_api_key, so a re-key sweep rotates it too"
+  "the sensitive-settings SQL (svc_credential_reencrypt.go) covers ai_diagnosis_api_key, so a re-key sweep rotates it too"
 
 # ── §2 — the feature is gated off, and the gate is checked before any network call ──
 echo "── §2 default-off gate is load-bearing ──"
-must_contain "$AI_FLAT" 'if get("ai_diagnosis_enabled")!="true"{returnOk(None);}' \
-  "load_config refuses to return a usable config unless ai_diagnosis_enabled == \"true\""
-must_contain "$AI_FLAT" 'ifprovider.is_empty()||model.is_empty()||api_key_enc.is_empty(){returnOk(None);}' \
-  "load_config also refuses when provider/model/key are incomplete, not just when disabled"
-must_contain "$GD_FLAT" 'let config=crate::services::ai_diagnosis::load_config(&state.db,&state.config.jwt_secret).await?.ok_or_else(||{err(StatusCode::BAD_REQUEST,"AIdiagnosisisnotconfigured.SetaproviderandAPIkeyinSettings→Services.",)})?;' \
-  "explain_history refuses with a clear message when AI diagnosis is not configured, rather than calling a provider with an empty key"
+must_contain "$AI_FLAT" 'ifget("ai_diagnosis_enabled")!="true"{returnnil,nil}' \
+  "AiDiagnosisLoadConfig refuses to return a usable config unless ai_diagnosis_enabled == \"true\""
+must_contain "$AI_FLAT" 'ifprovider==""||model==""||apiKeyEnc==""{returnnil,nil}' \
+  "AiDiagnosisLoadConfig also refuses when provider/model/key are incomplete, not just when disabled"
+must_contain "$GD_FLAT" 'config,err:=AiDiagnosisLoadConfig(ctx,st.DB,st.Config.JWTSecret)iferr!=nil{returnerr}ifconfig==nil{returnapiErr(http.StatusBadRequest,"AIdiagnosisisnotconfigured.SetaproviderandAPIkeyinSettings→Services.")}' \
+  "rtGitDeploysExplainHistory refuses with a clear message when AI diagnosis is not configured, rather than calling a provider with an empty key"
 
 # ── §3 — manual trigger only: exactly one call site, exactly one route ──
 echo "── §3 nothing calls the LLM except the one operator-triggered endpoint ──"
-call_sites=$(grep -rho 'ai_diagnosis::explain_failure(' --include=*.rs "$BE" | wc -l | tr -d ' ')
-if [ "$call_sites" -eq 1 ]; then
-  ok "ai_diagnosis::explain_failure has exactly 1 call site (no auto-trigger path)"
+# Non-test Go files only; the definition line (`func AiDiagnosisExplainFailure(`)
+# is not a call site.
+call_sites=$(grep -rhE 'AiDiagnosisExplainFailure\(' --include=*.go --exclude=*_test.go panel/go | grep -vE '^func AiDiagnosisExplainFailure\(' | grep -oE 'AiDiagnosisExplainFailure\(' | wc -l | tr -d ' ')
+def_sites=$(grep -c '^func AiDiagnosisExplainFailure(' "$AI_RS" || true)
+if [ "$call_sites" -eq 1 ] && [ "$def_sites" -eq 1 ]; then
+  ok "AiDiagnosisExplainFailure has exactly 1 call site (no auto-trigger path)"
 else
-  bad "ai_diagnosis::explain_failure has $call_sites call sites — expected exactly 1 (a new site may be an auto-trigger, spending the operator's credits without a click)"
+  bad "AiDiagnosisExplainFailure has $call_sites call sites (definition found: $def_sites) — expected exactly 1 (a new site may be an auto-trigger, spending the operator's credits without a click)"
 fi
-route_sites=$(grep -c '/history/{history_id}/explain' "$MOD_RS" || true)
+route_sites=$(grep -rhE 'r\.Handle\("[A-Z]+ [^"]*/history/\{history_id\}/explain"' --include=*.go --exclude=*_test.go "$BE" | wc -l | tr -d ' ')
 if [ "$route_sites" -eq 1 ]; then
   ok "the explain route is registered exactly once"
 else
   bad "expected exactly 1 registration of the explain route, found $route_sites"
 fi
-must_contain "$GD_FLAT" 'require_admin(&claims.role)?;letdeploy:(Uuid,String)=sqlx::query_as("SELECTid,nameFROMgit_deploysWHEREid=$1ANDuser_id=$2",)' \
-  "explain_history requires admin and scopes the git_deploy lookup to the caller's own user_id"
-must_contain "$GD_FLAT" 'ifentry.status!="failed"{returnErr(err(StatusCode::BAD_REQUEST,"Onlyfaileddeployscanbeexplained",));}' \
-  "explain_history refuses to run on anything but a failed deploy"
+must_contain "$GD_FLAT" 'iferr:=requireAdmin(claims.Role);err!=nil{returnerr}deploy,err:=queryOpt[Tup2[uuid.UUID,string]](ctx,st.DB,"SELECTid,nameFROMgit_deploysWHEREid=$1ANDuser_id=$2",id,claims.Sub)' \
+  "rtGitDeploysExplainHistory requires admin and scopes the git_deploy lookup to the caller's own user_id"
+must_contain "$GD_FLAT" 'ifentry.Status!="failed"{returnapiErr(http.StatusBadRequest,"Onlyfaileddeployscanbeexplained")}' \
+  "rtGitDeploysExplainHistory refuses to run on anything but a failed deploy"
 
 # ── §4 — redaction runs unconditionally, before truncation, before the network call ──
 echo "── §4 redaction is unconditional, not a setting ──"
-must_contain "$AI_FLAT" 'fnbuild_prompt(ctx:&FailureContext)->String{letredacted=redact(&ctx.output);' \
-  "build_prompt redacts ctx.output before anything else touches it"
+must_contain "$AI_FLAT" 'funcaiDiagnosisBuildPrompt(c*AiDiagnosisFailureContext)string{redacted:=aiDiagnosisRedact(c.Output)' \
+  "aiDiagnosisBuildPrompt redacts c.Output before anything else touches it"
 # No setting can disable it: redact() must not consult the settings table at all.
-if grep -q 'fn redact(' "$AI_RS"; then
-  REDACT_BODY=$(awk '/^fn redact\(/,/^}/' "$AI_RS")
+if grep -q '^func aiDiagnosisRedact(text string) string {' "$AI_RS"; then
+  REDACT_BODY=$(awk '/^func aiDiagnosisRedact\(/,/^}/' "$AI_RS")
   case "$REDACT_BODY" in
-    *settings*) bad "redact() references settings — check whether redaction can be disabled" ;;
-    *) ok "redact() takes no settings input — there is no switch that can turn it off" ;;
+    *settings*|*db*|*ctx*) bad "aiDiagnosisRedact() references settings/db/ctx — check whether redaction can be disabled" ;;
+    *ReplaceAll*) ok "aiDiagnosisRedact() takes no settings input — there is no switch that can turn it off" ;;
+    *) bad "aiDiagnosisRedact() body extracted but applies no pattern — the extractor broke" ;;
   esac
 else
-  bad "redact() function not found in $AI_RS"
+  bad "aiDiagnosisRedact() function not found in $AI_RS"
 fi
-for pattern_name in "PASSWORD|SECRET|TOKEN" "Bearer" "PRIVATE KEY"; do
-  n=$(grep -c "$pattern_name" "$AI_RS" || true)
-  if [ "$n" -gt 0 ]; then ok "redaction covers the \"$pattern_name\" shape"; else bad "redaction pattern for \"$pattern_name\" is missing"; fi
-done
-must_contain "$AI_FLAT" 'constMAX_OUTPUT_CHARS:usize=8000;' "output is truncated to a bounded size before it reaches any provider"
+# redaction "PASSWORD|SECRET|TOKEN" shape retired: covered by TestAiDiagnosisRedactsEnvStyleSecrets (panel/go/internal/api/svc_ai_diagnosis_test.go)
+# redaction "Bearer" shape retired: covered by TestAiDiagnosisRedactsBearerTokens (panel/go/internal/api/svc_ai_diagnosis_test.go)
+# redaction "PRIVATE KEY" shape retired: covered by TestAiDiagnosisRedactsPrivateKeyBlocks (panel/go/internal/api/svc_ai_diagnosis_test.go)
+must_contain "$AI_FLAT" 'constaiDiagnosisMaxOutputChars=8000' "output is truncated to a bounded size before it reaches any provider"
 
 # ── §5 — the frontend button only appears on a failed entry, and never auto-fires ──
 echo "── §5 frontend: manual button, gated on failed status ──"

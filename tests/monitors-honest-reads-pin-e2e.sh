@@ -4,13 +4,13 @@
 # Pins two properties of the monitoring routes, both of which had failed in the
 # same direction: the reassuring answer.
 #
-#   §A  the four reads in `monitors.rs` REPORT a failed query instead of
+#   §A  the four reads in `rt_monitors.go` REPORT a failed query instead of
 #       answering it with an empty list. All four discarded the error, so a
 #       failure rendered as an emptiness the operator cannot tell from a real
 #       one: "No SSL certificates found" on the certificate page, a public
 #       status page with no monitors on it, an empty response chart, and — the
 #       consequential one — a maintenance list showing no windows while
-#       `uptime.rs` was still skipping every monitor a live window covers.
+#       `svc_uptime.go` was still skipping every monitor a live window covers.
 #   §B  the certificate ladder can say RENEWAL FAILED. Every rung was a
 #       function of the clock, so a certificate whose renewal is failing read
 #       `ok` until its last month. v2.157.0 made `ssl_renewal_failure` resolve
@@ -22,6 +22,8 @@
 #       classification is free to drift from the first. Scoped to firing rows
 #       only, because `resolve_alert` clears only firing rows and an
 #       acknowledged alert would pin the rung on for ever.
+#       (Ported to Go: the api is panel/go/internal/api; §B's ladder ORDER is
+#       now a unit test, TestPinMonitorsHonestReadsLadder.)
 #   §D  every ladder call site passes the new argument, including the host-scan
 #       half that must pass `false` — those certificates have no site row, so
 #       nothing can raise a renewal alert against them.
@@ -48,8 +50,8 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-MON=panel/backend/src/routes/monitors.rs
-NOTIF=panel/backend/src/services/notifications.rs
+MON=panel/go/internal/api/rt_monitors.go
+NOTIF=panel/go/internal/api/svc_notifications.go
 CERTS=panel/frontend/src/pages/Certificates.tsx
 
 for f in "$MON" "$NOTIF" "$CERTS"; do
@@ -59,30 +61,33 @@ done
 # Comments out, CODE INTACT. The naive block-comment strip deletes real code
 # because the opener occurs inside string literals, and a truncated subject
 # makes an ABSENCE arm pass on code the stripper merely removed.
+# Go adds trailing `// ...` comments; those are stripped only when nothing
+# after the `//` could close a string, so a "https://" literal survives.
 code() {
   perl -0777 -pe '
     s{\{/\*.*?\*/\}}{}gs;
     s{^[ \t]*/\*.*?\*/[ \t]*$}{}gms;
     s{^\s*//.*$}{}gm;
+    s{[ \t]+//[^"`\n]*$}{}gm;
   ' "$1"
 }
 
 subj() { local t; t=$(code "$1"); [ -n "$t" ] || return 1; printf '%s' "$t"; }
 
-# The body of one top-level fn, bounded by the NEXT top-level fn. A fixed
-# `grep -A n` window is not a function.
+# The body of one top-level Go func, bounded by its closing `}` at column 0
+# (gofmt guarantees it). A fixed `grep -A n` window is not a function.
 fnbody() {
   awk -v name="$2" '
-    /^[[:space:]]*(pub )?(pub\(crate\) )?(async )?fn / {
-      if ($0 ~ "(pub |pub\\(crate\\) )?(async )?fn " name "\\(") { inside=1; next }
-      inside=0
+    /^func / {
+      if (index($0, "func " name "(") == 1 || $0 ~ ("^func \\([^)]*\\) " name "\\(")) { inside=1; next }
     }
+    inside && /^}/ { inside=0 }
     inside { print }
   ' <<< "$1"
 }
 
 # Every call to $2 in text $1, one per line, arguments PAREN-BALANCED and
-# whitespace-flattened. Immune to rustfmt reflowing a call across lines.
+# whitespace-flattened. Immune to gofmt reflowing a call across lines.
 calls() {
   perl -0777 -ne '
     while (/\b\Q'"$2"'\E\s*(\((?:[^()]++|(?1))*\))/gs) {
@@ -91,8 +96,8 @@ calls() {
   ' <<< "$1"
 }
 
-M=$(subj "$MON") || { bad "monitors.rs stripped to nothing"; M=""; }
-N=$(subj "$NOTIF") || { bad "notifications.rs stripped to nothing"; N=""; }
+M=$(subj "$MON") || { bad "rt_monitors.go stripped to nothing"; M=""; }
+N=$(subj "$NOTIF") || { bad "svc_notifications.go stripped to nothing"; N=""; }
 C=$(subj "$CERTS") || { bad "Certificates.tsx stripped to nothing"; C=""; }
 
 echo "== §A  a failed read is reported, not answered with an empty list =="
@@ -104,18 +109,18 @@ echo "== §A  a failed read is reported, not answered with an empty list =="
 # visible rather than merely ticked.
 A_LINES=$(wc -l <<< "$M")
 if [ "$A_LINES" -ge 600 ]; then
-  ok "A-control monitors.rs stripped subject is $A_LINES lines"
+  ok "A-control rt_monitors.go stripped subject is $A_LINES lines"
 else
-  bad "A-control monitors.rs stripped subject is only $A_LINES lines — subject lost"
+  bad "A-control rt_monitors.go stripped subject is only $A_LINES lines — subject lost"
 fi
 
 # The four reads, and the distinct context each one reports under. A shared
 # context string would make one arm satisfiable by another's site.
 for pair in \
-  "response_chart:response chart points" \
-  "status_page:status page monitors" \
-  "certificate_dashboard:certificate list" \
-  "list_maintenance:maintenance windows"
+  "rtMonitorsResponseChart:response chart points" \
+  "rtMonitorsStatusPage:status page monitors" \
+  "rtMonitorsCertificateDashboard:certificate list" \
+  "rtMonitorsListMaintenance:maintenance windows"
 do
   fn=${pair%%:*}; ctx=${pair#*:}
   B=$(fnbody "$M" "$fn")
@@ -126,7 +131,7 @@ do
   fi
   # POSITIVE: the body reaches a fallible read AND maps its error under its own
   # name. Not "does not swallow" — that it REPORTS.
-  if grep -qF 'fetch_all' <<< "$B" && grep -qF "internal_error(\"$ctx\"" <<< "$B"; then
+  if grep -qF 'queryAll[' <<< "$B" && grep -qF "internalError(\"$ctx\"" <<< "$B"; then
     ok "A1 $fn reports a failed read as \"$ctx\" ($BL-line body)"
   else
     bad "A1 $fn reports a failed read as \"$ctx\" ($BL-line body)"
@@ -135,96 +140,53 @@ done
 
 # REFUSAL, whole-file: the swallow is gone from every read in the file, not just
 # the four above. Whole-file is the strongest form of this one — the literal
-# must appear nowhere.
-if grep -qF 'unwrap_or_default' <<< "$M"; then
-  bad "A2 no read in monitors.rs discards its error"
+# must appear nowhere. Go's two shapes of Rust's `.unwrap_or_default()` on a
+# list read: the error blanked (`x, _ := queryAll[...]`), or caught and
+# answered with an empty value (`if err != nil { x = []T{} }` / `= nil`).
+if perl -0777 -ne 'exit(/_\s*:?=\s*queryAll\[/ || /err != nil \{\s*\w+ = (?:\[\][\w.\[\], ]*\{\}|nil)\s*\}/ ? 0 : 1)' <<< "$M"; then
+  bad "A2 no list read in rt_monitors.go discards its error"
 else
-  ok "A2 no read in monitors.rs discards its error"
+  ok "A2 no list read in rt_monitors.go discards its error"
 fi
 
 # CONTROL for A2: an absence arm needs a positive control, or it cannot tell
 # "the swallow is gone" from "the reads are gone".
-A_READS=$(grep -c 'fetch_all\|fetch_optional\|fetch_one' <<< "$M")
+A_READS=$(grep -cE 'query(All|Opt|One|Scalar|ScalarOpt)\[' <<< "$M")
 if [ "$A_READS" -ge 10 ]; then
-  ok "A2-control monitors.rs still performs $A_READS reads"
+  ok "A2-control rt_monitors.go still performs $A_READS reads"
 else
-  bad "A2-control monitors.rs performs only $A_READS reads — A2 may be vacuous"
+  bad "A2-control rt_monitors.go performs only $A_READS reads — A2 may be vacuous"
 fi
 
 echo "== §B  the ladder can say the renewal is failing =="
 
-L=$(fnbody "$M" "expiry_status")
-LL=$(wc -l <<< "$L")
-if [ "$LL" -ge 6 ] && [ "$LL" -le 40 ]; then
-  ok "B-control expiry_status body is $LL lines"
+# B-control retired: covered by TestPinMonitorsHonestReadsLadder (panel/go/internal/api/pin_monitors_honest_reads_test.go)
+# B1 retired: covered by TestPinMonitorsHonestReadsLadder (panel/go/internal/api/pin_monitors_honest_reads_test.go) — it calls rtMonitorsExpiryStatus(*int64, bool), so a ladder without the renewal argument does not compile
+# B2 retired: covered by TestPinMonitorsHonestReadsLadder (panel/go/internal/api/pin_monitors_honest_reads_test.go)
+# B3 retired: covered by TestPinMonitorsHonestReadsLadder (panel/go/internal/api/pin_monitors_honest_reads_test.go) — (-1, true) must be "expired"
+# B4 retired: covered by TestPinMonitorsHonestReadsLadder (panel/go/internal/api/pin_monitors_honest_reads_test.go) — renewal_failed at nil/3/20/300 days
+# B5 retired: covered by TestPinMonitorsHonestReadsLadder (panel/go/internal/api/pin_monitors_honest_reads_test.go) — all five clock rungs with the flag false
+if (cd panel/go && go test ./internal/api/ -run '^TestPinMonitorsHonestReadsLadder$' -count=1 >/dev/null 2>&1); then
+  ok "B-test TestPinMonitorsHonestReadsLadder passes (ladder order + all six rungs)"
 else
-  bad "B-control expiry_status body is $LL lines — expected a small match block"
-fi
-
-# POSITIVE: the ladder takes the second axis at all.
-if grep -qE 'fn expiry_status\(days_left: Option<i64>, renewal_failing: bool\)' <<< "$M"; then
-  ok "B1 the ladder takes a renewal-failure argument"
-else
-  bad "B1 the ladder takes a renewal-failure argument"
-fi
-
-# POSITIVE: it produces the rung.
-if grep -qF '"renewal_failed"' <<< "$L"; then
-  ok "B2 the ladder yields a renewal_failed rung"
-else
-  bad "B2 the ladder yields a renewal_failed rung"
-fi
-
-# ORDER, and it is the whole design. `expired` is decided BEFORE the flag is
-# consulted (the outage already happened and no longer turns on the renewal),
-# and the flag is consulted BEFORE the clock rungs (they say when it dies; this
-# says nothing is coming to save it). Offsets inside the body, on stripped code.
-P_EXPIRED=$(grep -n '"expired"' <<< "$L" | head -1 | cut -d: -f1)
-P_FLAG=$(grep -n 'renewal_failing' <<< "$L" | head -1 | cut -d: -f1)
-P_UNKNOWN=$(grep -n '"unknown"' <<< "$L" | head -1 | cut -d: -f1)
-P_CRIT=$(grep -n '"critical"' <<< "$L" | head -1 | cut -d: -f1)
-if [ -n "$P_EXPIRED" ] && [ -n "$P_FLAG" ] && [ -n "$P_UNKNOWN" ] && [ -n "$P_CRIT" ]; then
-  if [ "$P_EXPIRED" -lt "$P_FLAG" ]; then
-    ok "B3 expired outranks the renewal rung (line $P_EXPIRED before $P_FLAG)"
-  else
-    bad "B3 expired outranks the renewal rung (line $P_EXPIRED before $P_FLAG)"
-  fi
-  if [ "$P_FLAG" -lt "$P_UNKNOWN" ] && [ "$P_FLAG" -lt "$P_CRIT" ]; then
-    ok "B4 the renewal rung outranks unknown and the clock rungs"
-  else
-    bad "B4 the renewal rung outranks unknown and the clock rungs"
-  fi
-else
-  bad "B3/B4 could not locate all four rungs in the ladder body — refusing to compare"
-fi
-
-# POSITIVE, and the compatibility property: the four clock rungs all survive, so
-# a caller passing `false` gets exactly the ladder that shipped before.
-MISSING=""
-for rung in '"unknown"' '"expired"' '"critical"' '"warning"' '"ok"'; do
-  grep -qF "$rung" <<< "$L" || MISSING="$MISSING $rung"
-done
-if [ -z "$MISSING" ]; then
-  ok "B5 all five original rungs survive beside the new one"
-else
-  bad "B5 rungs lost from the ladder:$MISSING"
+  bad "B-test TestPinMonitorsHonestReadsLadder fails or did not build"
 fi
 
 echo "== §C  where the rung's truth comes from =="
 
-H=$(fnbody "$M" "renewal_failing_sites")
+H=$(fnbody "$M" "rtMonitorsRenewalFailingSites")
 HL=$(wc -l <<< "$H")
 if [ "$HL" -ge 15 ]; then
-  ok "C-control renewal_failing_sites body is $HL lines"
+  ok "C-control rtMonitorsRenewalFailingSites body is $HL lines"
 else
-  bad "C-control renewal_failing_sites body is $HL lines — subject lost"
+  bad "C-control rtMonitorsRenewalFailingSites body is $HL lines — subject lost"
 fi
 
 # POSITIVE: the key set is DERIVED from the shared list through the shared
 # predicate. This is the arm that matters — a re-listed literal set here would
 # be a second classification of the same six keys, free to drift from the one in
-# notifications.rs the moment a key is added.
-if grep -qF 'ssl_renewal_key::ALL' <<< "$H" && grep -qF 'renewal_success_clears' <<< "$H"; then
+# svc_notifications.go the moment a key is added.
+if grep -qF 'range NotificationsSslRenewalKeyAll' <<< "$H" && grep -qF 'NotificationsRenewalSuccessClears(' <<< "$H"; then
   ok "C1 the keys are filtered from the shared list by the shared predicate"
 else
   bad "C1 the keys are filtered from the shared list by the shared predicate"
@@ -236,25 +198,25 @@ fi
 # fewer names — rendering any of them as a failure reports one the panel did not
 # have. Naming any key here at all is the drift C1 exists to prevent.
 STANDING=""
-for k in 'DECLINED' 'MAIL_HOST_CONFLICT' 'DNS01_DOWNGRADED' 'dns01_downgraded' 'mail_host_conflict'; do
+for k in 'SslRenewalKeyDeclined' 'SslRenewalKeyMailHostConflict' 'SslRenewalKeyDns01Downgraded' '"declined"' '"dns01_downgraded"' '"mail_host_conflict"'; do
   grep -qF "$k" <<< "$M" && STANDING="$STANDING $k"
 done
 if [ -z "$STANDING" ]; then
-  ok "C2 monitors.rs re-lists no renewal key of its own"
+  ok "C2 rt_monitors.go re-lists no renewal key of its own"
 else
-  bad "C2 monitors.rs names renewal keys directly:$STANDING"
+  bad "C2 rt_monitors.go names renewal keys directly:$STANDING"
 fi
 
 # CONTROL for C2: the shared list really does carry those keys, so C2 is an
 # assertion about THIS file rather than about a vocabulary that no longer exists.
-K_ALL=$(grep -c 'DECLINED\|MAIL_HOST_CONFLICT\|DNS01_DOWNGRADED' <<< "$N")
+K_ALL=$(grep -cE 'SslRenewalKey(Declined|MailHostConflict|Dns01Downgraded)\b' <<< "$N")
 if [ "$K_ALL" -ge 3 ]; then
-  ok "C2-control notifications.rs carries the standing keys on $K_ALL lines"
+  ok "C2-control svc_notifications.go carries the standing keys on $K_ALL lines"
 else
-  bad "C2-control notifications.rs carries the standing keys on $K_ALL lines"
+  bad "C2-control svc_notifications.go carries the standing keys on $K_ALL lines"
 fi
 
-# POSITIVE: firing rows only, and by site. `resolve_alert` clears only firing
+# POSITIVE: firing rows only, and by site. `ResolveAlert` clears only firing
 # rows, so an acknowledged alert is never resolved by a later success — reading
 # it here would pin the rung on permanently for anyone who acknowledged before
 # fixing the cause.
@@ -272,7 +234,7 @@ fi
 # POSITIVE: the helper's failure is reported like every other read in §A. A
 # lookup that answers "not failing" when it could not read is the same defect
 # this whole ship is about, one layer in.
-if grep -qF 'internal_error("renewal failure lookup"' <<< "$H"; then
+if grep -qF 'internalError("renewal failure lookup"' <<< "$H"; then
   ok "C5 a failed lookup is reported, not read as \"not failing\""
 else
   bad "C5 a failed lookup is reported, not read as \"not failing\""
@@ -282,13 +244,15 @@ fi
 # every one of them still true when this lookup returns an empty set on every
 # path — keys still filtered, rows still firing-scoped, failure still reported —
 # while the rung becomes unreachable for every certificate in the product.
-# Asserted on the body's LAST expression, so returning an empty set goes red
-# however carefully the query above it is preserved.
-H_LAST=$(grep -v '^[[:space:]]*$' <<< "$H" | tail -2 | head -1)
-if grep -qF 'rows' <<< "$H_LAST"; then
-  ok "C6 the returned set is built from the rows the query read — \"$(sed 's/^ *//' <<< "$H_LAST")\""
+# Asserted on the body's TAIL: the loop that fills `out` from the query's rows
+# must be immediately followed by the final `return out, nil`, so returning an
+# empty (or freshly reset) set goes red however carefully the query above it
+# is preserved.
+H_LAST=$(grep -v '^[[:space:]]*$' <<< "$H" | tail -1)
+if perl -0777 -ne 'exit(/for _, (\w+) := range rows \{\s*out\[\1\] = true\s*\}\s*return out, nil\s*\z/ ? 0 : 1)' <<< "$H"; then
+  ok "C6 the returned set is built from the rows the query read — \"$(sed 's/^[[:space:]]*//' <<< "$H_LAST")\""
 else
-  bad "C6 the returned set is built from the rows the query read — got \"$(sed 's/^ *//' <<< "$H_LAST")\""
+  bad "C6 the returned set is built from the rows the query read — got \"$(sed 's/^[[:space:]]*//' <<< "$H_LAST")\""
 fi
 
 echo "== §D  every ladder call site passes the second axis =="
@@ -299,7 +263,7 @@ echo "== §D  every ladder call site passes the second axis =="
 # ⚠ The first cut of this section matched on the function NAME and asserted a
 # count of 3; it reported 4 and made D1 and D3 match nothing at all — two
 # vacuous arms hiding behind a control whose number said so.
-SITES=$(calls "$M" "expiry_status" | grep -vF 'Option<i64>')
+SITES=$(calls "$M" "rtMonitorsExpiryStatus" | grep -vF '*int64')
 N_SITES=$(grep -c . <<< "$SITES")
 # ⛔ READ THIS NUMBER. Five call sites: the per-caller list's own sites, the
 # admin list's sites, the host-scan half, the OFFLINE half (since v2.162.0,
@@ -317,15 +281,15 @@ fi
 # one-argument call, so this arm's real job is to stay honest about the SHAPE
 # the other §D arms match against — it goes red if `calls` ever stops resolving
 # argument lists and starts printing something else.
-ONE_ARG=$(grep -cx '(days_left)' <<< "$SITES")
+ONE_ARG=$(grep -cx '(days)' <<< "$SITES")
 if [ "$ONE_ARG" -eq 0 ]; then
   ok "D1 no call site passes the clock alone"
 else
   bad "D1 $ONE_ARG call site(s) pass the clock alone"
 fi
 
-# POSITIVE: two of the four consult the SITE lookup (`failing`), by site id.
-N_LOOKUP=$(grep -cx '(days_left, failing.contains(id))' <<< "$SITES")
+# POSITIVE: two of the five consult the SITE lookup (`failing`), by site id.
+N_LOOKUP=$(grep -cx '(days, failing\[c\.A\])' <<< "$SITES")
 if [ "$N_LOOKUP" -eq 2 ]; then
   ok "D2 both site-backed lists consult the lookup ($N_LOOKUP sites)"
 else
@@ -346,11 +310,11 @@ fi
 # — this endpoint has no server scope of its own) — same lookup pattern, same
 # key function, so the same substring still matches all three. This arm
 # asserts the SUBSTRING rather than `grep -cx` on the whole call: an exact
-# match on a long, wrapped call is a hostage to how rustfmt happens to break
+# match on a long, wrapped call is a hostage to how gofmt happens to break
 # it, and `calls()` already normalises internal whitespace to prove that
 # fragility isn't needed to tell a real lookup from a bare `false`.
-N_STACK_LOOKUP=$(grep -c 'failing_stacks\.contains( *&crate::services::security_scanner::stack_renewal_state_key(domain)' <<< "$SITES")
-N_FALSE=$(grep -cx '(days_left, false)' <<< "$SITES")
+N_STACK_LOOKUP=$(grep -c 'failingStacks\[SecurityScannerStackRenewalStateKey(' <<< "$SITES")
+N_FALSE=$(grep -cx '(days, false)' <<< "$SITES")
 if [ "$N_STACK_LOOKUP" -eq 3 ] && [ "$N_FALSE" -eq 0 ]; then
   ok "D3 all three stack-facing lists consult a real lookup — none still hardcodes false ($N_STACK_LOOKUP sites)"
 else
@@ -359,7 +323,7 @@ fi
 # The offline half's OWN arm. `stale` is the one thing that row carries and no
 # other row does, and it is the honest half of the bargain: a row assembled from
 # the panel's stored date must never be mistaken for a live read of the box.
-if [ "$(printf '%s' "$M" | /usr/bin/grep -oF '"stale": true,' | wc -l | tr -d ' ')" -eq 1 ]; then
+if [ "$(grep -cE '"stale": +true,' <<< "$M")" -eq 1 ]; then
   ok "D3b the offline half marks its rows as the panel's record, not a live read"
 else
   bad "D3b the offline half does not mark its rows stale — an operator cannot tell a stored date from a fresh one"
@@ -368,7 +332,7 @@ fi
 # POSITIVE: the two site-backed lists actually CALL the lookup, so D2's value
 # came from the query rather than from a literal. One declaration plus two
 # calls; the declaration is again the occurrence carrying the type annotation.
-LOOKUPS=$(calls "$M" "renewal_failing_sites" | grep -vF '&[Uuid]')
+LOOKUPS=$(calls "$M" "rtMonitorsRenewalFailingSites" | grep -vF '[]uuid.UUID')
 N_CALLS=$(grep -c . <<< "$LOOKUPS")
 if [ "$N_CALLS" -eq 2 ]; then
   ok "D4 both lists call the lookup ($N_CALLS call sites)"
@@ -381,7 +345,7 @@ fi
 # caller — `certificate_dashboard_for_admin` has its own inline, server-scoped
 # lookup instead, by design, since it has a server to scope by and this
 # function does not).
-STACK_LOOKUPS=$(calls "$M" "renewal_failing_stacks_for_user" | grep -vF '&[String]')
+STACK_LOOKUPS=$(calls "$M" "rtMonitorsRenewalFailingStacksForUser" | grep -vF '[]string')
 N_STACK_CALLS=$(grep -c . <<< "$STACK_LOOKUPS")
 if [ "$N_STACK_CALLS" -eq 1 ]; then
   ok "D5 the user-scoped stack lookup is declared once and called once ($N_STACK_CALLS call site)"
