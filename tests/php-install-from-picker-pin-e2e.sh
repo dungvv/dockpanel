@@ -49,12 +49,14 @@ bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 PICKER=panel/frontend/src/components/PhpVersionPicker.tsx
 SITES_TSX=panel/frontend/src/pages/Sites.tsx
 DETAIL_TSX=panel/frontend/src/pages/SiteDetail.tsx
-SITES_RS=panel/backend/src/routes/sites.rs
-SYSTEM_RS=panel/backend/src/routes/system.rs
-PHP_RS=panel/agent/src/routes/php.rs
-NGINX_RS=panel/agent/src/routes/nginx.rs
-PKG_RS=panel/agent/src/services/pkg.rs
-MOD_RS=panel/backend/src/routes/mod.rs
+# Go port: the *_RS names are kept for history; they point at the Go sources.
+# Rust routes/mod.rs's route table lives in each rt_*.go (rtSitesRegister).
+SITES_RS=panel/go/internal/api/rt_sites.go
+SYSTEM_RS=panel/go/internal/api/rt_system.go
+PHP_RS=panel/go/internal/agent/routes/php.go
+NGINX_RS=panel/go/internal/agent/routes/nginx.go
+PKG_RS=panel/go/internal/agent/services/pkg.go
+MOD_RS=panel/go/internal/api/rt_sites.go
 for f in "$PICKER" "$SITES_TSX" "$DETAIL_TSX" "$SITES_RS" "$SYSTEM_RS" "$PHP_RS" "$NGINX_RS" "$PKG_RS" "$MOD_RS"; do
   [ -f "$f" ] || { echo "missing $f"; exit 1; }
 done
@@ -86,7 +88,7 @@ SRC_MOD_RS=$(strip "$MOD_RS")
 # with SIGPIPE and `pipefail` turns that into a failed arm, non-deterministically.
 has()  { grep -q  -- "$2" <<< "$1"; }
 hasE() { grep -qE -- "$2" <<< "$1"; }
-fnbody() { awk "/pub async fn $2\(/,/^}/" <<< "$1"; }
+fnbody() { awk "/^func $2\\(/,/^}/" <<< "$1"; }
 
 # Every awk range extraction below anchors on an incidental spelling. If one stops
 # matching, the variable is EMPTY and every arm reading it goes red with a message
@@ -203,37 +205,42 @@ fi
 echo
 echo "§3 the panel outlives the agent's install budget (C)"
 
-agent_budget=$(grep -oE 'const INSTALL_TIMEOUT: Duration = Duration::from_secs\([0-9]+\)' <<< "$(strip "$PKG_RS")" | grep -oE '[0-9]+')
+agent_budget=$(grep -oE 'const pkgInstallTimeout = [0-9]+ \* time\.Second' <<< "$(strip "$PKG_RS")" | grep -oE '[0-9]+' | head -1)
 if [ -n "$agent_budget" ]; then
   ok "the agent's package transaction still declares its own budget (${agent_budget}s)"
 else
   bad "could not read the agent's install budget — this section's numbers need rechecking"
 fi
 
-INSTALLER=$(awk '/pub\(crate\) async fn install_service_with_log/,/^}/' <<< "$SRC_SYSTEM_RS")
-readable "install_service_with_log" "$INSTALLER"
-if has "$INSTALLER" 'post_long'; then
+INSTALLER=$(awk '/^func rtSystemInstallServiceWithLog\(/,/^}/' <<< "$SRC_SYSTEM_RS")
+readable "rtSystemInstallServiceWithLog" "$INSTALLER"
+if has "$INSTALLER" 'agent.PostLong(ctx, agentPath, body, rtSystemInstallAgentTimeoutSecs)'; then
   ok "service installs go through post_long, not the 60s client"
 else
-  bad "install_service_with_log still uses the 60s-capped post over a multi-minute install"
+  bad "rtSystemInstallServiceWithLog still uses the 60s-capped Post over a multi-minute install"
 fi
 
-panel_budget=$(grep -oE 'const INSTALL_AGENT_TIMEOUT_SECS: u64 = [0-9]+' <<< "$SRC_SYSTEM_RS" | grep -oE '[0-9]+$')
+panel_budget=$(grep -oE 'const rtSystemInstallAgentTimeoutSecs = [0-9]+' <<< "$SRC_SYSTEM_RS" | grep -oE '[0-9]+$')
 if [ -n "$panel_budget" ] && [ -n "$agent_budget" ] && [ "$panel_budget" -gt "$agent_budget" ]; then
   ok "the panel allows ${panel_budget}s, above the agent's ${agent_budget}s, so the agent errors first"
 else
   bad "panel budget '${panel_budget:-none}' does not exceed agent budget '${agent_budget:-none}'"
 fi
 
-PHP_INSTALL=$(fnbody "$SRC_SITES_RS" php_install)
-readable "php_install" "$PHP_INSTALL"
-if has "$PHP_INSTALL" 'install_service_with_log'; then
+# Go: rtSitesPhpInstall is a one-line delegate to rtSitesPhpPackage, which is
+# where the validation and the shared install path live — require both.
+PHP_INSTALL=$(fnbody "$SRC_SITES_RS" rtSitesPhpPackage)
+readable "rtSitesPhpPackage" "$PHP_INSTALL"
+if has "$(fnbody "$SRC_SITES_RS" rtSitesPhpInstall)" 'rtSitesPhpPackage(st, w, r, "", "/php/install")' && has "$PHP_INSTALL" 'rtSystemInstallServiceWithLog('; then
   ok "the PHP install shares the logged, budgeted install path"
 else
-  bad "php_install does not use the shared install path — it has its own exposure again"
+  bad "rtSitesPhpInstall does not use the shared install path — it has its own exposure again"
 fi
 
-if has "$PHP_INSTALL" 'StatusCode::BAD_REQUEST'; then
+valid_ln=$(grep -n 'return rtSitesInvalidPHP()' <<< "$PHP_INSTALL" | head -1 | cut -d: -f1)
+spawn_ln=$(grep -n 'rtSystemInstallServiceWithLog(' <<< "$PHP_INSTALL" | head -1 | cut -d: -f1)
+if [ -n "$valid_ln" ] && [ -n "$spawn_ln" ] && [ "$valid_ln" -lt "$spawn_ln" ] \
+   && has "$(fnbody "$SRC_SITES_RS" rtSitesInvalidPHP)" 'apiErr(http.StatusBadRequest'; then
   ok "an unknown version is refused before anything is spawned"
 else
   bad "php_install spawns first and validates later, so a bad version reports as started"
@@ -242,7 +249,7 @@ fi
 # A 200 stopped meaning success the moment the agent began judging an install by
 # whether FPM opened its socket. Reading only the status code paints that green
 # with the explanation printed underneath it.
-if hasE "$INSTALLER" 'get\("success"\)' && has "$INSTALLER" '"error"'; then
+if hasE "$INSTALLER" 'jsonGet\(resp, "success"\)' && has "$INSTALLER" 'status := "error"'; then
   ok "a 200 carrying success:false is logged as a failure, not a completed install"
 else
   bad "the install log reads the status code only — an honest failure would show as done"
@@ -251,21 +258,23 @@ fi
 echo
 echo "§4 an install that leaves PHP unusable is not called success (D)"
 
-if has "$SRC_PHP_RS" 'async fn settle('; then
+if has "$SRC_PHP_RS" 'func phpSettle('; then
   ok "there is one verdict function for every install outcome"
 else
   bad "no shared verdict — each install path decides for itself what success means"
 fi
 
-SETTLE=$(awk '/async fn settle\(/,/^}/' <<< "$SRC_PHP_RS")
-readable "settle()" "$SETTLE"
-if has "$SETTLE" 'socket_exists(version)'; then
+SETTLE=$(awk '/^func phpSettle\(/,/^}/' <<< "$SRC_PHP_RS")
+readable "phpSettle()" "$SETTLE"
+if has "$SETTLE" 'if phpSocketExists(version) {'; then
   ok "the verdict is judged on the socket, which is what refuses a PHP vhost"
 else
   bad "the verdict does not check the socket — the same wrong question as before"
 fi
 
-if has "$SETTLE" 'success: false'; then
+# Go: the failure value is the zero Success (false) — the second return is the
+# one that omits `Success: true`.
+if [ "$(grep -c 'return phpInstallResponse{' <<< "$SETTLE")" -ge 2 ] && has "$SETTLE" 'return phpInstallResponse{Version: version, Message:'; then
   ok "a missing socket is reported as a failure, not as an installed package"
 else
   bad "settle cannot report failure — it can only agree"
@@ -273,16 +282,16 @@ fi
 
 # Every exit that claims success, on both families and on the already-installed
 # short circuit, must go through it. One that does not is the one that lies.
-settle_calls=$(grep -c 'settle(version,' <<< "$SRC_PHP_RS")
+settle_calls=$(grep -c 'phpSettle(version,' <<< "$SRC_PHP_RS")
 if [ "$settle_calls" -ge 3 ]; then
   ok "all $settle_calls success paths go through the same verdict"
 else
   bad "only $settle_calls path(s) use the verdict — apt, rpm and already-installed all need it"
 fi
 
-ALREADY=$(awk '/if is_installed\(version\)\.await \{/,/^    \}/' <<< "$SRC_PHP_RS")
+ALREADY=$(awk '/^\tif phpIsInstalled\(version\) \{/,/^\t\}/' <<< "$SRC_PHP_RS")
 readable "the already-installed branch" "$ALREADY"
-if has "$ALREADY" 'start_fpm(version)'; then
+if has "$ALREADY" 'phpStartFpm(version)'; then
   ok "an already-installed version has its FPM unit started rather than assumed"
 else
   bad "the already-installed branch still reports success without starting anything"
@@ -306,13 +315,13 @@ fi
 echo
 echo "§6 one version list on the panel side, not two"
 
-if has "$SRC_SITES_RS" 'const PHP_VERSIONS'; then
+if has "$SRC_SITES_RS" 'var rtSitesPHPVersions = '; then
   ok "the accepted versions are declared once"
 else
   bad "no shared list — the two handlers can drift apart again"
 fi
 
-inline=$(grep -cE '\["8\.1", "8\.2", "8\.3", "8\.4", "8\.5"\]' <<< "$SRC_SITES_RS")
+inline=$(grep -cE '"8\.1", "8\.2", "8\.3", "8\.4", "8\.5"' <<< "$SRC_SITES_RS")
 if [ "$inline" -le 1 ]; then
   ok "the literal appears $inline time(s) — the declaration itself"
 else
@@ -328,13 +337,13 @@ echo "§7 the runtime switch the picker exists to serve (#99, s310)"
 # updatable, so the answer was that there was no button, not that he had missed it.
 # These arms pin the half that was promised in the thread that same morning.
 
-if has "$SRC_MOD_RS" 'sites/{id}/runtime'; then
+if has "$SRC_MOD_RS" '"PUT /api/sites/{id}/runtime", h(rtSitesSwitchRuntime)'; then
   ok "the runtime switch is registered as a route"
 else
   bad "no /api/sites/{id}/runtime route — #99 is unreachable again"
 fi
 
-if has "$SRC_SITES_RS" 'const SWITCHABLE_RUNTIMES'; then
+if has "$SRC_SITES_RS" 'var rtSitesSwitchableRuntimes = '; then
   ok "the switchable runtimes are declared once, as a closed list"
 else
   bad "no SWITCHABLE_RUNTIMES declaration — the target runtime is unbounded"
@@ -344,18 +353,20 @@ fi
 # node and python to the site directory while static and php both map to
 # {site_dir}/public — so admitting a proxying runtime here turns a vhost rebuild
 # into a document-root move, silently, on somebody's live site.
-switchable=$(grep -A2 'const SWITCHABLE_RUNTIMES' <<< "$SRC_SITES_RS")
+switchable=$(grep -A2 'var rtSitesSwitchableRuntimes = ' <<< "$SRC_SITES_RS")
 if [ -z "$switchable" ]; then
-  bad "could not extract SWITCHABLE_RUNTIMES — the next two arms would read nothing"
+  bad "could not extract rtSitesSwitchableRuntimes — the next two arms would read nothing"
+elif ! hasE "$switchable" '"static", "php"'; then
+  bad "rtSitesSwitchableRuntimes no longer reads as the static/php pair — re-derive this arm"
 elif hasE "$switchable" '"(proxy|node|python)"'; then
-  bad "SWITCHABLE_RUNTIMES admits a proxying runtime — that moves the document root"
+  bad "rtSitesSwitchableRuntimes admits a proxying runtime — that moves the document root"
 else
-  ok "SWITCHABLE_RUNTIMES excludes every runtime whose document root differs"
+  ok "rtSitesSwitchableRuntimes excludes every runtime whose document root differs"
 fi
 
-RUNTIME_FN=$(fnbody "$SRC_SITES_RS" switch_runtime)
+RUNTIME_FN=$(fnbody "$SRC_SITES_RS" rtSitesSwitchRuntime)
 if [ -z "$RUNTIME_FN" ]; then
-  bad "switch_runtime not found — every arm below reads an empty window"
+  bad "rtSitesSwitchRuntime not found — every arm below reads an empty window"
 else
   if has "$RUNTIME_FN" 'php_version is required'; then
     ok "switching to php demands an explicit version"
@@ -367,8 +378,7 @@ else
   # rather than reach: the vhost is written FIRST, so a refused agent write
   # leaves the row describing what is actually being served. Reversed, a site
   # whose nginx write failed would read as switched in the panel and in the API.
-  put_at=$(grep -n 'agent$' <<< "$RUNTIME_FN" | head -1 | cut -d: -f1)
-  [ -z "$put_at" ] && put_at=$(grep -n '\.put(' <<< "$RUNTIME_FN" | head -1 | cut -d: -f1)
+  put_at=$(grep -n 'agent\.Put(ctx, "/nginx/sites/"' <<< "$RUNTIME_FN" | head -1 | cut -d: -f1)
   upd_at=$(grep -n 'UPDATE sites SET runtime' <<< "$RUNTIME_FN" | head -1 | cut -d: -f1)
   if [ -z "$put_at" ] || [ -z "$upd_at" ]; then
     bad "could not locate both the agent write and the UPDATE — ordering unverified"
@@ -418,7 +428,7 @@ echo "§8 the direction §7 made reachable — php -> static (s311)"
 tstrip() { sed 's/^[[:space:]]*#.*//' <<< "$1"; }
 hasF() { grep -qF -- "$2" <<< "$1"; }
 
-for tpl in panel/agent/src/templates/nginx/http.conf panel/agent/src/templates/nginx/https.conf; do
+for tpl in panel/go/internal/agent/templates/nginx/http.conf panel/go/internal/agent/templates/nginx/https.conf; do
   [ -f "$tpl" ] || { bad "missing $tpl — the arms below would read nothing"; continue; }
 
   # Bound the window on the branch's own terminator, never a fixed -A count
@@ -477,15 +487,15 @@ fi
 # A fleet member's static vhosts therefore need the retrofit inside the AGENT,
 # which is the process that owns /etc/nginx/sites-enabled on every box. Keyed on
 # the function AND its call site: a migration nothing invokes is the s310 shape.
-AG_NGINX=panel/agent/src/services/nginx.rs
-AG_MAIN=panel/agent/src/main.rs
+AG_NGINX=panel/go/internal/agent/services/nginx.go
+AG_MAIN=panel/go/cmd/dockpanel-agent/main.go
 if [ ! -f "$AG_NGINX" ] || [ ! -f "$AG_MAIN" ]; then
   bad "MISSING agent subject file — the fleet-side arm is measuring nothing"
-elif ! grep -q 'fn retrofit_static_denies' "$AG_NGINX"; then
+elif ! grep -q '^func NginxRetrofitStaticDenies(' "$AG_NGINX"; then
   bad "the agent has no vhost retrofit — a fleet member's switched site stays exposed after update"
-elif ! grep -q 'retrofit_static_denies()' "$AG_MAIN"; then
+elif ! grep -qE '^\s*services\.NginxRetrofitStaticDenies\(ctx\)' "$AG_MAIN"; then
   bad "the agent's retrofit exists and nothing calls it at startup"
-elif ! grep -q 'fn patch_static_vhost' "$AG_NGINX"; then
+elif ! grep -q '^func NginxPatchStaticVhost(' "$AG_NGINX"; then
   bad "the retrofit decision is not a testable pure function — it cannot be exercised without a box"
 else
   ok "the agent retrofits its own static vhosts at startup, so the fix reaches fleet members"
@@ -494,7 +504,7 @@ fi
 # Second control, on the other side: the php branches must still carry the denies
 # these arms were modelled on. A zero here would mean the greps above are matching
 # a pattern this codebase no longer writes.
-if [ "$(grep -cF 'deny all' panel/agent/src/templates/nginx/http.conf)" -ge 12 ]; then
+if [ "$(grep -cF 'deny all' panel/go/internal/agent/templates/nginx/http.conf)" -ge 12 ]; then
   ok "the php preset branches still carry their own denies (the arms are non-vacuous)"
 else
   bad "fewer denies than expected in http.conf — re-derive what this section is matching"

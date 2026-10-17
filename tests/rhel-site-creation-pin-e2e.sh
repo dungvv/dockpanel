@@ -65,23 +65,29 @@ PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
 
-PKG_RS=panel/agent/src/services/pkg.rs
-PHP_RS=panel/agent/src/routes/php.rs
-NGINX_ROUTE_RS=panel/agent/src/routes/nginx.rs
-NGINX_SVC_RS=panel/agent/src/services/nginx.rs
-SITES_RS=panel/backend/src/routes/sites.rs
-OWNERSHIP_RS=panel/agent/src/services/ownership.rs
-GIT_BUILD_SVC_RS=panel/agent/src/services/git_build.rs
-DOCKER_APPS_ROUTE_RS=panel/agent/src/routes/docker_apps.rs
-DOCKER_APPS_SVC_RS=panel/agent/src/services/docker_apps.rs
-SERVICE_INSTALLER_RS=panel/agent/src/routes/service_installer.rs
-IAC_RS=panel/agent/src/routes/iac.rs
-SECURITY_SCANNER_RS=panel/agent/src/services/security_scanner.rs
-DIAGNOSTICS_RS=panel/agent/src/services/diagnostics.rs
-MAIL_RS=panel/agent/src/routes/mail.rs
-for f in "$PKG_RS" "$PHP_RS" "$NGINX_ROUTE_RS" "$NGINX_SVC_RS" "$SITES_RS" \
-         "$OWNERSHIP_RS" "$GIT_BUILD_SVC_RS" "$DOCKER_APPS_ROUTE_RS" "$DOCKER_APPS_SVC_RS" \
-         "$SERVICE_INSTALLER_RS" "$IAC_RS" "$SECURITY_SCANNER_RS" "$DIAGNOSTICS_RS" "$MAIL_RS"; do
+# Go port names: resolve_php_fpm_socket → services.PkgResolvePhpFpmSocket,
+# php.rs socket_exists/list_versions → phpSocketExists/phpListVersions,
+# nginx put_site → nginxRoutes.putSite, sites_dir(_for)/vhost_paths(_for)/
+# parked_dir_for → NginxSitesDir(For)/NginxVhostPaths(For)/NginxParkedDirFor,
+# sites.rs's php_socket literal → rtSitesPHPSocket.
+AG=panel/go/internal/agent
+PKG_GO=$AG/services/pkg.go
+PHP_GO=$AG/routes/php.go
+NGINX_ROUTE_GO=$AG/routes/nginx.go
+NGINX_SVC_GO=$AG/services/nginx.go
+SITES_GO=panel/go/internal/api/rt_sites.go
+OWNERSHIP_GO=$AG/services/ownership.go
+GIT_BUILD_SVC_GO=$AG/services/git_build.go
+DOCKER_APPS_ROUTE_GO=$AG/routes/docker_apps.go
+DOCKER_APPS_SVC_GO=$AG/services/docker_apps.go
+SERVICE_INSTALLER_GO=$AG/routes/service_installer.go
+IAC_GO=$AG/routes/iac.go
+SECURITY_SCANNER_GO=$AG/services/security_scanner.go
+DIAGNOSTICS_GO=$AG/services/diagnostics.go
+MAIL_GO=$AG/routes/mail.go
+for f in "$PKG_GO" "$PHP_GO" "$NGINX_ROUTE_GO" "$NGINX_SVC_GO" "$SITES_GO" \
+         "$OWNERSHIP_GO" "$GIT_BUILD_SVC_GO" "$DOCKER_APPS_ROUTE_GO" "$DOCKER_APPS_SVC_GO" \
+         "$SERVICE_INSTALLER_GO" "$IAC_GO" "$SECURITY_SCANNER_GO" "$DIAGNOSTICS_GO" "$MAIL_GO"; do
   [ -f "$f" ] || { echo "MISSING SUBJECT FILE: $f"; exit 1; }
 done
 
@@ -89,47 +95,56 @@ done
 # (lesson #149) — the fix's comments deliberately name both families' paths.
 strip() { sed 's://.*::' "$1"; }
 
-SRC_PKG=$(strip "$PKG_RS")
-SRC_PHP=$(strip "$PHP_RS")
-SRC_NGINX_ROUTE=$(strip "$NGINX_ROUTE_RS")
-SRC_NGINX_SVC=$(strip "$NGINX_SVC_RS")
-SRC_OWNERSHIP=$(strip "$OWNERSHIP_RS")
-SRC_GIT_BUILD_SVC=$(strip "$GIT_BUILD_SVC_RS")
-SRC_DOCKER_APPS_ROUTE=$(strip "$DOCKER_APPS_ROUTE_RS")
-SRC_DOCKER_APPS_SVC=$(strip "$DOCKER_APPS_SVC_RS")
-SRC_SERVICE_INSTALLER=$(strip "$SERVICE_INSTALLER_RS")
-SRC_IAC=$(strip "$IAC_RS")
-SRC_SECURITY_SCANNER=$(strip "$SECURITY_SCANNER_RS")
-SRC_DIAGNOSTICS=$(strip "$DIAGNOSTICS_RS")
-SRC_MAIL=$(strip "$MAIL_RS")
-SRC_SITES=$(strip "$SITES_RS")
+SRC_PKG=$(strip "$PKG_GO")
+SRC_PHP=$(strip "$PHP_GO")
+SRC_NGINX_ROUTE=$(strip "$NGINX_ROUTE_GO")
+SRC_NGINX_SVC=$(strip "$NGINX_SVC_GO")
+SRC_OWNERSHIP=$(strip "$OWNERSHIP_GO")
+SRC_MAIL=$(strip "$MAIL_GO")
+SRC_SITES=$(strip "$SITES_GO")
 
 # Here-strings, never pipelines: a `grep -q` closing the pipe SIGPIPEs the
 # upstream sed, and pipefail turns that into a failed arm non-deterministically.
-has()  { grep -q  -- "$2" <<< "$1"; }
+has()  { grep -qF -- "$2" <<< "$1"; }
 hasE() { grep -qE -- "$2" <<< "$1"; }
 fnbody() { awk "/$2/,/^}/" <<< "$1"; }
 readable() { [ -n "$2" ] || bad "could not extract $1 — the arms reading it mean nothing"; }
 
+# Run Go tests and require each named one to PASS (not merely exist).
+gotest() {
+  local pkg=$1; shift
+  local re out t
+  re="^($(IFS='|'; echo "$*"))\$"
+  if ! command -v go >/dev/null 2>&1; then bad "go toolchain not found — cannot run $*"; return; fi
+  out=$(cd panel/go && go test "$pkg" -run "$re" -count=1 -v 2>&1)
+  for t in "$@"; do
+    if grep -q -- "--- PASS: $t " <<< "$out"; then
+      ok "$t runs and passes"
+    else
+      bad "$t is missing or failing: $(tail -3 <<< "$out" | tr '\n' ' ')"
+    fi
+  done
+}
+
 echo
 echo "§1 one resolver knows both families' socket layouts"
 
-RESOLVER=$(fnbody "$SRC_PKG" 'pub async fn resolve_php_fpm_socket')
-readable "resolve_php_fpm_socket" "$RESOLVER"
+RESOLVER=$(fnbody "$SRC_PKG" '^func PkgResolvePhpFpmSocket\(')
+readable "PkgResolvePhpFpmSocket" "$RESOLVER"
 
-if has "$RESOLVER" '/run/php/php{version}-fpm.sock'; then
+if has "$RESOLVER" 'debian := "/run/php/php" + version + "-fpm.sock"'; then
   ok "the resolver checks the Debian versioned path"
 else
   bad "the resolver does not check the Debian path — apt boxes would regress"
 fi
 
-if has "$RESOLVER" '/run/php-fpm/www.sock'; then
+if has "$RESOLVER" '"/run/php-fpm/www.sock"'; then
   ok "the resolver checks the RHEL unversioned path"
 else
   bad "the resolver does not check RHEL's socket — the whole point of the fix"
 fi
 
-if has "$RESOLVER" 'installed_php_version().await.as_deref() == Some(version)'; then
+if hasE "$RESOLVER" 'if PkgInstalledPhpVersion\(\) == version && pkgExists\("/run/php-fpm/www\.sock"\)'; then
   ok "the RHEL branch confirms it's THIS version before trusting the unversioned socket"
 else
   bad "no version confirmation on the RHEL branch — every version would claim the one live socket"
@@ -138,31 +153,33 @@ fi
 echo
 echo "§2 the two call sites share the resolver, not their own copies"
 
-SOCKET_EXISTS=$(fnbody "$SRC_PHP" 'async fn socket_exists')
-readable "socket_exists" "$SOCKET_EXISTS"
-if has "$SOCKET_EXISTS" 'resolve_php_fpm_socket(version).await.is_some()'; then
-  ok "php.rs::socket_exists() delegates to the shared resolver"
+SOCKET_EXISTS=$(grep -A3 -E '^func phpSocketExists\(' <<< "$SRC_PHP")
+readable "phpSocketExists" "$SOCKET_EXISTS"
+if has "$SOCKET_EXISTS" 'return services.PkgResolvePhpFpmSocket(version) != ""'; then
+  ok "php.go::phpSocketExists() delegates to the shared resolver"
 else
-  bad "php.rs::socket_exists() re-implements its own check — the two can drift apart again"
+  bad "php.go::phpSocketExists() re-implements its own check — the two can drift apart again"
 fi
 
-# The historical bug, pinned as an absence: put_site() must NOT independently
+# The historical bug, pinned as an absence: putSite() must NOT independently
 # stat the raw wire-format path as its verdict. It may still strip/parse the
 # string to extract a version, but the EXISTENCE question has to go through
 # the resolver.
-PUT_SITE=$(fnbody "$SRC_NGINX_ROUTE" 'async fn put_site')
-readable "put_site" "$PUT_SITE"
+PUT_SITE=$(fnbody "$SRC_NGINX_ROUTE" '^func \(n nginxRoutes\) putSite\(')
+readable "putSite" "$PUT_SITE"
 
-if hasE "$PUT_SITE" 'resolve_php_fpm_socket\(version\)\.await'; then
-  ok "put_site() resolves the real socket instead of trusting the literal path"
+if hasE "$PUT_SITE" 'real := services\.PkgResolvePhpFpmSocket\(version\)'; then
+  ok "putSite() resolves the real socket instead of trusting the literal path"
 else
-  bad "put_site() does not call the resolver — RHEL site creation is unfixed"
+  bad "putSite() does not call the resolver — RHEL site creation is unfixed"
 fi
 
-if hasE "$PUT_SITE" '!std::path::Path::new\(socket_path\)\.exists\(\)'; then
-  bad "put_site() still has the old literal-existence check — the RHEL bug is back"
+# Go's spellings of "does this literal path exist": nginxExists/os.Stat/
+# pkgExists on the wire string `sp` or the raw cfg.PhpSocket.
+if hasE "$PUT_SITE" '(nginxExists|os\.Stat|pkgExists|os\.Lstat)\((sp|\*cfg\.PhpSocket|socketPath)\)'; then
+  bad "putSite() still has the old literal-existence check — the RHEL bug is back"
 else
-  ok "the old Debian-only literal existence check is gone from put_site()"
+  ok "the old Debian-only literal existence check is gone from putSite()"
 fi
 
 echo
@@ -172,44 +189,46 @@ echo "§3 a resolved RHEL socket naturally skips the Debian-only per-site pool"
 # (/etc/php/{version}/fpm/pool.d) and out of scope for this fix. It must
 # degrade to the shared pool on RHEL, not error — proven by the guard that
 # gates it still matching only a Debian-shaped resolved socket.
-POOL_BLOCK=$(awk '/let mut per_site_socket: Option<String> = None;/,/if let Some\(sock\) = per_site_socket \{/' <<< "$SRC_NGINX_ROUTE")
+POOL_BLOCK=$(awk '/var perSiteSocket \*string/,/if perSiteSocket != nil \{/' <<< "$SRC_NGINX_ROUTE")
 readable "the per-site pool block" "$POOL_BLOCK"
 
-if hasE "$POOL_BLOCK" 'strip_prefix\("unix:/run/php/php"\)'; then
+if has "$POOL_BLOCK" 'strings.CutPrefix(*cfg.PhpSocket, "unix:/run/php/php")'; then
   ok "the per-site pool block only activates on a Debian-shaped resolved socket"
 else
   bad "the per-site pool block's guard changed — verify it still excludes RHEL's resolved socket"
 fi
 
-WRITE_POOL=$(fnbody "$SRC_NGINX_SVC" 'pub fn write_php_pool_config')
-readable "write_php_pool_config" "$WRITE_POOL"
-if has "$WRITE_POOL" 'return Ok(());'; then
-  ok "write_php_pool_config no-ops rather than erroring when the Debian pool.d tree is absent"
-else
-  bad "write_php_pool_config no longer degrades gracefully on a missing pool.d tree"
-fi
+# write_php_pool_config no-op arm retired: covered by TestPinRhelSiteCreationPoolConfigNoopsWithoutPoolD (panel/go/internal/agent/services/pin_rhel_site_creation_test.go)
 
 echo
 echo "§4 the backend's hardcoded string is documented as a version carrier"
 
-# sites.rs cannot know the target server's distro, so it is correct for it to
-# keep sending the Debian-shaped literal — but only if that's understood as
-# an input to the resolver, not an assertion of the real path. Pinned as a
-# comment so a future reader doesn't "fix" this into a redundant distro branch
-# on the wrong side of the wire.
-carrier_comments=$(grep -c 'VERSION CARRIER\|[Vv]ersion carrier' "$SITES_RS")
-if [ "$carrier_comments" -ge 4 ]; then
-  ok "all $carrier_comments php_socket construction sites document the version-carrier contract"
+# rt_sites.go cannot know the target server's distro, so it is correct for it
+# to keep sending the Debian-shaped literal — but only if that's understood as
+# an input to the resolver, not an assertion of the real path. The Go port
+# folded the four construction sites into one documented helper,
+# rtSitesPHPSocket; pin the comment on the helper AND that every construction
+# site goes through it (a fresh inline literal would carry no such contract).
+CARRIER=$(grep -B4 -E '^func rtSitesPHPSocket\(' "$SITES_GO")
+if has "$CARRIER" 'VERSION CARRIER'; then
+  ok "rtSitesPHPSocket documents the version-carrier contract"
 else
-  bad "only $carrier_comments of the 4 known php_socket construction sites are documented"
+  bad "rtSitesPHPSocket no longer documents the version-carrier contract"
+fi
+carrier_sites=$(grep -cE 'rtSitesPHPSocket\(\*' <<< "$SRC_SITES" || true)
+inline=$(grep -E 'unix:/run/php/php' <<< "$SRC_SITES" | grep -vcE '^func rtSitesPHPSocket\(' || true)
+if [ "$carrier_sites" -ge 4 ] && [ "$inline" -eq 0 ]; then
+  ok "all $carrier_sites php_socket construction sites go through the documented carrier"
+else
+  bad "only $carrier_sites of the 4 known php_socket construction sites use rtSitesPHPSocket ($inline inline literal(s))"
 fi
 
 echo
 echo "§5 the version-status API stops advertising a socket that may not be real"
 
-LIST_VERSIONS=$(fnbody "$SRC_PHP" 'async fn list_versions')
-readable "list_versions" "$LIST_VERSIONS"
-if has "$LIST_VERSIONS" 'resolve_php_fpm_socket(v).await'; then
+LIST_VERSIONS=$(fnbody "$SRC_PHP" '^func phpListVersions\(')
+readable "phpListVersions" "$LIST_VERSIONS"
+if has "$LIST_VERSIONS" 'real = services.PkgResolvePhpFpmSocket(v)'; then
   ok "the versions API reports the real resolved socket, not a Debian-only guess"
 else
   bad "the versions API still hardcodes the Debian socket path in its response"
@@ -218,111 +237,85 @@ fi
 echo
 echo "§6 the nginx vhost directory itself — no site of ANY runtime worked on RHEL"
 
-SITES_DIR_FOR=$(fnbody "$SRC_NGINX_SVC" 'pub fn sites_dir_for')
-readable "sites_dir_for" "$SITES_DIR_FOR"
-if hasE "$SITES_DIR_FOR" '"/etc/nginx/sites-enabled"' && hasE "$SITES_DIR_FOR" '"/etc/nginx/conf.d"'; then
-  ok "one function knows both families' vhost directories"
+# sites_dir_for both-directories arm retired: covered by TestPinRhelSiteCreationSitesDirFor (panel/go/internal/agent/services/pin_rhel_site_creation_test.go)
+
+# Split-for-testability: the pure decision takes a bool so a test needs no
+# nginx installed. A version that probed the filesystem directly would pass or
+# fail by accident of whether the CI runner has nginx — pin against that
+# regression explicitly.
+if hasE "$SRC_NGINX_SVC" '^func NginxSitesDir\(\) string \{ return NginxSitesDirFor\(nginxUsesSitesEnabled\(\)\) \}'; then
+  ok "the real-filesystem wrapper delegates to the pure, testable decision"
 else
-  bad "sites_dir_for does not name both directories — the RHEL branch may be gone"
+  bad "NginxSitesDir() does not delegate to NginxSitesDirFor (or is gone) — the decision is no longer testable without nginx installed"
 fi
 
-# Split-for-testability, the same shape this file already used for
-# vhost_target_between/vhost_target: the pure decision takes a bool so a test
-# needs no nginx installed. A version that probed the filesystem directly
-# would pass or fail by accident of whether the CI runner has nginx — pin
-# against that regression explicitly.
-if hasE "$SRC_NGINX_SVC" 'fn sites_dir\(\) -> &.static str \{' ; then
-  SITES_DIR_UNCONDITIONAL=$(fnbody "$SRC_NGINX_SVC" 'pub fn sites_dir\(\)')
-  if has "$SITES_DIR_UNCONDITIONAL" 'sites_dir_for('; then
-    ok "the real-filesystem wrapper delegates to the pure, testable decision"
-  else
-    bad "sites_dir() does not delegate to sites_dir_for — the decision is no longer testable without nginx installed"
-  fi
+VHOST_PATHS_FOR=$(fnbody "$SRC_NGINX_SVC" '^func NginxVhostPathsFor\(')
+readable "NginxVhostPathsFor" "$VHOST_PATHS_FOR"
+if has "$VHOST_PATHS_FOR" 'dir := NginxSitesDirFor(usesSitesEnabled)'; then
+  ok "NginxVhostPathsFor shares the same directory decision, not a second copy"
 else
-  bad "could not find sites_dir() — the real-filesystem entry point is gone"
+  bad "NginxVhostPathsFor re-derives the directory instead of sharing NginxSitesDirFor"
 fi
-
-VHOST_PATHS_FOR=$(fnbody "$SRC_NGINX_SVC" 'pub fn vhost_paths_for')
-readable "vhost_paths_for" "$VHOST_PATHS_FOR"
-if has "$VHOST_PATHS_FOR" 'sites_dir_for(uses_sites_enabled)'; then
-  ok "vhost_paths_for shares the same directory decision, not a second copy"
-else
-  bad "vhost_paths_for re-derives the directory instead of sharing sites_dir_for"
-fi
-if hasE "$VHOST_PATHS_FOR" 'if uses_sites_enabled \{' && has "$VHOST_PATHS_FOR" '} else {'; then
-  ok "vhost_paths_for actually branches on the convention rather than returning one shape"
-else
-  bad "vhost_paths_for has no visible branch on uses_sites_enabled — one family always gets the other's paths"
-fi
+# vhost_paths_for branch arm retired: covered by TestBothPathsComeFromOneFunctionSoTheyCannotDrift + TestTheRhelFamilyHasNoSecondDirectorySoBothPathsShareConfD (panel/go/internal/agent/services/nginx_test.go)
+gotest ./internal/agent/services/ TestBothPathsComeFromOneFunctionSoTheyCannotDrift TestTheRhelFamilyHasNoSecondDirectorySoBothPathsShareConfD TestPinRhelSiteCreationSitesDirFor TestPinRhelSiteCreationPoolConfigNoopsWithoutPoolD TestPinRhelSiteCreationParkedDirSharesConfD TestASingleSharedDirectoryIsNotScannedTwice
 
 echo
 echo "§7 every other reader/writer of a site's vhost shares the one decision, not its own copy"
 
 # The class of defect: ~25 call sites across a dozen files independently
-# hardcoded the Debian path. Each subject below must call through sites_dir()
-# — or, s449, through `vhost_paths()`/`vhost_target()`, which themselves
-# resolve through `sites_dir_for` and additionally know the PARKED path
-# sites_dir() alone does not — rather than spelling /etc/nginx/sites-enabled
-# itself. mail.rs is a deliberate exception — it already tried both literal
-# paths for the PANEL's own vhost before this fix existed, which is a
-# different (already-correct) shape.
+# hardcoded the Debian path. Each subject below must call through
+# NginxSitesDir() — or, s449, through NginxVhostPaths()/NginxVhostTargetFor(),
+# which themselves resolve through NginxSitesDirFor and additionally know the
+# PARKED path NginxSitesDir() alone does not — rather than spelling
+# /etc/nginx/sites-enabled itself. mail.go is a deliberate exception — it
+# already tried both literal paths for the PANEL's own vhost before this fix
+# existed, which is a different (already-correct) shape.
 declare -A PROPAGATION=(
-  ["ssl.rs (routes)"]="panel/agent/src/routes/ssl.rs"
-  ["ownership.rs"]="$OWNERSHIP_RS"
-  ["git_build.rs (services)"]="$GIT_BUILD_SVC_RS"
-  ["docker_apps.rs (routes)"]="$DOCKER_APPS_ROUTE_RS"
-  ["docker_apps.rs (services)"]="$DOCKER_APPS_SVC_RS"
-  ["service_installer.rs"]="$SERVICE_INSTALLER_RS"
-  ["iac.rs"]="$IAC_RS"
-  ["security_scanner.rs"]="$SECURITY_SCANNER_RS"
-  ["diagnostics.rs"]="$DIAGNOSTICS_RS"
+  ["ssl.go (routes)"]="$AG/routes/ssl.go"
+  ["ownership.go"]="$OWNERSHIP_GO"
+  ["git_build.go (services)"]="$GIT_BUILD_SVC_GO"
+  ["docker_apps.go (routes)"]="$DOCKER_APPS_ROUTE_GO"
+  ["docker_apps.go (services)"]="$DOCKER_APPS_SVC_GO"
+  ["service_installer.go"]="$SERVICE_INSTALLER_GO"
+  ["iac.go"]="$IAC_GO"
+  ["security_scanner.go"]="$SECURITY_SCANNER_GO"
+  ["diagnostics.go"]="$DIAGNOSTICS_GO"
 )
 for label in "${!PROPAGATION[@]}"; do
   f="${PROPAGATION[$label]}"
   src=$(strip "$f")
   if hasE "$src" '"/etc/nginx/sites-enabled/'; then
     bad "$label still hardcodes the Debian vhost directory literally"
-  elif hasE "$src" 'sites_dir\(\)|vhost_paths\(|vhost_target\('; then
+  elif hasE "$src" 'NginxSitesDir\(\)|NginxVhostPaths\(|NginxVhostTargetFor\('; then
     ok "$label reads the vhost directory through the shared decision"
   else
-    bad "$label neither hardcodes nor calls sites_dir()/vhost_paths()/vhost_target() — re-derive what changed"
+    bad "$label neither hardcodes nor calls NginxSitesDir()/NginxVhostPaths()/NginxVhostTargetFor() — re-derive what changed"
   fi
 done
 
-# mail.rs is the one file that got this right BEFORE the fix existed — it
+# mail.go is the one file that got this right BEFORE the fix existed — it
 # tries both literal paths for the panel's own vhost. Pin that this is still
 # true, as a control: if this ever regresses to hardcoding one path, the
 # panel's own webmail-domain detection breaks on whichever family it drops.
 if hasE "$SRC_MAIL" '"/etc/nginx/sites-enabled/dockpanel-panel.conf"' && hasE "$SRC_MAIL" '"/etc/nginx/conf.d/dockpanel-panel.conf"'; then
-  ok "mail.rs's pre-existing dual-path check for the panel's own vhost is still intact (control)"
+  ok "mail.go's pre-existing dual-path check for the panel's own vhost is still intact (control)"
 else
-  bad "mail.rs no longer tries both families for the panel's own vhost"
+  bad "mail.go no longer tries both families for the panel's own vhost"
 fi
 
 echo
 echo "§8 the parked (disabled) directory: RHEL shares one dir, and a shared-dir scan is not double-counted"
 
-PARKED_DIR_FOR=$(fnbody "$SRC_NGINX_SVC" 'pub fn parked_dir_for')
-readable "parked_dir_for" "$PARKED_DIR_FOR"
-if has "$PARKED_DIR_FOR" 'sites_dir_for(false)'; then
-  ok "on the RHEL branch, parked_dir_for falls back to the SAME directory as sites_dir_for"
-else
-  bad "parked_dir_for's RHEL branch does not point at the same directory as sites_dir_for"
-fi
+# parked_dir_for RHEL-branch arm retired: covered by TestPinRhelSiteCreationParkedDirSharesConfD (panel/go/internal/agent/services/pin_rhel_site_creation_test.go)
 
-REGISTRY_REFS=$(fnbody "$SRC_OWNERSHIP" 'fn registry_needle_references')
-readable "registry_needle_references" "$REGISTRY_REFS"
-if hasE "$REGISTRY_REFS" 'parked_dir == live_dir'; then
+REGISTRY_REFS=$(fnbody "$SRC_OWNERSHIP" '^func ownershipRegistryNeedleReferences\(')
+readable "ownershipRegistryNeedleReferences" "$REGISTRY_REFS"
+if hasE "$REGISTRY_REFS" 'if parkedDir == liveDir \{'; then
   ok "a shared live/parked directory short-circuits before the second scan"
 else
   bad "no guard against scanning the same directory twice — RHEL would double-count every match"
 fi
-
-if has "$SRC_OWNERSHIP" 'a_single_shared_directory_is_not_scanned_twice'; then
-  ok "the double-scan guard has its own mutation-reachable unit test"
-else
-  bad "no unit test exercises the double-scan guard directly"
-fi
+# double-scan unit-test arm: now executed in §6's gotest (TestASingleSharedDirectoryIsNotScannedTwice).
 
 echo
 printf 'passed: %d   failed: %d\n' "$PASS" "$FAIL"

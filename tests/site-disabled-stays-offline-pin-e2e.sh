@@ -52,13 +52,17 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-NGX_SVC=panel/agent/src/services/nginx.rs
-NGX_RT=panel/agent/src/routes/nginx.rs
-SSL_SVC=panel/agent/src/services/ssl.rs
-GIT_SVC=panel/agent/src/services/git_build.rs
-DAPPS_RT=panel/agent/src/routes/docker_apps.rs
-SCANNER=panel/backend/src/services/security_scanner.rs
-HEALER=panel/backend/src/services/auto_healer.rs
+# Go port: vhost_target_between/vhost_target/vhost_paths → services.
+# NginxVhostTargetBetween/NginxVhostTargetFor/NginxVhostPaths; render_site_config
+# → NginxRenderSiteConfig; listener_lines → NginxListenerLines; build_nginx_body
+# → rtSitesBuildNginxBody.
+NGX_SVC=panel/go/internal/agent/services/nginx.go
+NGX_RT=panel/go/internal/agent/routes/nginx.go
+SSL_SVC=panel/go/internal/agent/services/ssl.go
+GIT_SVC=panel/go/internal/agent/services/git_build.go
+DAPPS_RT=panel/go/internal/agent/routes/docker_apps.go
+SCANNER=panel/go/internal/api/svc_security_scanner.go
+HEALER=panel/go/internal/api/svc_auto_healer.go
 
 for f in "$NGX_SVC" "$NGX_RT" "$SSL_SVC" "$GIT_SVC" "$DAPPS_RT" "$SCANNER" "$HEALER"; do
   [ -f "$f" ] || bad "MISSING SUBJECT FILE: $f"
@@ -106,7 +110,7 @@ files_matching() {
   printf '%s' "$out"
 }
 
-AGENT_RS=$(find panel/agent/src -name '*.rs' | sort)
+AGENT_RS=$( { find panel/go/internal/agent -name '*.go' ! -name '*_test.go'; find panel/go/cmd/dockpanel-agent -name '*.go' ! -name '*_test.go'; } | sort)
 # An arm that ENUMERATES its own subjects must assert the enumeration first:
 # `find` outside a checkout returns nothing, and a census over zero files is
 # green by construction.
@@ -115,7 +119,8 @@ AGENT_RS=$(find panel/agent/src -name '*.rs' | sort)
   || bad "the agent source enumeration came back with $(wc -w <<< "$AGENT_RS") files — every census below would be vacuous"
 
 # One function's body, bounded by its OWN closing brace — a `}` in column 0 —
-# and never by a comment or a fixed line offset.
+# and never by a comment or a fixed line offset. (Patterns go through awk -v,
+# which eats one level of backslashes — so parens are written `[(]`.)
 fn_body() { awk -v pat="$1" '$0 ~ pat {f=1} f {print} f && /^\}/ {exit}' <<< "$2"; }
 
 # Does `first` appear before `second` inside `body`? Used where ORDER is the
@@ -138,37 +143,8 @@ HEALER_S=$(subj "$HEALER" || true)
 
 echo "§A  the decision is ONE function, reachable without a box"
 
-# A1 — the decision itself, not a name. It takes BOTH candidate paths as
-# arguments, which is what makes it reachable from a unit test: while it lived
-# inline in five writers there was nothing a test could hold (lesson #243).
-if [ -z "$NGX_SVC_S" ]; then
-  bad "A1 SKIPPED: $NGX_SVC did not yield source"
-elif has "$NGX_SVC_S" 'fn vhost_target_between\(' \
-  && has "$NGX_SVC_S" 'Path::new\(parked\)\.exists\(\)'; then
-  ok "A1 the choice between an in-service path and a parked one is a function taking both, deciding on the parked file's existence"
-else
-  bad "A1 the vhost destination is no longer decided by a function taking both paths — an inline check per writer is what this suite exists to prevent"
-fi
-
-# A2 — the two outcomes are distinguishable by callers, and the distinction is
-# what gates the reload. An enum whose variants collapse would let §C pass
-# vacuously.
-#      ⚠ `fn is_live` PRESENT is not the assertion — a body rewritten to `true`
-#      keeps the name and turns every §C guard vacuous. The arm reads the body.
-if [ -z "$NGX_SVC_S" ]; then
-  bad "A2 SKIPPED: $NGX_SVC did not yield source"
-else
-  IS_LIVE=$(fn_body 'fn is_live' "$NGX_SVC_S")
-  if has "$NGX_SVC_S" 'enum VhostTarget' \
-    && has "$NGX_SVC_S" 'Live\(String\)' \
-    && has "$NGX_SVC_S" 'Parked\(String\)' \
-    && [ -n "$IS_LIVE" ] \
-    && has "$IS_LIVE" 'VhostTarget::Live'; then
-    ok "A2 a caller can tell an in-service write from a parked one, and the answer is derived from the variant"
-  else
-    bad "A2 the in-service and parked outcomes are no longer distinguishable — every reload guard downstream becomes vacuous"
-  fi
-fi
+# A1 retired: covered by TestASiteWithNothingParkedIsWrittenIntoService + TestAParkedBodyTakesTheWriteAndTheSiteStaysOffline (panel/go/internal/agent/services/nginx_test.go)
+# A2 retired: covered by TestAParkedBodyTakesTheWriteAndTheSiteStaysOffline + TestTheStubIsLeftAloneEvenWhenTheParkedBodyIsEmpty (panel/go/internal/agent/services/nginx_test.go) — they assert the Live flag of each outcome, which is what every §C guard reads
 
 # A3 — CENSUS over stripped code: the parked filename is spelled in exactly one
 # file. Three call sites building it by hand is how the parked body ended up with
@@ -188,8 +164,8 @@ echo "§B  every writer that renders a full vhost asks where the render goes"
 # of files that render must equal the set that ask. A sixth writer added later
 # fails this arm on the day it is written, which is the only way this class of bug
 # stays fixed.
-RENDERERS=$(files_matching 'render_site_config\(' $AGENT_RS)
-ASKERS=$(files_matching 'vhost_target(_between)?\(' $AGENT_RS)
+RENDERERS=$(files_matching 'NginxRenderSiteConfig\(' $AGENT_RS)
+ASKERS=$(files_matching 'NginxVhostTarget(For|Between)\(' $AGENT_RS)
 if [ "$RENDERERS" = "$ASKERS" ] && [ -n "$RENDERERS" ]; then
   ok "B1 every file that renders a site vhost also asks where it goes ($(tr -s ' ' '\n' <<< "$RENDERERS" | grep -c .) files, sets identical)"
 else
@@ -207,17 +183,27 @@ b_writer() {
   local body; body=$(fn_body "$fnpat" "$src")
   if [ -z "$body" ]; then
     bad "$label SKIPPED: could not bound the function matching /$fnpat/ in $file"
-  elif has "$body" 'vhost_target\(' && has "$body" 'target\.path\(\)'; then
+  elif has "$body" 'target := (services\.)?NginxVhostTargetFor\(domain\)' && has "$body" 'target\.Path'; then
     ok "$label the writer in $file asks where its render goes, and writes where it was told"
   else
     bad "$label the writer in $file writes a rendered vhost without asking, or asks and ignores the answer — a disabled site is back on the internet"
   fi
 }
 
-b_writer "B2" "$NGX_RT_S"   'async fn put_site'              "$NGX_RT"
-b_writer "B3" "$SSL_SVC_S"  'async fn enable_ssl_for_site'   "$SSL_SVC"
-b_writer "B4" "$GIT_SVC_S"  'async fn setup_nginx_proxy'     "$GIT_SVC"
-b_writer "B5" "$DAPPS_RT_S" 'async fn expose_domain'         "$DAPPS_RT"
+b_writer "B2" "$NGX_RT_S"   '^func [(]n nginxRoutes[)] putSite[(]'  "$NGX_RT"
+b_writer "B3" "$SSL_SVC_S"  '^func SslEnableSslForSite[(]'          "$SSL_SVC"
+b_writer "B4" "$GIT_SVC_S"  '^func gitBuildSetupNginxProxy[(]'      "$GIT_SVC"
+# Go: expose_domain's write moved into the helper dockerAppsWriteVhost, so B5
+# pins the helper AND that the exposer still routes its writes through it.
+b_writer "B5" "$DAPPS_RT_S" '^func dockerAppsWriteVhost[(]'         "$DAPPS_RT"
+EXPOSE=$(fn_body '^func dockerAppsExposeDomain[(]' "$DAPPS_RT_S")
+if [ -z "$EXPOSE" ]; then
+  bad "B5b SKIPPED: could not bound dockerAppsExposeDomain in $DAPPS_RT"
+elif has "$EXPOSE" 'dockerAppsWriteVhost\(domain, ' && ! has "$EXPOSE" 'os\.WriteFile\('; then
+  ok "B5b dockerAppsExposeDomain writes vhosts only through dockerAppsWriteVhost"
+else
+  bad "B5b dockerAppsExposeDomain writes a vhost without the target-asking helper"
+fi
 
 echo "§C  a write that did not go into service does not claim a reload"
 
@@ -233,16 +219,16 @@ c_order() {
   local body; body=$(fn_body "$fnpat" "$src")
   if [ -z "$body" ]; then
     bad "$label SKIPPED: could not bound the function matching /$fnpat/ in $file"
-  elif before "$body" 'is_live\(\)' 'nginx::reload\(\)|reload\(\)\.await'; then
+  elif before "$body" 'if !target\.Live \{' '(services\.)?NginxReload\(\)'; then
     ok "$label $file stops before reloading when the write was parked"
   else
     bad "$label $file reloads nginx without first checking the write reached it — the parked branch reports a success nobody can see"
   fi
 }
 
-c_order "C1" "$NGX_RT_S"  'async fn put_site'            "$NGX_RT"
-c_order "C2" "$SSL_SVC_S" 'async fn enable_ssl_for_site' "$SSL_SVC"
-c_order "C3" "$GIT_SVC_S" 'async fn setup_nginx_proxy'   "$GIT_SVC"
+c_order "C1" "$NGX_RT_S"  '^func [(]n nginxRoutes[)] putSite[(]' "$NGX_RT"
+c_order "C2" "$SSL_SVC_S" '^func SslEnableSslForSite[(]'         "$SSL_SVC"
+c_order "C3" "$GIT_SVC_S" '^func gitBuildSetupNginxProxy[(]'     "$GIT_SVC"
 
 echo "§D  what comes back when a site is enabled is the site as it is now"
 
@@ -258,15 +244,15 @@ d_pair() {
   local body; body=$(fn_body "$fnpat" "$NGX_RT_S")
   if [ -z "$body" ]; then
     bad "$label SKIPPED: could not bound the function matching /$fnpat/"
-  elif has "$body" 'vhost_paths\('; then
+  elif has "$body" 'services\.NginxVhostPaths\(domain\)'; then
     ok "$label the function matching /$fnpat/ takes both paths from the one place that spells them"
   else
     bad "$label the function matching /$fnpat/ builds a vhost path by hand — the parked name now has two spellings"
   fi
 }
 
-d_pair "D1" 'async fn disable_site'
-d_pair "D2" 'async fn enable_site'
+d_pair "D1" '^func [(]n nginxRoutes[)] disableSite[(]'
+d_pair "D2" '^func [(]n nginxRoutes[)] enableSite[(]'
 
 # D3 — renaming a disabled site carries its parked body across. Without this the
 # real body stays parked under the OLD name, where enabling will never look, and
@@ -274,12 +260,12 @@ d_pair "D2" 'async fn enable_site'
 if [ -z "$NGX_RT_S" ]; then
   bad "D3 SKIPPED: $NGX_RT did not yield source"
 else
-  RENAME_BODY=$(fn_body 'async fn rename_site' "$NGX_RT_S")
+  RENAME_BODY=$(fn_body '^func [(]n nginxRoutes[)] renameSite[(]' "$NGX_RT_S")
   if [ -z "$RENAME_BODY" ]; then
     bad "D3 SKIPPED: could not bound rename_site"
-  elif [ "$(count "$RENAME_BODY" 'vhost_paths\(')" -ge 2 ] \
-    && has "$RENAME_BODY" 'fs::write\(&new_parked' \
-    && has "$RENAME_BODY" 'fs::remove_file\(&old_parked'; then
+  elif [ "$(count "$RENAME_BODY" 'NginxVhostPaths\(')" -ge 2 ] \
+    && has "$RENAME_BODY" 'os\.WriteFile\(newParked' \
+    && has "$RENAME_BODY" 'os\.Remove\(oldParked\)'; then
     ok "D3 renaming a disabled site carries its parked body to the new name"
   else
     bad "D3 renaming a disabled site strands its parked body under the old name — the site can no longer be enabled from the panel"
@@ -300,17 +286,17 @@ e_loop() {
   local body; body=$(fn_body "$fnpat" "$src")
   if [ -z "$body" ]; then
     bad "$label SKIPPED: could not bound the function matching /$fnpat/ in $file"
-  elif ! has "$body" 'build_nginx_body\('; then
+  elif ! has "$body" 'rtSitesBuildNginxBody\('; then
     bad "$label SKIPPED: the function matching /$fnpat/ in $file no longer rebuilds a vhost — re-aim this arm"
-  elif before "$body" '!site\.enabled' 'build_nginx_body\('; then
+  elif before "$body" 'if !s\.Enabled \{' 'rtSitesBuildNginxBody\('; then
     ok "$label $file skips the unattended vhost rebuild for a disabled site"
   else
     bad "$label $file pushes a vhost for a disabled site on an unattended schedule — this is the resurrection nobody is watching"
   fi
 }
 
-e_loop "E1" "$SCANNER_S" 'async fn auto_fix_safe_findings' "$SCANNER"
-e_loop "E2" "$HEALER_S"  'async fn auto_renew_ssl'         "$HEALER"
+e_loop "E1" "$SCANNER_S" '^func SecurityScannerAutoFixSafeFindings[(]' "$SCANNER"
+e_loop "E2" "$HEALER_S"  '^func autoHealerAutoRenewSsl[(]'            "$HEALER"
 
 echo "§F  the maintenance response answers where the site answered"
 
@@ -319,25 +305,17 @@ echo "§F  the maintenance response answers where the site answered"
 # panel knows it, so nginx attached the stub to a different socket and never
 # consulted it: disabling a site did nothing at all. Proven by A/B on one box —
 # same stub, address-bound listener, 200 became 503.
-if [ -z "$NGX_SVC_S" ]; then
-  bad "F1 SKIPPED: $NGX_SVC did not yield source"
-elif has "$NGX_SVC_S" 'fn listener_lines\(' \
-  && has "$NGX_SVC_S" 'starts_with\("listen "\)' \
-  && has "$NGX_SVC_S" 'starts_with\("ssl_certificate "\)'; then
-  ok "F1 the listeners a maintenance response must answer on are derived from a vhost, certificates included"
-else
-  bad "F1 nothing derives a vhost's listeners — a maintenance response that names its own addresses is attached to a socket the site never used"
-fi
+# F1 retired: covered by TestTheMaintenanceResponseAnswersWhereTheSiteAnswered + TestATlsSiteCanStillSayItIsDisabledOverHttps (panel/go/internal/agent/services/nginx_test.go)
 
 # F2 — and the writer USES it. F1 passing while disable_site keeps its own
 # hardcoded block is the shape lesson #243 is about.
 if [ -z "$NGX_RT_S" ]; then
   bad "F2 SKIPPED: $NGX_RT did not yield source"
 else
-  DIS_BODY=$(fn_body 'async fn disable_site' "$NGX_RT_S")
+  DIS_BODY=$(fn_body '^func [(]n nginxRoutes[)] disableSite[(]' "$NGX_RT_S")
   if [ -z "$DIS_BODY" ]; then
     bad "F2 SKIPPED: could not bound disable_site"
-  elif has "$DIS_BODY" 'listener_lines\(' && before "$DIS_BODY" 'listener_lines\(' 'server_name \{domain\}'; then
+  elif has "$DIS_BODY" 'services\.NginxListenerLines\(' && before "$DIS_BODY" 'NginxListenerLines\(' 'server_name %\[2\]s'; then
     ok "F2 disabling a site builds its maintenance response on the addresses the site was answering on"
   else
     bad "F2 disable_site names its own listen addresses — the maintenance response will not be consulted and the site stays up"
