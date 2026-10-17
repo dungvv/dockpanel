@@ -531,8 +531,8 @@ echo "── 7. Class C — the docs site serves this version's evidence page �
 # checks IN SOURCE. That pin cannot tell you whether mdbook was ever re-run —
 # and the docs site has no deploy step at all, so "correct in source" and "live"
 # are entirely independent facts.
-# This commit's version: the api's own version literal in the Go tree.
-VERSION=$(grep -m1 '^var Version = "' panel/go/internal/api/core_state.go | sed -e 's/.*"\(.*\)".*/\1/')
+# This commit's version: the top-level VERSION file, which every build stamps.
+VERSION=$(tr -d '[:space:]' < VERSION 2>/dev/null)
 if page=$("${CURL[@]}" "$DOCS/testing.html" 2>/dev/null); then
   live_stamp=$(grep -oE 'Reflects v[0-9]+\.[0-9]+\.[0-9]+' <<<"$page" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
   if [ -z "$live_stamp" ]; then

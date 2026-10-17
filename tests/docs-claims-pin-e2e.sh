@@ -79,9 +79,9 @@ done
 echo
 echo "── 2. FEATURES.md's version stamp tracks the shipped version ──"
 
-# The shipped version: the api's own version literal in the Go tree.
-VERSION_SRC=panel/go/internal/api/core_state.go
-VERSION=$(grep -m1 '^var Version = "' "$VERSION_SRC" | sed -e 's/.*"\(.*\)".*/\1/')
+# The shipped version: the top-level VERSION file, which every build stamps.
+VERSION_SRC=VERSION
+VERSION=$(tr -d '[:space:]' < "$VERSION_SRC" 2>/dev/null)
 STAMP=$(grep -m1 -oE '\*\*Version\*\*: v?[0-9]+\.[0-9]+\.[0-9]+' FEATURES.md | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
 
 if [ -z "$STAMP" ]; then
