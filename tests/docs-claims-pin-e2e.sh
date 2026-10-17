@@ -828,10 +828,12 @@ fi
 # somebody adds a seventh manifest, which is the failure this arm exists for. And
 # the enumeration is asserted before it is trusted — an empty find would print a
 # clean green having examined nothing.
-mapfile -t MANIFESTS < <(find . -maxdepth 4 \( -name Cargo.toml -o -name package.json \) \
+# go.mod has no licence field, so the Go module is covered by LICENSE alone; the
+# manifests that CAN declare a licence are the package.json files.
+mapfile -t MANIFESTS < <(find . -maxdepth 4 -name package.json \
   -not -path '*/node_modules/*' -not -path '*/target/*' -not -path '*/dist/*' \
   -not -path './.git/*' | sort)
-if [ "${#MANIFESTS[@]}" -lt 6 ]; then
+if [ "${#MANIFESTS[@]}" -lt 3 ]; then
   bad "only ${#MANIFESTS[@]} first-party manifests enumerated — the sweep went blind"
 else
   ok "${#MANIFESTS[@]} first-party manifests enumerated"
@@ -868,7 +870,7 @@ fi
 # are reported in ONE assertion naming them, so the arm cannot pass by measuring
 # an empty set and cannot flood the log with one line per row.
 FEAT_PATHS=$(awk '/^\|/ {print}' FEATURES.md \
-  | grep -oE '`[a-z_]+(/[a-z_.]+)+\.(rs|tsx|ts)`' \
+  | grep -oE '`[a-z_]+(/[a-z_.]+)+\.(go|rs|tsx|ts)`' \
   | tr -d '`' | sort -u)
 feat_total=0; feat_missing=""
 for rel in $FEAT_PATHS; do
@@ -876,7 +878,9 @@ for rel in $FEAT_PATHS; do
   # The columns are relative to different crates (backend, agent, frontend), so
   # the path is resolved by SUFFIX anywhere under panel/ rather than by guessing
   # which column a token came from.
-  if [ -z "$(find panel -path "*/$rel" -print -quit 2>/dev/null)" ]; then
+  # A `.rs` citation names the retired Rust tree, which nothing ships from: it
+  # is stale even while a copy of that tree is still on disk.
+  if [[ "$rel" == *.rs ]] || [ -z "$(find panel -path "*/$rel" -print -quit 2>/dev/null)" ]; then
     feat_missing="$feat_missing $rel"
   fi
 done

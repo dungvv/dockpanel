@@ -410,8 +410,6 @@ func TestTheMeasuredVictimsStillDeclareTheVolumesTheyCouldNotWrite(t *testing.T)
 // found by something READING it; a committed artefact plus a test that FAILS
 // when it stops matching stands between a changed template and a merge.
 //
-// The `_generated` text is kept byte-identical to the Rust generator's so the
-// one fixture serves both implementations while they coexist.
 func dockerAppsGeneratedCatalogue(t *testing.T) string {
 	templates := make([]any, 0, len(dockerAppsTemplates))
 	for _, tpl := range dockerAppsTemplates {
@@ -444,8 +442,8 @@ func dockerAppsGeneratedCatalogue(t *testing.T) string {
 	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(map[string]any{
-		"_generated": "Do not edit. Source of truth is TEMPLATES in panel/agent/src/services/docker_apps.rs. " +
-			"Regenerate with UPDATE_TEMPLATE_CATALOGUE=1 cargo test -p dockpanel-agent catalogue",
+		"_generated": "Do not edit. Source of truth is dockerAppsTemplates in panel/go/internal/agent/services/docker_apps.go. " +
+			"Regenerate with UPDATE_TEMPLATE_CATALOGUE=1 go test ./internal/agent/services -run Catalogue",
 		"count":     len(dockerAppsTemplates),
 		"templates": templates,
 	}); err != nil {
