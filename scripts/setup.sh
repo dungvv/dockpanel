@@ -778,9 +778,16 @@ install_node() {
         return
     fi
 
-    if command -v node &> /dev/null; then
+    # An existing Node only counts if it can actually build the frontend: the
+    # distro packages on Ubuntu 24.04 ship Node 18 WITHOUT npm (npm is a
+    # separate package), so "node is on PATH" let the install reach the
+    # frontend build and die there with `npx: command not found`.
+    local node_major
+    node_major=$(node --version 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/')
+    if command -v npm &> /dev/null && [ -n "$node_major" ] && [ "$node_major" -ge 20 ] 2>/dev/null; then
         log "Node.js already installed: $(node --version)"
     else
+        [ -n "$node_major" ] && log "Node.js $(node --version) is too old or has no npm — installing Node.js 20"
         # `set -o pipefail` inside the wrapper is load-bearing: without it a
         # failed nodesource curl pipes nothing into `bash -` (which exits 0),
         # the `&&` then installs the distro's much-older Node, and the build
