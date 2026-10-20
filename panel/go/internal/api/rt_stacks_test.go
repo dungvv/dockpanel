@@ -1,6 +1,9 @@
 package api
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func stacksDecode(t *testing.T, s string) any {
 	t.Helper()
@@ -69,5 +72,34 @@ func TestStacksProvidedTlsRefusalReadsTheAgentAnswer(t *testing.T) {
 	}
 	if rtStacksProvidedTlsRefusal(stacksDecode(t, `{}`)) == nil {
 		t.Fatal("empty answer must be a refusal")
+	}
+}
+
+// stacksRecordingAgent records how whole-stack calls reach the agent.
+type stacksRecordingAgent struct {
+	AgentHandle
+	timeout uint64
+	plain   bool
+}
+
+func (a *stacksRecordingAgent) Post(context.Context, string, any) (any, error) {
+	a.plain = true
+	return nil, nil
+}
+
+func (a *stacksRecordingAgent) PostLong(_ context.Context, _ string, _ any, timeoutSecs uint64) (any, error) {
+	a.timeout = timeoutSecs
+	return nil, nil
+}
+
+// A stack deploy does every service in one agent call; the 60s plain-Post
+// budget rolled large stacks back mid-deploy.
+func TestStacksAgentPostUsesTheLongBudget(t *testing.T) {
+	a := &stacksRecordingAgent{}
+	if _, err := rtStacksAgentPost(context.Background(), a, "/apps/compose/deploy", nil); err != nil {
+		t.Fatal(err)
+	}
+	if a.plain || a.timeout != AgentStackTimeoutSecs || AgentStackTimeoutSecs <= 60 {
+		t.Fatalf("plain=%v timeout=%d, want PostLong with %d (>60)", a.plain, a.timeout, AgentStackTimeoutSecs)
 	}
 }

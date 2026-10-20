@@ -320,6 +320,18 @@ func rtStacksClearRemoved(ctx context.Context, db *pgxpool.Pool, serverID uuid.U
 	}
 }
 
+// AgentStackTimeoutSecs bounds one stack deploy or stack action. The agent
+// pulls, creates, starts and confirms every service in a single call, ~1.5-3s
+// each, so a plain Post's 60s cut a 37-service stack off halfway through —
+// the update then rolled back to the previous definition, every time.
+const AgentStackTimeoutSecs = 600
+
+// rtStacksAgentPost is the agent call for whole-stack work (deploy, remove,
+// start/stop/restart): long pool, AgentStackTimeoutSecs budget.
+func rtStacksAgentPost(ctx context.Context, agent AgentHandle, path string, body any) (any, error) {
+	return agent.PostLong(ctx, path, body, AgentStackTimeoutSecs)
+}
+
 func rtStacksOr(s *string, def string) string {
 	if s != nil {
 		return *s
@@ -533,7 +545,7 @@ func rtStacksCreate(st *AppState, w http.ResponseWriter, r *http.Request) error 
 	}
 
 	// Deploy with the stack_id label.
-	deployResult, err := agent.Post(ctx, "/apps/compose/deploy", map[string]any{
+	deployResult, err := rtStacksAgentPost(ctx, agent, "/apps/compose/deploy", map[string]any{
 		"yaml":            body.Yaml,
 		"stack_id":        stack.ID.String(),
 		"domain":          domain,
@@ -690,7 +702,7 @@ func rtStacksRemove(st *AppState, w http.ResponseWriter, r *http.Request) error 
 
 	// Remove all containers, and the vhost/certs the stack was fronted by. The
 	// agent proves ownership of each before deleting it.
-	result, actionErr := agent.Post(ctx, "/apps/stack/action", map[string]any{
+	result, actionErr := rtStacksAgentPost(ctx, agent, "/apps/stack/action", map[string]any{
 		"stack_id": id.String(),
 		"action":   "remove",
 		"domain":   domain,
@@ -867,7 +879,7 @@ func rtStacksUpdate(st *AppState, w http.ResponseWriter, r *http.Request) error 
 	if prev.Domain != nil && (domain == nil || *domain != *prev.Domain) {
 		vacating = prev.Domain
 	}
-	if removed, err := agent.Post(ctx, "/apps/stack/action", map[string]any{
+	if removed, err := rtStacksAgentPost(ctx, agent, "/apps/stack/action", map[string]any{
 		"stack_id": id.String(),
 		"action":   "remove",
 		"domain":   vacating,
@@ -880,7 +892,7 @@ func rtStacksUpdate(st *AppState, w http.ResponseWriter, r *http.Request) error 
 	restore := func() {
 		rtStacksRestorePrevious(ctx, st.DB, prev.ServerID, agent, id, prev.Yaml, prev.Domain, prev.SslEmail, previousMode, prev.Alias)
 	}
-	deployResult, err := agent.Post(ctx, "/apps/compose/deploy", map[string]any{
+	deployResult, err := rtStacksAgentPost(ctx, agent, "/apps/compose/deploy", map[string]any{
 		"yaml":            body.Yaml,
 		"stack_id":        id.String(),
 		"domain":          domain,
@@ -949,14 +961,14 @@ func rtStacksUpdate(st *AppState, w http.ResponseWriter, r *http.Request) error 
 // YAML. Carries the previous TLS mode and alias too: a restore that sent only
 // the address would put a provided-certificate stack back as plain HTTP.
 func rtStacksRestorePrevious(ctx context.Context, db *pgxpool.Pool, serverID uuid.UUID, agent AgentHandle, id uuid.UUID, yaml string, domain, sslEmail *string, tlsMode string, tlsCertificate *string) {
-	if removed, err := agent.Post(ctx, "/apps/stack/action", map[string]any{"stack_id": id.String(), "action": "remove"}); err == nil {
+	if removed, err := rtStacksAgentPost(ctx, agent, "/apps/stack/action", map[string]any{"stack_id": id.String(), "action": "remove"}); err == nil {
 		rtStacksClearRemoved(ctx, db, serverID, removed)
 	}
 	var email *string
 	if tlsMode == "acme" {
 		email = sslEmail
 	}
-	if _, err := agent.Post(ctx, "/apps/compose/deploy", map[string]any{
+	if _, err := rtStacksAgentPost(ctx, agent, "/apps/compose/deploy", map[string]any{
 		"yaml":            yaml,
 		"stack_id":        id.String(),
 		"domain":          domain,
@@ -995,7 +1007,7 @@ func rtStacksAction(ctx context.Context, st *AppState, claims *Claims, id uuid.U
 	if err != nil {
 		return nil, err
 	}
-	result, err := agent.Post(ctx, "/apps/stack/action", map[string]any{"stack_id": id.String(), "action": action})
+	result, err := rtStacksAgentPost(ctx, agent, "/apps/stack/action", map[string]any{"stack_id": id.String(), "action": action})
 	if err != nil {
 		return nil, agentError("Stack "+action, err)
 	}
