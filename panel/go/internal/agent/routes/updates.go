@@ -167,6 +167,7 @@ func updatesRpmBin() string {
 
 // GET /system/updates — list available package updates.
 func updatesList(w http.ResponseWriter, r *http.Request) {
+	defer updatesCountCache.reset() // refreshed repo metadata changes the count
 	packages := []updatesPackageUpdate{}
 	if services.PkgManager() == services.PkgMgrRpm {
 		bin := updatesRpmBin()
@@ -243,6 +244,7 @@ func updatesLine(line string) string {
 // Each line is {"type":"line","line":"..."}; the final line is
 // {"type":"done","success":bool,"reboot_required":bool}.
 func updatesApply(w http.ResponseWriter, r *http.Request) {
+	defer updatesCountCache.reset()
 	var body updatesApplyRequest
 	if !decodeJSON(w, r, &body) {
 		return
@@ -342,8 +344,19 @@ func updatesAllValid(pkg string) bool {
 	return true
 }
 
+// `apt list --upgradable` loads the whole package cache (~1 CPU-second) and the
+// dashboard polls this every 15s; the answer only moves after a repo refresh
+// or an upgrade, both of which reset the cache.
+var updatesCountCache = ttlCache[[2]int]{ttl: 10 * time.Minute}
+
 // GET /system/updates/count — quick count of available updates (no apt update).
 func updatesCount(w http.ResponseWriter, r *http.Request) {
+	c := updatesCountCache.get(updatesCountNow)
+	writeJSON(w, http.StatusOK, updatesUpdateCount{Count: c[0], Security: c[1], RebootRequired: updatesRebootRequired()})
+}
+
+// updatesCountNow returns {upgradable, security} from the package manager.
+func updatesCountNow() [2]int {
 	count, security := 0, 0
 	if services.PkgManager() == services.PkgMgrRpm {
 		if bin := updatesRpmBin(); bin != "" {
@@ -366,7 +379,7 @@ func updatesCount(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeJSON(w, http.StatusOK, updatesUpdateCount{Count: count, Security: security, RebootRequired: updatesRebootRequired()})
+	return [2]int{count, security}
 }
 
 // POST /system/reboot — schedule a system reboot in 1 minute.

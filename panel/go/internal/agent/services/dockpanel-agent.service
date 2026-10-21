@@ -31,6 +31,10 @@ ExecStartPost=/bin/sh -c 'sleep 1 && chgrp $(getent group www-data >/dev/null 2>
 Restart=always
 RestartSec=5
 Environment=LOG_LEVEL=info
+# The agent is I/O-bound. With the Go default (one P per CPU) a dashboard poll
+# woke threads across every core: on a 12-vCPU VM most of its CPU went to
+# scheduler spinning and cross-CPU TLB-flush IPIs, not work (perf, s-cpu).
+Environment=GOMAXPROCS=2
 
 # Sandbox hardening (v2.8.13). apt/dpkg/snap/composer-rm operations that need to
 # write outside ReadWritePaths escape via systemd-run — see safe_command_unsandboxed

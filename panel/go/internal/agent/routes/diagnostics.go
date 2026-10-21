@@ -22,9 +22,13 @@ func registerDiagnostics(r *Router) {
 	r.Handle("GET /diagnostics/recommendations", diagnosticsRecommendations)
 }
 
+// The checks fork ~15 commands (nginx -t, systemctl, tail, df, docker…) and the
+// dashboard asks every 15s, so one run serves callers for a minute.
+var diagnosticsCache = ttlCache[services.DiagnosticsReport]{ttl: time.Minute}
+
 // GET /diagnostics — Run all diagnostic checks.
 func diagnosticsRun(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, services.DiagnosticsRun())
+	writeJSON(w, http.StatusOK, diagnosticsCache.get(services.DiagnosticsRun))
 }
 
 // POST /diagnostics/fix — Apply a one-click fix.
@@ -46,6 +50,7 @@ func diagnosticsApplyFix(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	msg, err := services.DiagnosticsApplyFix(*body.FixID)
+	diagnosticsCache.reset()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

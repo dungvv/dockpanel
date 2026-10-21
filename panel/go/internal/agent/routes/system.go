@@ -17,7 +17,6 @@ import (
 	"github.com/shirou/gopsutil/v4/load"
 	"github.com/shirou/gopsutil/v4/mem"
 	gnet "github.com/shirou/gopsutil/v4/net"
-	"github.com/shirou/gopsutil/v4/process"
 	"github.com/shirou/gopsutil/v4/sensors"
 
 	"github.com/ovexro/dockpanel/panel/go/internal/agent/safecmd"
@@ -139,25 +138,78 @@ func (s *State) systemHandleInfo(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-func systemHandleProcesses(w http.ResponseWriter, _ *http.Request) {
-	procs, _ := process.Processes()
-	for _, p := range procs {
-		_, _ = p.Percent(0) // baseline
+// procSample is one process's line of /proc/<pid>/stat.
+type procSample struct {
+	name     string
+	ticks    uint64 // utime + stime, in clock ticks
+	rssPages uint64
+}
+
+// procParseStat parses /proc/<pid>/stat. comm sits between the first '(' and
+// the LAST ')' because it may itself contain spaces and parentheses.
+func procParseStat(line string) (procSample, bool) {
+	open, end := strings.IndexByte(line, '('), strings.LastIndexByte(line, ')')
+	if open < 0 || end < open {
+		return procSample{}, false
 	}
+	f := strings.Fields(line[end+1:]) // f[0] is field 3 (state)
+	if len(f) < 22 {
+		return procSample{}, false
+	}
+	ut, err1 := strconv.ParseUint(f[11], 10, 64)  // field 14
+	st, err2 := strconv.ParseUint(f[12], 10, 64)  // field 15
+	rss, err3 := strconv.ParseUint(f[21], 10, 64) // field 24
+	if err1 != nil || err2 != nil || err3 != nil {
+		return procSample{}, false
+	}
+	return procSample{name: line[open+1 : end], ticks: ut + st, rssPages: rss}, true
+}
+
+// procSnapshot reads one stat file per process. gopsutil's per-process
+// Percent/Name/MemoryInfo re-read /proc/stat, cpuinfo and cpufreq for every
+// process, which made this endpoint cost ~0.6 CPU-seconds per call.
+func procSnapshot() map[int32]procSample {
+	out := map[int32]procSample{}
+	ents, _ := os.ReadDir("/proc")
+	for _, e := range ents {
+		pid, err := strconv.ParseInt(e.Name(), 10, 32)
+		if err != nil {
+			continue
+		}
+		if b, err := os.ReadFile("/proc/" + e.Name() + "/stat"); err == nil {
+			if s, ok := procParseStat(string(b)); ok {
+				out[int32(pid)] = s
+			}
+		}
+	}
+	return out
+}
+
+// procClockTicks is USER_HZ, fixed at 100 on Linux userspace ABIs.
+const procClockTicks = 100
+
+func systemHandleProcesses(w http.ResponseWriter, _ *http.Request) {
+	before, t0 := procSnapshot(), time.Now()
 	// Brief pause then sample again for accurate CPU readings.
 	time.Sleep(200 * time.Millisecond)
-	out := make([]systemProcessInfo, 0, len(procs))
-	for _, p := range procs {
-		pc, err := p.Percent(0)
-		if err != nil {
-			continue // exited meanwhile
+	after, secs := procSnapshot(), time.Since(t0).Seconds()
+	out := make([]systemProcessInfo, 0, len(after))
+	for pid, s := range after {
+		prev, ok := before[pid]
+		if !ok || s.ticks < prev.ticks {
+			continue // started meanwhile, or pid reused
 		}
-		name, _ := p.Name()
-		var rss uint64
-		if mi, err := p.MemoryInfo(); err == nil {
-			rss = mi.RSS
+		name := s.name
+		if len(name) == 15 { // kernel truncates comm to 15 bytes; take argv[0]
+			if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil {
+				if a0, _, _ := strings.Cut(string(b), "\x00"); a0 != "" {
+					name = a0[strings.LastIndexByte(a0, '/')+1:]
+				}
+			}
 		}
-		out = append(out, systemProcessInfo{Pid: uint32(p.Pid), Name: name, CpuPct: float32(pc), MemMb: rss / 1048576})
+		pct := float64(s.ticks-prev.ticks) / procClockTicks / secs * 100
+		out = append(out, systemProcessInfo{Pid: uint32(pid), Name: name, CpuPct: float32(pct),
+			MemMb: s.rssPages * uint64(os.Getpagesize()) / 1048576})
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].CpuPct > out[j].CpuPct })
 	if len(out) > 20 {
